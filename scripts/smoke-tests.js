@@ -157,6 +157,32 @@ test("set completion never requires RPE", () => {
   );
 });
 
+test("template review treats Default and Normal as the same default variant", () => {
+  const {
+    getTemplateVariantForStorage,
+    getTemplateVariantLabel,
+    normalizeTemplateVariantForComparison,
+  } = require(
+    fromRoot("src/utils/templateChanges.ts"),
+  );
+
+  assert.equal(normalizeTemplateVariantForComparison(undefined), "");
+  assert.equal(normalizeTemplateVariantForComparison(""), "");
+  assert.equal(normalizeTemplateVariantForComparison("Normal"), "");
+  assert.equal(normalizeTemplateVariantForComparison(" normal "), "");
+  assert.equal(normalizeTemplateVariantForComparison("Paused"), "Paused");
+  assert.notEqual(
+    normalizeTemplateVariantForComparison("Paused"),
+    normalizeTemplateVariantForComparison("Normal"),
+  );
+  assert.equal(getTemplateVariantForStorage("Normal", false), undefined);
+  assert.equal(getTemplateVariantForStorage(undefined, true), "Normal");
+  assert.equal(getTemplateVariantForStorage("Paused", true), "Paused");
+  assert.equal(getTemplateVariantLabel("Normal", false), "");
+  assert.equal(getTemplateVariantLabel(undefined, true), "Normal");
+  assert.equal(getTemplateVariantLabel("Paused", true), "Paused");
+});
+
 test("remote exercise data strips undeclared fields", () => {
   const { sanitizeRemoteExercises } = require(fromRoot("src/utils/helpers.ts"));
   const [exercise] = sanitizeRemoteExercises([
