@@ -25,13 +25,30 @@ expo-env.d.ts
 npm-debug.*
 yarn-debug.*
 yarn-error.*
+*.log
+.firebase/
 
 # macOS
 .DS_Store
 *.pem
 
 # local env files
+.env
+.env.*
+!.env.example
 .env*.local
+
+# credentials and signing files
+GoogleService-Info.plist
+google-services.json
+*service-account*.json
+serviceAccount*.json
+
+# local project notes and audits
+IRONVAULT_FULL_APP_AUDIT.md
+
+# test output
+coverage/
 
 # typescript
 *.tsbuildinfo

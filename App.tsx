@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from "react";
+import React, { useCallback, useRef, useState, useEffect } from "react";
 import {
   NavigationContainer,
   DarkTheme,
@@ -10,7 +10,7 @@ import {
   SafeAreaProvider,
   useSafeAreaInsets,
 } from "react-native-safe-area-context";
-import { View, ActivityIndicator, Platform } from "react-native";
+import { View, ActivityIndicator, Linking, Platform } from "react-native";
 import AsyncStorage from "@react-native-async-storage/async-storage";
 import { Ionicons } from "@expo/vector-icons";
 import { GestureHandlerRootView } from "react-native-gesture-handler";
@@ -34,10 +34,23 @@ import EditTemplateScreen from "./src/screens/EditTemplateScreen";
 import ManageExercisesScreen from "./src/screens/ManageExercisesScreen";
 import SearchScreen from "./src/screens/SearchScreen";
 import OnboardingGuide from "./src/components/OnboardingGuide";
+import LegalAcceptanceGate from "./src/components/LegalAcceptanceGate";
 
 const Stack = createNativeStackNavigator();
 const Tab = createBottomTabNavigator();
 const navigationRef = createNavigationContainerRef<any>();
+
+const isTemplateShareOpenUrl = (url?: string | null) => {
+  if (!url) return false;
+
+  const withoutQuery = String(url).split("?")[0].split("#")[0];
+  let decoded = withoutQuery;
+  try {
+    decoded = decodeURIComponent(withoutQuery);
+  } catch {}
+
+  return decoded.toLowerCase().includes(".ironvault-template");
+};
 
 const MyDarkTheme = {
   ...DarkTheme,
@@ -122,6 +135,46 @@ export default function App() {
   const [initializing, setInitializing] = useState(true);
   const [user, setUser] = useState<User | null>(null);
   const [isFirstTime, setIsFirstTime] = useState(true);
+  const pendingTemplateImportUrlRef = useRef<string | null>(null);
+  const templateImportRequestIdRef = useRef(0);
+  const appReadinessRef = useRef<{
+    user: User | null;
+    isFirstTime: boolean;
+  }>({ user: null, isFirstTime: true });
+
+  const routePendingTemplateImport = useCallback(() => {
+    const pendingUrl = pendingTemplateImportUrlRef.current;
+    const { user: currentUser, isFirstTime: setupIsPending } =
+      appReadinessRef.current;
+
+    if (
+      !pendingUrl ||
+      !navigationRef.isReady() ||
+      !currentUser?.emailVerified ||
+      setupIsPending
+    ) {
+      return;
+    }
+
+    templateImportRequestIdRef.current += 1;
+    pendingTemplateImportUrlRef.current = null;
+    navigationRef.navigate("Home", {
+      screen: "Templates",
+      params: {
+        importTemplateUri: pendingUrl,
+        importTemplateRequestId: templateImportRequestIdRef.current,
+      },
+    });
+  }, []);
+
+  const handleTemplateShareOpenUrl = useCallback(
+    (url?: string | null) => {
+      if (!isTemplateShareOpenUrl(url)) return;
+      pendingTemplateImportUrlRef.current = String(url);
+      routePendingTemplateImport();
+    },
+    [routePendingTemplateImport],
+  );
 
   const handleRestTimerNotificationPress = async (
     response: Notifications.NotificationResponse,
@@ -157,6 +210,25 @@ export default function App() {
 
     return () => subscription.remove();
   }, []);
+
+  useEffect(() => {
+    Linking.getInitialURL()
+      .then(handleTemplateShareOpenUrl)
+      .catch((error) => {
+        console.log("Unable to read initial app link:", error);
+      });
+
+    const subscription = Linking.addEventListener("url", ({ url }) => {
+      handleTemplateShareOpenUrl(url);
+    });
+
+    return () => subscription.remove();
+  }, [handleTemplateShareOpenUrl]);
+
+  useEffect(() => {
+    appReadinessRef.current = { user, isFirstTime };
+    routePendingTemplateImport();
+  }, [isFirstTime, routePendingTemplateImport, user]);
 
   useEffect(() => {
     const unsubscribe = onAuthStateChanged(auth, async (authenticatedUser) => {
@@ -217,7 +289,11 @@ export default function App() {
   return (
     <GestureHandlerRootView style={{ flex: 1 }}>
       <SafeAreaProvider>
-        <NavigationContainer ref={navigationRef} theme={MyDarkTheme}>
+        <NavigationContainer
+          ref={navigationRef}
+          theme={MyDarkTheme}
+          onReady={routePendingTemplateImport}
+        >
           <Stack.Navigator
             screenOptions={{
               contentStyle: { backgroundColor: Colors.background },
@@ -285,6 +361,7 @@ export default function App() {
             )}
           </Stack.Navigator>
         </NavigationContainer>
+        <LegalAcceptanceGate user={user} />
       </SafeAreaProvider>
     </GestureHandlerRootView>
   );

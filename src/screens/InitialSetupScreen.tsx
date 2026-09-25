@@ -14,7 +14,7 @@ import { SafeAreaView } from "react-native-safe-area-context";
 import AsyncStorage from "@react-native-async-storage/async-storage";
 import * as Haptics from "expo-haptics";
 import { Ionicons } from "@expo/vector-icons";
-import { doc, getDoc, setDoc } from "firebase/firestore";
+import { doc, runTransaction } from "firebase/firestore";
 
 import CustomAlert from "../components/CustomAlert";
 import { auth, db } from "../config/firebaseConfig";
@@ -25,8 +25,17 @@ import {
   syncFoldersToCloud,
   syncGymsToCloud,
   syncSettingsToCloud,
+  sanitizeGymsForStorage,
+  sanitizeMachineBrandsForStorage,
 } from "../utils/firebaseSync";
 import { Colors } from "../theme";
+import {
+  LIMITS,
+  clampRestSeconds,
+  cleanLimitedText,
+  limitText,
+  sanitizeWholeNumberInput,
+} from "../constants/limits";
 
 type SetupAlert = {
   visible: boolean;
@@ -46,6 +55,27 @@ const clampCycleLength = (value: any) => {
   if (!Number.isFinite(parsed)) return 7;
   return Math.max(2, Math.min(9, Math.round(parsed)));
 };
+
+
+const normalizeUsername = (value: string) => value.trim().toLowerCase();
+
+const validateUsername = (value: string) => {
+  const normalized = normalizeUsername(value);
+
+  if (!normalized) return "Please choose a username to continue.";
+  if (normalized.length < 3) return "Username must be at least 3 characters.";
+  if (normalized.length > 20) return "Username must be 20 characters or fewer.";
+  if (!/^[a-z0-9_]+$/.test(normalized)) {
+    return "Use lowercase letters, numbers, and underscores only.";
+  }
+  if (normalized.startsWith("_") || normalized.endsWith("_")) {
+    return "Username cannot start or end with an underscore.";
+  }
+
+  return null;
+};
+
+const USERNAME_TAKEN_ERROR = "IRONVAULT_USERNAME_TAKEN";
 
 const startOfLocalDay = (value: number) => {
   const date = new Date(value);
@@ -111,7 +141,7 @@ export default function InitialSetupScreen({ route }: any) {
   };
 
   const handleAddBrand = () => {
-    const trimmed = brandInput.trim();
+    const trimmed = cleanLimitedText(brandInput, LIMITS.nameChars);
     if (!trimmed) return;
 
     const exists = allMachineBrands.some(
@@ -135,13 +165,15 @@ export default function InitialSetupScreen({ route }: any) {
   };
 
   const handleFinish = async () => {
-    const trimmedUsername = username.trim();
-    const trimmedGym = primaryGym.trim();
-    const trimmedSplitName = splitName.trim() || "Current Split";
-    const parsedRest = Math.max(15, Math.round(Number(rest || 0)));
+    const trimmedUsername = normalizeUsername(username);
+    const trimmedGym = cleanLimitedText(primaryGym, LIMITS.nameChars);
+    const trimmedSplitName =
+      cleanLimitedText(splitName, LIMITS.nameChars) || "Current Split";
+    const parsedRest = clampRestSeconds(rest || 90);
 
-    if (!trimmedUsername) {
-      showAlert("Required", "Please choose a username to continue.");
+    const usernameValidationError = validateUsername(trimmedUsername);
+    if (usernameValidationError) {
+      showAlert("Invalid Username", usernameValidationError);
       return;
     }
 
@@ -164,26 +196,59 @@ export default function InitialSetupScreen({ route }: any) {
       if (!user) throw new Error("No user found.");
       const uid = user.uid;
 
-      const usernameRef = doc(db, "usernames", trimmedUsername.toLowerCase());
-      const usernameSnap = await getDoc(usernameRef);
+      const now = Date.now();
+      const usernameRef = doc(db, "usernames", trimmedUsername);
+      const userRef = doc(db, "users", uid);
 
-      if (usernameSnap.exists()) {
-        showAlert("Taken", "This username is already in use.");
-        setLoading(false);
-        return;
+      try {
+        await runTransaction(db, async (transaction) => {
+          const usernameSnap = await transaction.get(usernameRef);
+
+          if (usernameSnap.exists()) {
+            const ownerUid = usernameSnap.data().uid;
+            if (ownerUid && ownerUid !== uid) {
+              throw new Error(USERNAME_TAKEN_ERROR);
+            }
+          }
+
+          transaction.set(
+            usernameRef,
+            {
+              uid,
+              username: trimmedUsername,
+              usernameLower: trimmedUsername,
+              display_name: trimmedUsername,
+              updatedAt: now,
+            },
+            { merge: true },
+          );
+
+          transaction.set(
+            userRef,
+            {
+              username: trimmedUsername,
+              usernameLower: trimmedUsername,
+              updatedAt: now,
+            },
+            { merge: true },
+          );
+        });
+      } catch (error: any) {
+        if (String(error?.message || "").includes(USERNAME_TAKEN_ERROR)) {
+          showAlert("Taken", "This username is already in use.");
+          setLoading(false);
+          return;
+        }
+        throw error;
       }
 
-      await setDoc(usernameRef, {
-        uid,
-        display_name: trimmedUsername,
-      });
-
-      const now = Date.now();
       const newGym = {
         id: genId("gym-"),
         name: trimmedGym,
         variants: [],
-        defaultMachineBrand: gymDefaultBrand || null,
+        defaultMachineBrand: gymDefaultBrand
+          ? cleanLimitedText(gymDefaultBrand, LIMITS.nameChars)
+          : null,
         createdAt: now,
         updatedAt: now,
       };
@@ -210,18 +275,25 @@ export default function InitialSetupScreen({ route }: any) {
           ]
         : [];
 
+      const setupGyms = sanitizeGymsForStorage([newGym]);
+      const setupBrands = sanitizeMachineBrandsForStorage(customBrands);
+
       await AsyncStorage.multiSet([
         [`@user_username_${uid}`, trimmedUsername],
         [`@user_metric_${uid}`, metric],
         [`@rest_time_${uid}`, String(parsedRest)],
         [`@rest_timer_enabled_${uid}`, String(timerEnabled)],
         [`@auto_check_enabled_${uid}`, String(autoCheckEnabled)],
+        [`@rpe_tracking_enabled_${uid}`, "false"],
         [`@plate_calc_enabled_${uid}`, String(plateCalcEnabled)],
         [`@plates_kg_${uid}`, JSON.stringify(platesKg)],
         [`@plates_lbs_${uid}`, JSON.stringify(platesLbs)],
-        [`@user_gyms_${uid}`, JSON.stringify([newGym])],
+        [`@user_gyms_${uid}`, JSON.stringify(setupGyms)],
         [`@last_used_gym_${uid}`, newGym.id],
-        [`@global_variants_${uid}`, JSON.stringify(customBrands)],
+        [
+          `@global_variants_${uid}`,
+          JSON.stringify(setupBrands),
+        ],
         [`@workout_folders_${uid}`, JSON.stringify(setupFolders)],
         [
           `@active_split_folder_${uid}`,
@@ -234,21 +306,31 @@ export default function InitialSetupScreen({ route }: any) {
         await AsyncStorage.removeItem(`@active_split_folder_${uid}`);
       }
 
-      await syncSettingsToCloud({
+      syncSettingsToCloud({
         username: trimmedUsername,
+        usernameLower: trimmedUsername,
         metric,
-        restTime: String(parsedRest),
+        restTime: parsedRest,
         timerEnabled,
         autoCheckEnabled,
+        rpeTrackingEnabled: false,
         plateCalcEnabled,
         platesKg,
         platesLbs,
         activeSplitFolderId:
           createSplit && setupFolders[0] ? setupFolders[0].id : null,
-      });
-      await syncGymsToCloud([newGym]);
-      await syncConfigToCloud("global_variants" as any, customBrands);
-      await syncFoldersToCloud(setupFolders);
+      }).catch((error) =>
+        console.log("Initial settings cloud sync delayed:", error),
+      );
+      syncGymsToCloud(setupGyms).catch((error) =>
+        console.log("Initial gyms cloud sync delayed:", error),
+      );
+      syncConfigToCloud("global_variants" as any, setupBrands).catch((error) =>
+        console.log("Initial machine brands cloud sync delayed:", error),
+      );
+      syncFoldersToCloud(setupFolders).catch((error) =>
+        console.log("Initial folders cloud sync delayed:", error),
+      );
 
       Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
       route.params?.onFinish?.();
@@ -295,7 +377,8 @@ export default function InitialSetupScreen({ route }: any) {
             placeholder="Username"
             placeholderTextColor={Colors.textMuted}
             value={username}
-            onChangeText={setUsername}
+            onChangeText={(value) => setUsername(normalizeUsername(value))}
+            maxLength={20}
             autoCapitalize="none"
             editable={!loading}
             style={localStyles.input}
@@ -328,7 +411,12 @@ export default function InitialSetupScreen({ route }: any) {
                 style={localStyles.smallInput}
                 keyboardType="number-pad"
                 value={rest}
-                onChangeText={setRest}
+                onChangeText={(value) =>
+                  setRest(
+                    sanitizeWholeNumberInput(value, LIMITS.restSecondsMax),
+                  )
+                }
+                maxLength={3}
                 editable={!loading}
               />
               <Text style={localStyles.inlineInputUnit}>seconds</Text>
@@ -363,12 +451,18 @@ export default function InitialSetupScreen({ route }: any) {
                   return (
                     <TouchableOpacity
                       key={`${metric}-${plate}`}
-                      style={[localStyles.plateChip, active && localStyles.plateChipActive]}
+                      style={[
+                        localStyles.plateChip,
+                        active && localStyles.plateChipActive,
+                      ]}
                       onPress={() => togglePlate(plate)}
                       activeOpacity={0.85}
                     >
                       <Text
-                        style={[localStyles.plateText, active && localStyles.plateTextActive]}
+                        style={[
+                          localStyles.plateText,
+                          active && localStyles.plateTextActive,
+                        ]}
                       >
                         {plate}
                       </Text>
@@ -389,7 +483,10 @@ export default function InitialSetupScreen({ route }: any) {
             placeholder="e.g. ActiveSG Jurong, Home Gym"
             placeholderTextColor={Colors.textMuted}
             value={primaryGym}
-            onChangeText={setPrimaryGym}
+            onChangeText={(value) =>
+              setPrimaryGym(limitText(value, LIMITS.nameChars))
+            }
+            maxLength={LIMITS.nameChars}
             editable={!loading}
             style={localStyles.input}
           />
@@ -397,11 +494,17 @@ export default function InitialSetupScreen({ route }: any) {
           <Text style={localStyles.fieldLabel}>Default Machine Brand</Text>
           <ScrollView horizontal showsHorizontalScrollIndicator={false}>
             <TouchableOpacity
-              style={[localStyles.brandChip, !gymDefaultBrand && localStyles.brandChipActive]}
+              style={[
+                localStyles.brandChip,
+                !gymDefaultBrand && localStyles.brandChipActive,
+              ]}
               onPress={() => setGymDefaultBrand(null)}
             >
               <Text
-                style={[localStyles.brandText, !gymDefaultBrand && localStyles.brandTextActive]}
+                style={[
+                  localStyles.brandText,
+                  !gymDefaultBrand && localStyles.brandTextActive,
+                ]}
               >
                 None
               </Text>
@@ -411,10 +514,18 @@ export default function InitialSetupScreen({ route }: any) {
               return (
                 <TouchableOpacity
                   key={brand}
-                  style={[localStyles.brandChip, active && localStyles.brandChipActive]}
+                  style={[
+                    localStyles.brandChip,
+                    active && localStyles.brandChipActive,
+                  ]}
                   onPress={() => setGymDefaultBrand(brand)}
                 >
-                  <Text style={[localStyles.brandText, active && localStyles.brandTextActive]}>
+                  <Text
+                    style={[
+                      localStyles.brandText,
+                      active && localStyles.brandTextActive,
+                    ]}
+                  >
                     {brand}
                   </Text>
                 </TouchableOpacity>
@@ -427,12 +538,18 @@ export default function InitialSetupScreen({ route }: any) {
               placeholder="Add custom machine brand..."
               placeholderTextColor={Colors.textMuted}
               value={brandInput}
-              onChangeText={setBrandInput}
+              onChangeText={(value) =>
+                setBrandInput(limitText(value, LIMITS.nameChars))
+              }
+              maxLength={LIMITS.nameChars}
               onSubmitEditing={handleAddBrand}
               style={[localStyles.input, { flex: 1, marginBottom: 0 }]}
               editable={!loading}
             />
-            <TouchableOpacity style={localStyles.addBrandButton} onPress={handleAddBrand}>
+	            <TouchableOpacity
+	              style={localStyles.addBrandButton}
+	              onPress={handleAddBrand}
+	            >
               <Ionicons name="add" size={20} color={Colors.background} />
             </TouchableOpacity>
           </View>
@@ -442,8 +559,14 @@ export default function InitialSetupScreen({ route }: any) {
               {customBrands.map((brand) => (
                 <View key={brand} style={localStyles.customBrandChip}>
                   <Text style={localStyles.customBrandText}>{brand}</Text>
-                  <TouchableOpacity onPress={() => handleRemoveBrand(brand)}>
-                    <Ionicons name="close-circle" size={16} color={Colors.textMuted} />
+	                  <TouchableOpacity
+	                    onPress={() => handleRemoveBrand(brand)}
+	                  >
+	                    <Ionicons
+	                      name="close-circle"
+	                      size={16}
+	                      color={Colors.textMuted}
+	                    />
                   </TouchableOpacity>
                 </View>
               ))}
@@ -468,7 +591,10 @@ export default function InitialSetupScreen({ route }: any) {
                 placeholder="Split name"
                 placeholderTextColor={Colors.textMuted}
                 value={splitName}
-                onChangeText={setSplitName}
+                onChangeText={(value) =>
+                  setSplitName(limitText(value, LIMITS.nameChars))
+                }
+                maxLength={LIMITS.nameChars}
                 editable={!loading}
                 style={[localStyles.input, { marginTop: 14 }]}
               />

@@ -743,6 +743,36 @@ export const styles = StyleSheet.create({
     minWidth: 52,
     textAlign: "center",
   },
+  restPresetRow: {
+    width: "100%",
+    flexDirection: "row",
+    gap: 8,
+    marginTop: -2,
+    marginBottom: 10,
+  },
+  restPresetChip: {
+    flex: 1,
+    minHeight: 38,
+    borderRadius: Radius.pill,
+    backgroundColor: Colors.surface,
+    borderWidth: 1,
+    borderColor: Colors.border,
+    alignItems: "center",
+    justifyContent: "center",
+    paddingHorizontal: 10,
+  },
+  restPresetChipActive: {
+    backgroundColor: Colors.accent,
+    borderColor: Colors.accent,
+  },
+  restPresetChipText: {
+    color: Colors.textMuted,
+    fontSize: 13,
+    fontWeight: "900",
+  },
+  restPresetChipTextActive: {
+    color: Colors.background,
+  },
   modalContent: {
     backgroundColor: Colors.card,
     padding: 24,

@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useMemo, useRef } from "react";
+import React, { useCallback, useState, useEffect, useMemo, useRef } from "react";
 import {
   View,
   Text,
@@ -18,6 +18,9 @@ import {
 } from "react-native-safe-area-context";
 import AsyncStorage from "@react-native-async-storage/async-storage";
 import { Ionicons } from "@expo/vector-icons";
+import * as FileSystem from "expo-file-system/legacy";
+import * as Sharing from "expo-sharing";
+import * as DocumentPicker from "expo-document-picker";
 import { auth } from "../config/firebaseConfig";
 import { styles } from "../constants/globalStyles";
 import * as Haptics from "expo-haptics";
@@ -25,12 +28,45 @@ import DraggableFlatList from "react-native-draggable-flatlist";
 import { GestureHandlerRootView } from "react-native-gesture-handler";
 import {
   fetchConfigFromCloud,
-  syncConfigToCloud,
+  safeJsonParse,
+  clearConfigItemsDeletedLocally,
+  markConfigItemsDeletedLocally,
+  reconcileTemplatesAndFoldersForStorage,
+  saveTemplatesLocallyAndToCloud,
+  sanitizeFoldersForStorage,
+  sanitizeTemplatesForStorage,
   syncFoldersToCloud,
+  syncPersonalExercisesToCloud,
   syncSettingsToCloud,
 } from "../utils/firebaseSync";
 import CustomAlert from "../components/CustomAlert";
-import { genId, getSupersetGroups } from "../utils/helpers";
+import UndoToast from "../components/UndoToast";
+import BlockingOverlay from "../components/BlockingOverlay";
+import {
+  formatExerciseDisplayName,
+  genId,
+  getSupersetGroups,
+} from "../utils/helpers";
+import { LIMITS, cleanLimitedText, limitText } from "../constants/limits";
+import {
+  TEMPLATE_SHARE_MIME_TYPE,
+  TemplateImportPreview,
+  buildImportedCustomExerciseRecords,
+  buildImportedTemplateRecord,
+  buildTemplateImportPreview,
+  createTemplateShareEnvelope,
+  getTemplateShareFileName,
+  parseTemplateShareFile,
+  serializeTemplateShareEnvelope,
+  templateNameExists,
+} from "../utils/templateSharing";
+import { cleanStoredCustomExercises } from "../utils/exerciseLibraryStorage";
+import {
+  getTemplateExerciseNoteKey,
+  readNextSessionNotesEnabled,
+  readTemplateNextSessionNotes,
+  writeTemplateNextSessionNote,
+} from "../utils/nextSessionNotes";
 
 type SplitDay = {
   dayNumber: number;
@@ -47,6 +83,13 @@ type TemplateFolder = {
   startDate?: number;
   createdAt?: number;
   updatedAt?: number;
+};
+
+type TemplateUndoState = {
+  templates: any[];
+  folders: TemplateFolder[];
+  activeFolderId: string;
+  message: string;
 };
 
 const clampCycleLength = (value: any) => {
@@ -111,7 +154,7 @@ const normalizeFolder = (folder: any): TemplateFolder => {
   return {
     ...folder,
     id: folder?.id || genId("fldr-"),
-    name: folder?.name || "Folder",
+    name: cleanLimitedText(folder?.name || "Folder", LIMITS.nameChars),
     templateIds,
     cycleLength,
     days: normalizeSplitDays(folder?.days, cycleLength, templateIds),
@@ -152,12 +195,13 @@ const TEMPLATE_REORDER_DRAG_ANIMATION_CONFIG = {
   restSpeedThreshold: 0.01,
 };
 
-export default function TemplatesScreen({ navigation }: any) {
+export default function TemplatesScreen({ navigation, route }: any) {
   const [templates, setTemplates] = useState<any[]>([]);
   const [folders, setFolders] = useState<TemplateFolder[]>([]);
   const [history, setHistory] = useState<any[]>([]);
   const [searchQuery, setSearchQuery] = useState("");
   const listRef = useRef<FlatList<any>>(null);
+  const handledExternalImportRef = useRef("");
   const [activeFolderId, setActiveFolderId] = useState<string>("All");
   const [activeSplitFolderId, setActiveSplitFolderId] = useState<string | null>(
     null,
@@ -166,6 +210,19 @@ export default function TemplatesScreen({ navigation }: any) {
   const [isMenuVisible, setIsMenuVisible] = useState(false);
   const [selectedTemplate, setSelectedTemplate] = useState<any>(null);
   const [detailTemplate, setDetailTemplate] = useState<any>(null);
+  const [nextSessionNotesEnabled, setNextSessionNotesEnabled] =
+    useState(false);
+  const [detailNextSessionNotes, setDetailNextSessionNotes] = useState<
+    Record<string, string>
+  >({});
+  const [isNextSessionNoteModalVisible, setIsNextSessionNoteModalVisible] =
+    useState(false);
+  const [nextSessionNoteTarget, setNextSessionNoteTarget] = useState<{
+    templateId: string;
+    exercise: any;
+    title: string;
+  } | null>(null);
+  const [nextSessionNoteDraft, setNextSessionNoteDraft] = useState("");
   const [loading, setLoading] = useState(false);
   const [isTemplateReorderModalVisible, setIsTemplateReorderModalVisible] = useState(false);
   const [templateReorderDraft, setTemplateReorderDraft] = useState<any[]>([]);
@@ -183,6 +240,13 @@ export default function TemplatesScreen({ navigation }: any) {
   const [isMoveModalVisible, setIsMoveModalVisible] = useState(false);
   const [isBatchSelectVisible, setIsBatchSelectVisible] = useState(false);
   const [batchSelectIds, setBatchSelectIds] = useState<string[]>([]);
+  const [isTemplateSharing, setIsTemplateSharing] = useState(false);
+  const [isTemplateImporting, setIsTemplateImporting] = useState(false);
+  const [templateBlockingMessage, setTemplateBlockingMessage] = useState("");
+  const templateBlockingRef = useRef(false);
+  const [templateImportPreview, setTemplateImportPreview] =
+    useState<TemplateImportPreview | null>(null);
+  const [templateImportName, setTemplateImportName] = useState("");
 
   const [isManageMode, setIsManageMode] = useState(false);
   const [selectedTemplateIds, setSelectedTemplateIds] = useState<string[]>([]);
@@ -198,9 +262,40 @@ export default function TemplatesScreen({ navigation }: any) {
   const [deleteAlertVisible, setDeleteAlertVisible] = useState(false);
   const [deleteFolderAlertVisible, setDeleteFolderAlertVisible] =
     useState(false);
+  const [templateUndo, setTemplateUndo] = useState<TemplateUndoState | null>(
+    null,
+  );
 
   const insets = useSafeAreaInsets();
   const uid = auth.currentUser?.uid;
+  const isTemplatesBlocking =
+    templateBlockingMessage.length > 0 ||
+    isTemplateImporting ||
+    isTemplateSharing;
+
+  const runTemplateBlockingAction = async (
+    message: string,
+    action: () => Promise<void> | void,
+  ) => {
+    if (
+      templateBlockingRef.current ||
+      isTemplateImporting ||
+      isTemplateSharing
+    ) {
+      return;
+    }
+
+    templateBlockingRef.current = true;
+    setTemplateBlockingMessage(message);
+    try {
+      await action();
+    } catch (error) {
+      console.error("Template action failed:", error);
+    } finally {
+      templateBlockingRef.current = false;
+      setTemplateBlockingMessage("");
+    }
+  };
 
   const activeFolder = useMemo(
     () => folders.find((folder) => folder.id === activeFolderId) || null,
@@ -208,30 +303,30 @@ export default function TemplatesScreen({ navigation }: any) {
   );
 
   const saveTemplates = async (nextTemplates: any[]) => {
-    setTemplates(nextTemplates);
+    const sanitizedTemplates = sanitizeTemplatesForStorage(nextTemplates);
+    setTemplates(sanitizedTemplates);
     if (!uid) return;
 
-    await AsyncStorage.setItem(
-      `@workout_templates_${uid}`,
-      JSON.stringify(nextTemplates),
-    );
-
     try {
-      await syncConfigToCloud("templates", nextTemplates);
+      await saveTemplatesLocallyAndToCloud(sanitizedTemplates, uid);
     } catch (error) {
       console.error("Failed to sync templates:", error);
     }
   };
 
   const saveFolders = async (newFolders: TemplateFolder[]) => {
-    const normalized = newFolders.map(normalizeFolder);
+    const normalized = sanitizeFoldersForStorage(
+      newFolders.map(normalizeFolder),
+    ).map(normalizeFolder);
     setFolders(normalized);
     if (uid) {
       await AsyncStorage.setItem(
         `@workout_folders_${uid}`,
         JSON.stringify(normalized),
       );
-      await syncFoldersToCloud(normalized);
+      syncFoldersToCloud(normalized).catch((error) =>
+        console.log("Folder cloud sync delayed:", error),
+      );
     }
   };
 
@@ -247,9 +342,356 @@ export default function TemplatesScreen({ navigation }: any) {
     }
 
     try {
-      await syncSettingsToCloud({ activeSplitFolderId: folderId });
+      syncSettingsToCloud({ activeSplitFolderId: folderId }).catch((error) =>
+        console.log("Active split cloud sync delayed", error),
+      );
     } catch (e) {
       console.log("Active split cloud sync delayed", e);
+    }
+  };
+
+  const duplicateTemplate = (template: any) => {
+    if (!template) return;
+    if (templates.length >= LIMITS.templatesPerUser) {
+      setInfoAlert({
+        visible: true,
+        title: "Template Limit Reached",
+        message: "You can save up to 50 templates.",
+      });
+      return;
+    }
+
+    const duplicateTemplateData = {
+      ...template,
+      id: undefined,
+      name:
+        cleanLimitedText(template.name || "Template", LIMITS.nameChars) ||
+        "Template",
+      exercises: Array.isArray(template.exercises)
+        ? template.exercises.map((exercise: any) =>
+            typeof exercise === "string"
+              ? exercise
+              : {
+                  ...exercise,
+                  id: undefined,
+                },
+          )
+        : [],
+    };
+
+    navigation.navigate("EditTemplate", {
+      duplicateTemplateData,
+    });
+  };
+
+  const createTemplateInFolder = (folderId?: string | null) => {
+    if (templates.length >= LIMITS.templatesPerUser) {
+      setInfoAlert({
+        visible: true,
+        title: "Template Limit Reached",
+        message: "You can save up to 50 templates.",
+      });
+      return;
+    }
+
+    navigation.navigate("EditTemplate", {
+      folderId: folderId || null,
+    });
+  };
+
+  const loadPersonalExercisesForTemplateSharing = async () => {
+    if (!uid) return [];
+    const raw = await AsyncStorage.getItem(`@user_exercises_${uid}`);
+    return cleanStoredCustomExercises(safeJsonParse<any[]>(raw, []));
+  };
+
+  const getTemplateShareErrorMessage = (error: any, fallback: string) => {
+    const message = String(error?.message || "");
+    if (
+      message.toLowerCase().includes("changed") ||
+      message.toLowerCase().includes("corrupted") ||
+      message.toLowerCase().includes("modified") ||
+      message.toLowerCase().includes("not valid") ||
+      message.toLowerCase().includes("invalid") ||
+      message.toLowerCase().includes("too many") ||
+      message.toLowerCase().includes("too large") ||
+      message.toLowerCase().includes("unsupported")
+    ) {
+      return message;
+    }
+    return message || fallback;
+  };
+
+  const shareTemplate = async (template: any) => {
+    if (!uid || !template || isTemplateSharing) return;
+
+    try {
+      setIsTemplateSharing(true);
+      const personalExercises = await loadPersonalExercisesForTemplateSharing();
+      const envelope = await createTemplateShareEnvelope(
+        template,
+        personalExercises,
+      );
+      const filename = getTemplateShareFileName(template.name);
+      const fileUri = `${FileSystem.cacheDirectory}${filename}`;
+
+      await FileSystem.writeAsStringAsync(
+        fileUri,
+        serializeTemplateShareEnvelope(envelope),
+        { encoding: FileSystem.EncodingType.UTF8 },
+      );
+
+      const canShare = await Sharing.isAvailableAsync();
+      if (!canShare) {
+        setInfoAlert({
+          visible: true,
+          title: "Template Exported",
+          message: `${filename} was created, but sharing is not available on this device.`,
+        });
+        return;
+      }
+
+      await Sharing.shareAsync(fileUri, {
+        mimeType: TEMPLATE_SHARE_MIME_TYPE,
+        dialogTitle: "Share IronVault Template",
+        UTI: "public.data",
+      });
+
+      Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
+    } catch (error: any) {
+      console.error("Template share failed:", error);
+      setInfoAlert({
+        visible: true,
+        title: "Share Failed",
+        message: getTemplateShareErrorMessage(
+          error,
+          "Could not share this template. Please try again.",
+        ),
+      });
+    } finally {
+      setIsTemplateSharing(false);
+    }
+  };
+
+  const prepareTemplateImportFromUri = async (
+    fileUri: string,
+    options: { externalOpen?: boolean } = {},
+  ) => {
+    if (!uid || isTemplatesBlocking) return;
+
+    if (templates.length >= LIMITS.templatesPerUser) {
+      setInfoAlert({
+        visible: true,
+        title: "Template Limit Reached",
+        message: "You can save up to 50 templates.",
+      });
+      return;
+    }
+
+    try {
+      setIsTemplateImporting(true);
+      if (options.externalOpen) {
+        setActiveFolderId("All");
+      }
+
+      const raw = await FileSystem.readAsStringAsync(fileUri, {
+        encoding: FileSystem.EncodingType.UTF8,
+      });
+      const payload = await parseTemplateShareFile(raw);
+      const personalExercises = await loadPersonalExercisesForTemplateSharing();
+      const preview = buildTemplateImportPreview(payload, personalExercises);
+
+      if (
+        personalExercises.length + preview.customExercisesToAdd.length >
+        LIMITS.customExercisesPerUser
+      ) {
+        throw new Error(
+          "Importing this template would exceed your 100 custom exercise limit.",
+        );
+      }
+
+      setTemplateImportPreview(preview);
+      setTemplateImportName(preview.suggestedName);
+      Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
+    } catch (error: any) {
+      console.error("Template import preview failed:", error);
+      setInfoAlert({
+        visible: true,
+        title: "Import Failed",
+        message: getTemplateShareErrorMessage(
+          error,
+          "Could not import this template file. Please try again.",
+        ),
+      });
+    } finally {
+      setIsTemplateImporting(false);
+    }
+  };
+
+  const chooseTemplateImportFile = async () => {
+    if (!uid || isTemplatesBlocking) return;
+
+    try {
+      const result = await DocumentPicker.getDocumentAsync({
+        type: "*/*",
+        copyToCacheDirectory: true,
+        multiple: false,
+      });
+
+      if (result.canceled) return;
+
+      const file = result.assets?.[0];
+      if (!file?.uri) {
+        throw new Error("Could not read the selected file.");
+      }
+
+      await prepareTemplateImportFromUri(file.uri);
+    } catch (error: any) {
+      console.error("Template import picker failed:", error);
+      setInfoAlert({
+        visible: true,
+        title: "Import Failed",
+        message: getTemplateShareErrorMessage(
+          error,
+          "Could not import this template file. Please try again.",
+        ),
+      });
+    }
+  };
+
+  useEffect(() => {
+    const fileUri = route?.params?.importTemplateUri;
+    if (!fileUri || !uid) return;
+
+    const importKey = `${route?.params?.importTemplateRequestId || ""}:${fileUri}`;
+    if (handledExternalImportRef.current === importKey) return;
+
+    handledExternalImportRef.current = importKey;
+    prepareTemplateImportFromUri(String(fileUri), { externalOpen: true }).finally(
+      () => {
+        navigation.setParams?.({
+          importTemplateUri: undefined,
+          importTemplateRequestId: undefined,
+        });
+      },
+    );
+  }, [
+    navigation,
+    route?.params?.importTemplateRequestId,
+    route?.params?.importTemplateUri,
+    uid,
+  ]);
+
+  const confirmTemplateImport = async () => {
+    if (!uid || !templateImportPreview || isTemplateImporting) return;
+
+    const finalName = cleanLimitedText(templateImportName, LIMITS.nameChars);
+    if (!finalName) {
+      setInfoAlert({
+        visible: true,
+        title: "Template Name Required",
+        message: "Name this template before importing it.",
+      });
+      return;
+    }
+
+    if (templateNameExists(finalName, templates)) {
+      setInfoAlert({
+        visible: true,
+        title: "Name Taken",
+        message: `A template named "${finalName}" already exists. Rename this import before continuing.`,
+      });
+      return;
+    }
+
+    if (templates.length >= LIMITS.templatesPerUser) {
+      setInfoAlert({
+        visible: true,
+        title: "Template Limit Reached",
+        message: "You can save up to 50 templates.",
+      });
+      return;
+    }
+
+    try {
+      setIsTemplateImporting(true);
+      const rawCustom = await AsyncStorage.getItem(`@user_exercises_${uid}`);
+      const existingCustomExercises = cleanStoredCustomExercises(
+        safeJsonParse<any[]>(rawCustom, []),
+      );
+      const refreshedPreview = buildTemplateImportPreview(
+        templateImportPreview.payload,
+        existingCustomExercises,
+      );
+
+      if (
+        existingCustomExercises.length +
+          refreshedPreview.customExercisesToAdd.length >
+        LIMITS.customExercisesPerUser
+      ) {
+        throw new Error(
+          "Importing this template would exceed your 100 custom exercise limit.",
+        );
+      }
+
+      const importedTemplate = buildImportedTemplateRecord(
+        refreshedPreview.payload,
+        finalName,
+      );
+      const importedCustomExercises = buildImportedCustomExerciseRecords(
+        refreshedPreview.customExercisesToAdd,
+      );
+      const updatedCustomExercises = cleanStoredCustomExercises([
+        ...existingCustomExercises,
+        ...importedCustomExercises,
+      ]);
+
+      if (importedCustomExercises.length > 0) {
+        await AsyncStorage.setItem(
+          `@user_exercises_${uid}`,
+          JSON.stringify(updatedCustomExercises),
+        );
+        syncPersonalExercisesToCloud(updatedCustomExercises).catch((error) =>
+          console.log("Imported exercise cloud sync delayed:", error),
+        );
+      }
+
+      await saveTemplates([...templates, importedTemplate]);
+      if (activeFolderId !== "All" && activeFolder) {
+        await saveFolders(
+          folders.map((folder) =>
+            folder.id === activeFolderId
+              ? normalizeFolder({
+                  ...folder,
+                  templateIds: Array.from(
+                    new Set([...folder.templateIds, importedTemplate.id]),
+                  ),
+                  updatedAt: Date.now(),
+                })
+              : folder,
+          ),
+        );
+      }
+      setTemplateImportPreview(null);
+      setTemplateImportName("");
+      Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
+      setInfoAlert({
+        visible: true,
+        title: "Template Imported",
+        message: `${importedTemplate.name} was added with ${importedTemplate.exercises.length} exercises.${activeFolderId !== "All" && activeFolder ? ` It was also added to ${activeFolder.name}.` : ""}${importedCustomExercises.length > 0 ? ` ${importedCustomExercises.length} custom exercise${importedCustomExercises.length === 1 ? "" : "s"} also added.` : ""}`,
+      });
+    } catch (error: any) {
+      console.error("Template import failed:", error);
+      setInfoAlert({
+        visible: true,
+        title: "Import Failed",
+        message: getTemplateShareErrorMessage(
+          error,
+          "Could not finish importing this template. Please try again.",
+        ),
+      });
+    } finally {
+      setIsTemplateImporting(false);
     }
   };
 
@@ -265,84 +707,117 @@ export default function TemplatesScreen({ navigation }: any) {
     });
   };
 
+  const disableActiveSplit = async () => {
+    if (!activeSplitFolderId) return;
+    Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
+    await saveActiveSplitFolder(null);
+    setIsFolderOptionsVisible(false);
+    setInfoAlert({
+      visible: true,
+      title: "Active Split Disabled",
+      message: "Home will show free training until you set another folder as your active split.",
+    });
+  };
+
   const load = async () => {
-    if (!uid) return;
+    if (!uid) {
+      setLoading(false);
+      return;
+    }
     setLoading(true);
 
-    const saved = await AsyncStorage.getItem(`@workout_templates_${uid}`);
-    let localTemplates = saved
-      ? JSON.parse(saved).filter((t: any) => t && t.id)
-      : [];
-
-    if (localTemplates.length === 0) {
-      try {
-        const cloudTemplates = await fetchConfigFromCloud("templates");
-        if (cloudTemplates && cloudTemplates.length > 0) {
-          localTemplates = cloudTemplates;
-          await AsyncStorage.setItem(
-            `@workout_templates_${uid}`,
-            JSON.stringify(cloudTemplates),
-          );
-        }
-      } catch (error) {
-        console.error("Failed to restore templates:", error);
-      }
-    }
-    setTemplates(localTemplates);
-
-    const savedFolders = await AsyncStorage.getItem(`@workout_folders_${uid}`);
-    let localFolders = savedFolders ? JSON.parse(savedFolders) : [];
-
-    if (localFolders.length === 0) {
-      try {
-        const cloudFolders = await fetchConfigFromCloud("folders");
-        if (cloudFolders && cloudFolders.length > 0) {
-          localFolders = cloudFolders;
-          await AsyncStorage.setItem(
-            `@workout_folders_${uid}`,
-            JSON.stringify(cloudFolders),
-          );
-        }
-      } catch (e) {
-        console.error("Failed to restore folders:", e);
-      }
-    }
-
-    const normalizedFolders = localFolders.map(normalizeFolder);
-    setFolders(normalizedFolders);
-
-    const savedActiveSplitFolderId = await AsyncStorage.getItem(
-      `@active_split_folder_${uid}`,
-    );
-    if (
-      savedActiveSplitFolderId &&
-      normalizedFolders.some(
-        (folder: TemplateFolder) => folder.id === savedActiveSplitFolderId,
-      )
-    ) {
-      setActiveSplitFolderId(savedActiveSplitFolderId);
-    } else if (savedActiveSplitFolderId) {
-      await saveActiveSplitFolder(null);
-    }
-
-    if (JSON.stringify(normalizedFolders) !== JSON.stringify(localFolders)) {
-      await AsyncStorage.setItem(
-        `@workout_folders_${uid}`,
-        JSON.stringify(normalizedFolders),
+    try {
+      const saved = await AsyncStorage.getItem(`@workout_templates_${uid}`);
+      setNextSessionNotesEnabled(await readNextSessionNotesEnabled(uid));
+      let localTemplates = sanitizeTemplatesForStorage(
+        saved ? safeJsonParse<any[]>(saved, []) : [],
       );
-      try {
-        await syncFoldersToCloud(normalizedFolders);
-      } catch (e) {}
+
+      if (localTemplates.length === 0) {
+        try {
+          const cloudTemplates = await fetchConfigFromCloud("templates");
+          if (cloudTemplates && cloudTemplates.length > 0) {
+            localTemplates = sanitizeTemplatesForStorage(cloudTemplates);
+          }
+        } catch (error) {
+          console.log("Failed to restore templates:", error);
+        }
+      }
+
+      const savedFolders = await AsyncStorage.getItem(`@workout_folders_${uid}`);
+      let localFolders = savedFolders ? safeJsonParse(savedFolders, []) : [];
+
+      if (localFolders.length === 0) {
+        try {
+          const cloudFolders = await fetchConfigFromCloud("folders");
+          if (cloudFolders && cloudFolders.length > 0) {
+            localFolders = cloudFolders;
+          }
+        } catch (error) {
+          console.log("Failed to restore folders:", error);
+        }
+      }
+
+      const preNormalizedFolders = localFolders.map(normalizeFolder);
+      const reconciled = reconcileTemplatesAndFoldersForStorage(
+        localTemplates,
+        preNormalizedFolders,
+      );
+      localTemplates = reconciled.templates;
+      const normalizedFolders = reconciled.folders.map(normalizeFolder);
+      setTemplates(localTemplates);
+      setFolders(normalizedFolders);
+
+      if (
+        JSON.stringify(localTemplates) !==
+        JSON.stringify(safeJsonParse(saved, []))
+      ) {
+        await AsyncStorage.setItem(
+          `@workout_templates_${uid}`,
+          JSON.stringify(localTemplates),
+        );
+        try {
+          await saveTemplatesLocallyAndToCloud(localTemplates, uid);
+        } catch (error) {
+          console.log("Failed to sync cleaned templates:", error);
+        }
+      }
+
+      const savedActiveSplitFolderId = await AsyncStorage.getItem(
+        `@active_split_folder_${uid}`,
+      );
+      if (
+        savedActiveSplitFolderId &&
+        normalizedFolders.some(
+          (folder: TemplateFolder) => folder.id === savedActiveSplitFolderId,
+        )
+      ) {
+        setActiveSplitFolderId(savedActiveSplitFolderId);
+      } else if (savedActiveSplitFolderId) {
+        await saveActiveSplitFolder(null);
+      }
+
+      if (JSON.stringify(normalizedFolders) !== JSON.stringify(localFolders)) {
+        await AsyncStorage.setItem(
+          `@workout_folders_${uid}`,
+          JSON.stringify(normalizedFolders),
+        );
+        syncFoldersToCloud(normalizedFolders).catch((error) =>
+          console.log("Cleaned folders cloud sync delayed:", error),
+        );
+      }
+
+      const savedHistory = await AsyncStorage.getItem(`@workout_history_${uid}`);
+      setHistory(
+        savedHistory
+          ? safeJsonParse<any[]>(savedHistory, []).filter((w: any) => w && w.id)
+          : [],
+      );
+    } catch (error) {
+      console.log("Failed to load templates screen:", error);
+    } finally {
+      setLoading(false);
     }
-
-    const savedHistory = await AsyncStorage.getItem(`@workout_history_${uid}`);
-    setHistory(
-      savedHistory
-        ? JSON.parse(savedHistory).filter((w: any) => w && w.id)
-        : [],
-    );
-
-    setLoading(false);
   };
 
   useEffect(() => {
@@ -354,6 +829,26 @@ export default function TemplatesScreen({ navigation }: any) {
     });
     return unsubscribe;
   }, [navigation, uid]);
+
+  useEffect(() => {
+    let isMounted = true;
+
+    const loadDetailNextSessionNotes = async () => {
+      if (!uid || !nextSessionNotesEnabled || !detailTemplate?.id) {
+        if (isMounted) setDetailNextSessionNotes({});
+        return;
+      }
+
+      const notes = await readTemplateNextSessionNotes(uid, detailTemplate.id);
+      if (isMounted) setDetailNextSessionNotes(notes);
+    };
+
+    loadDetailNextSessionNotes();
+
+    return () => {
+      isMounted = false;
+    };
+  }, [detailTemplate?.id, nextSessionNotesEnabled, uid]);
 
   const exitManageMode = () => {
     setIsManageMode(false);
@@ -390,6 +885,7 @@ export default function TemplatesScreen({ navigation }: any) {
   };
 
   const startTemplateFromDetail = (template: any) => {
+    closeNextSessionNoteModal();
     setDetailTemplate(null);
     setTimeout(() => handleTemplatePress(template), 250);
   };
@@ -485,6 +981,32 @@ export default function TemplatesScreen({ navigation }: any) {
     activeFolderId !== "All" && folderTemplates.length === 0;
   const hasTemplateSearch = searchQuery.trim().length > 0;
 
+  const templateIdsInFolders = useMemo(() => {
+    const ids = new Set<string>();
+    folders.forEach((folder) => {
+      folder.templateIds.forEach((templateId) => ids.add(String(templateId)));
+    });
+    return ids;
+  }, [folders]);
+
+  const unfiledTemplates = useMemo(
+    () =>
+      templates.filter(
+        (template) => !templateIdsInFolders.has(String(template?.id || "")),
+      ),
+    [templateIdsInFolders, templates],
+  );
+
+  const showAllFolderOverview =
+    activeFolderId === "All" &&
+    !hasTemplateSearch &&
+    !isManageMode &&
+    folders.length > 0;
+
+  const templateListData = showAllFolderOverview
+    ? unfiledTemplates
+    : displayedTemplates;
+
   const getTemplateCounts = (template: any) => {
     const exercises = template?.exercises || [];
     const totalSets =
@@ -498,7 +1020,146 @@ export default function TemplatesScreen({ navigation }: any) {
   };
 
   const getExerciseName = (ex: any) =>
-    typeof ex === "string" ? ex : ex?.name || "Exercise";
+    typeof ex === "string" ? ex : formatExerciseDisplayName(ex);
+
+  const getDetailExerciseNote = (exercise: any) =>
+    detailNextSessionNotes[getTemplateExerciseNoteKey(exercise)] || "";
+
+  const openNextSessionNoteModal = (template: any, exercise: any) => {
+    if (!uid || !template?.id) return;
+
+    const title = getExerciseName(exercise);
+    const noteKey = getTemplateExerciseNoteKey(exercise);
+    Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
+    setNextSessionNoteTarget({
+      templateId: template.id,
+      exercise,
+      title,
+    });
+    setNextSessionNoteDraft(noteKey ? detailNextSessionNotes[noteKey] || "" : "");
+    setIsNextSessionNoteModalVisible(true);
+  };
+
+  const closeNextSessionNoteModal = () => {
+    setIsNextSessionNoteModalVisible(false);
+    setNextSessionNoteTarget(null);
+    setNextSessionNoteDraft("");
+  };
+
+  const saveNextSessionNote = async () => {
+    if (!uid || !nextSessionNoteTarget) {
+      closeNextSessionNoteModal();
+      return;
+    }
+
+    try {
+      const notes = await writeTemplateNextSessionNote(
+        uid,
+        nextSessionNoteTarget.templateId,
+        nextSessionNoteTarget.exercise,
+        nextSessionNoteDraft,
+      );
+      setDetailNextSessionNotes(notes);
+      closeNextSessionNoteModal();
+      Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
+    } catch (error) {
+      console.log("Unable to save next session note", error);
+      setInfoAlert({
+        visible: true,
+        title: "Note Not Saved",
+        message:
+          "IronVault could not save this next session note. Please try again.",
+      });
+    }
+  };
+
+  const renderNextSessionNoteEditor = () => {
+    if (!isNextSessionNoteModalVisible) return null;
+
+    return (
+      <KeyboardAvoidingView
+        behavior={Platform.OS === "ios" ? "padding" : undefined}
+        style={[
+          styles.modalOverlay,
+          localStyles.nextSessionNoteInlineOverlay,
+        ]}
+      >
+        <View style={styles.actionMenuCard}>
+          <Text style={styles.actionMenuTitle}>Next Session Note</Text>
+          <Text style={styles.actionMenuSubtitle}>
+            Shown only the next time this template is started, then removed
+            after you finish that workout.
+          </Text>
+
+          <Text
+            style={localStyles.nextSessionNoteExerciseTitle}
+            numberOfLines={2}
+          >
+            {nextSessionNoteTarget?.title || "Exercise"}
+          </Text>
+
+          <TextInput
+            style={localStyles.nextSessionNoteInput}
+            value={nextSessionNoteDraft}
+            onChangeText={(value) =>
+              setNextSessionNoteDraft(limitText(value, LIMITS.noteChars))
+            }
+            maxLength={LIMITS.noteChars}
+            multiline
+            placeholder="Example: If the final warm-up moves well, take the heavier top set."
+            placeholderTextColor="#6C6C70"
+            selectionColor="#32D74B"
+          />
+
+          <Text style={localStyles.nextSessionNoteCount}>
+            {nextSessionNoteDraft.length}/{LIMITS.noteChars}
+          </Text>
+
+          <View style={localStyles.nextSessionNoteFooter}>
+            <TouchableOpacity
+              style={localStyles.nextSessionNoteCancelButton}
+              onPress={closeNextSessionNoteModal}
+              activeOpacity={0.82}
+            >
+              <Text style={localStyles.nextSessionNoteCancelText}>Cancel</Text>
+            </TouchableOpacity>
+            <TouchableOpacity
+              style={localStyles.nextSessionNoteSaveButton}
+              onPress={saveNextSessionNote}
+              activeOpacity={0.82}
+            >
+              <Text style={localStyles.nextSessionNoteSaveText}>
+                {nextSessionNoteDraft.trim() ? "Save" : "Clear"}
+              </Text>
+            </TouchableOpacity>
+          </View>
+        </View>
+      </KeyboardAvoidingView>
+    );
+  };
+
+  const renderDetailNoteButton = (template: any, exercise: any) => {
+    if (!nextSessionNotesEnabled) return null;
+
+    const note = getDetailExerciseNote(exercise);
+    return (
+      <TouchableOpacity
+        activeOpacity={0.82}
+        style={[
+          localStyles.detailNoteButton,
+          note && localStyles.detailNoteButtonActive,
+        ]}
+        onPress={() => openNextSessionNoteModal(template, exercise)}
+        hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}
+      >
+        <Ionicons
+          name={note ? "document-text" : "document-text-outline"}
+          size={17}
+          color={note ? "#32D74B" : "#8E8E93"}
+        />
+      </TouchableOpacity>
+    );
+  };
 
   const getTemplatePreviewItems = (template: any) => {
     const exercises = template?.exercises || [];
@@ -549,54 +1210,210 @@ export default function TemplatesScreen({ navigation }: any) {
     return list.join(" • ");
   };
 
+  const renderAllFolderOverview = () => {
+    if (!showAllFolderOverview) return null;
+
+    return (
+      <View style={localStyles.folderOverviewSection}>
+        <View style={localStyles.folderOverviewHeader}>
+          <View>
+            <Text style={localStyles.folderOverviewKicker}>FOLDERS</Text>
+            <Text style={localStyles.folderOverviewTitle}>
+              Browse by folder
+            </Text>
+          </View>
+          <Text style={localStyles.folderOverviewCount}>
+            {folders.length} folder{folders.length === 1 ? "" : "s"}
+          </Text>
+        </View>
+
+        {folders.map((folder) => {
+          const folderTemplateList = folder.templateIds
+            .map((templateId) =>
+              templates.find((template) => template.id === templateId),
+            )
+            .filter(Boolean);
+          const totals = folderTemplateList.reduce(
+            (acc, template) => {
+              const counts = getTemplateCounts(template);
+              acc.exercises += counts.exCount;
+              acc.sets += counts.totalSets;
+              return acc;
+            },
+            { exercises: 0, sets: 0 },
+          );
+          const preview = folderTemplateList
+            .slice(0, 3)
+            .map((template: any) => template.name)
+            .join(" • ");
+
+          return (
+            <TouchableOpacity
+              key={folder.id}
+              style={localStyles.folderOverviewCard}
+              activeOpacity={0.84}
+              onPress={() => {
+                Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
+                setActiveFolderId(folder.id);
+              }}
+            >
+              <View style={localStyles.folderOverviewIcon}>
+                <Ionicons name="folder-outline" size={22} color="#32D74B" />
+              </View>
+              <View style={{ flex: 1, minWidth: 0 }}>
+                <View style={localStyles.folderOverviewNameRow}>
+                  <Text
+                    style={localStyles.folderOverviewName}
+                    numberOfLines={1}
+                  >
+                    {folder.name}
+                  </Text>
+                  {folder.id === activeSplitFolderId && (
+                    <View style={localStyles.activeSplitBadge}>
+                      <Text style={localStyles.activeSplitBadgeText}>
+                        ACTIVE
+                      </Text>
+                    </View>
+                  )}
+                </View>
+                <Text style={localStyles.folderOverviewMeta}>
+                  {folderTemplateList.length} template
+                  {folderTemplateList.length === 1 ? "" : "s"} •{" "}
+                  {totals.exercises} exercises • {totals.sets} sets
+                </Text>
+                <Text style={localStyles.folderOverviewPreview} numberOfLines={1}>
+                  {preview || "No templates in this folder yet"}
+                </Text>
+              </View>
+              <TouchableOpacity
+                style={localStyles.folderOverviewOptionsButton}
+                onPress={() => openFolderOptions(folder)}
+              >
+                <Ionicons
+                  name="ellipsis-horizontal"
+                  size={22}
+                  color="#8E8E93"
+                />
+              </TouchableOpacity>
+            </TouchableOpacity>
+          );
+        })}
+      </View>
+    );
+  };
+
+  const normalizeTemplateMatchName = (value: any) =>
+    String(value || "")
+      .trim()
+      .toLowerCase();
+
+  const getWorkoutTimestamp = (workout: any) => {
+    const candidates = [workout?.startedAt, workout?.finishedAt, workout?.id];
+
+    for (const candidate of candidates) {
+      const numeric = Number(candidate);
+      if (Number.isFinite(numeric) && numeric > 0) return numeric;
+    }
+
+    return parseWorkoutDate(workout?.date).getTime();
+  };
+
   const parseWorkoutDate = (value: any) => {
     if (!value) return new Date(0);
+
     const native = new Date(value);
     if (!Number.isNaN(native.getTime())) return native;
+
     const parts = String(value)
       .split(/[\/-]/)
       .map((part) => parseInt(part, 10));
+
     if (parts.length >= 3 && parts.every((part) => !Number.isNaN(part))) {
       const [a, b, c] = parts;
       const year = c < 100 ? 2000 + c : c;
-      const day = a > 12 ? a : b;
-      const month = a > 12 ? b : a;
-      return new Date(year, month - 1, day);
+
+      if (a > 12) return new Date(year, b - 1, a);
+      if (b > 12) return new Date(year, a - 1, b);
+
+      // Ambiguous old locale strings such as 04/06/2026 cannot be proven from
+      // the text alone. Newer logs use startedAt/finishedAt above, so this is
+      // only a fallback for older sessions.
+      return new Date(year, a - 1, b);
     }
+
     return new Date(0);
   };
 
-  const getLastUsedText = (template: any) => {
-    const templateNames = new Set(
-      (template?.exercises || []).map((ex: any) => getExerciseName(ex)),
+  const getTemplateExerciseSignature = (template: any) =>
+    (template?.exercises || [])
+      .map((ex: any) => normalizeTemplateMatchName(getExerciseName(ex)))
+      .filter(Boolean)
+      .join("||");
+
+  const templateHasDuplicateExerciseSequence = (template: any) => {
+    if (!template) return false;
+
+    const targetSignature = getTemplateExerciseSignature(template);
+    if (!targetSignature) return false;
+
+    return (
+      templates.filter(
+        (candidate: any) =>
+          candidate?.id !== template?.id &&
+          getTemplateExerciseSignature(candidate) === targetSignature,
+      ).length > 0
     );
+  };
 
+  const isWorkoutFromTemplate = (workout: any, template: any) => {
+    if (!workout || !template) return false;
+
+    // Best match: sessions started from a template should carry the template id.
+    // This is the only fully reliable match when two templates have identical exercises.
+    if (workout.templateId && template.id && workout.templateId === template.id)
+      return true;
+
+    const workoutName = normalizeTemplateMatchName(workout.workoutName);
+    const templateName = normalizeTemplateMatchName(template.name);
+    if (workoutName && templateName && workoutName === templateName) return true;
+
+    // If another template has the exact same exercise sequence, exercise matching is
+    // ambiguous. Without templateId or an exact name match, the workout could belong
+    // to either template, so do not mark both cards as last used.
+    if (templateHasDuplicateExerciseSequence(template)) return false;
+
+    const templateExerciseNames = (template?.exercises || [])
+      .map((ex: any) => normalizeTemplateMatchName(getExerciseName(ex)))
+      .filter(Boolean);
+
+    const workoutExerciseNames = (workout?.fullWorkoutData || [])
+      .map((ex: any) => normalizeTemplateMatchName(ex?.name || getExerciseName(ex)))
+      .filter(Boolean);
+
+    if (templateExerciseNames.length === 0 || workoutExerciseNames.length === 0)
+      return false;
+
+    if (templateExerciseNames.length !== workoutExerciseNames.length) return false;
+
+    return templateExerciseNames.every(
+      (name: string, index: number) => name === workoutExerciseNames[index],
+    );
+  };
+
+  const getLastUsedText = (template: any) => {
     const match = history
-      .filter((workout: any) => {
-        if (workout.templateId && workout.templateId === template.id)
-          return true;
-        if (workout.workoutName === template.name) return true;
-
-        const workoutNames = new Set(
-          (workout.fullWorkoutData || []).map((ex: any) => ex?.name),
-        );
-        if (templateNames.size === 0 || workoutNames.size === 0) return false;
-        let overlap = 0;
-        templateNames.forEach((name) => {
-          if (workoutNames.has(name)) overlap += 1;
-        });
-        return overlap >= Math.min(2, templateNames.size);
-      })
-      .sort(
-        (a: any, b: any) =>
-          parseWorkoutDate(b.date).getTime() -
-          parseWorkoutDate(a.date).getTime(),
-      )[0];
+      .filter((workout: any) => isWorkoutFromTemplate(workout, template))
+      .sort((a: any, b: any) => getWorkoutTimestamp(b) - getWorkoutTimestamp(a))[0];
 
     if (!match) return "Never used";
-    const date = parseWorkoutDate(match.date);
-    if (date.getTime() === 0) return "Used before";
-    const diffDays = Math.floor((Date.now() - date.getTime()) / 86400000);
+
+    const timestamp = getWorkoutTimestamp(match);
+    if (!timestamp) return "Used before";
+
+    const lastUsedDay = startOfLocalDay(timestamp);
+    const today = startOfLocalDay(Date.now());
+    const diffDays = Math.floor((today - lastUsedDay) / 86400000);
+
     if (diffDays <= 0) return "Last used today";
     if (diffDays === 1) return "Last used yesterday";
     return `Last used ${diffDays} days ago`;
@@ -616,7 +1433,7 @@ export default function TemplatesScreen({ navigation }: any) {
 
   const openFolderOptions = (folder: TemplateFolder) => {
     setEditingFolderId(folder.id);
-    setFolderName(folder.name);
+    setFolderName(limitText(folder.name, LIMITS.nameChars));
     setFolderCycleLength(folder.cycleLength || 7);
     setIsFolderOptionsVisible(true);
   };
@@ -727,23 +1544,100 @@ export default function TemplatesScreen({ navigation }: any) {
     Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Heavy);
 
     const idSet = new Set(ids);
+    const deletedTemplates = templates.filter((template) =>
+      idSet.has(template.id),
+    );
     const updatedTemplates = templates.filter(
       (template) => !idSet.has(template.id),
     );
     const updatedFolders = cleanFoldersAfterTemplateDelete(folders, ids);
 
-    await saveTemplates(updatedTemplates);
-    await saveFolders(updatedFolders);
-
+    setTemplateUndo({
+      templates,
+      folders,
+      activeFolderId,
+      message: `${deletedTemplates.length} template${
+        deletedTemplates.length === 1 ? "" : "s"
+      } deleted`,
+    });
+    setTemplates(sanitizeTemplatesForStorage(updatedTemplates));
+    setFolders(
+      sanitizeFoldersForStorage(updatedFolders.map(normalizeFolder)).map(
+        normalizeFolder,
+      ),
+    );
     setSelectedTemplate(null);
     setSelectedTemplateIds([]);
     setIsManageMode(false);
-    setInfoAlert({
-      visible: true,
-      title: "Templates Deleted",
-      message: `${ids.length} template${ids.length === 1 ? "" : "s"} removed. Any split days using them were changed to rest days.`,
-    });
+
+    Promise.resolve()
+      .then(async () => {
+        await markConfigItemsDeletedLocally("templates", deletedTemplates, uid);
+        await saveTemplates(updatedTemplates);
+        await saveFolders(updatedFolders);
+      })
+      .catch((error) => {
+        console.log("Template delete persistence delayed:", error);
+      });
   };
+
+  const deleteFolderById = (folderId?: string | null) => {
+    if (!folderId) {
+      setDeleteFolderAlertVisible(false);
+      setIsFolderOptionsVisible(false);
+      return;
+    }
+
+    const folderToDelete = folders.find((folder) => folder.id === folderId);
+    const nextFolders = folders.filter((folder) => folder.id !== folderId);
+    const normalizedFolders = sanitizeFoldersForStorage(
+      nextFolders.map(normalizeFolder),
+    ).map(normalizeFolder);
+    const shouldClearActiveSplit = folderId === activeSplitFolderId;
+
+    Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Heavy);
+    setDeleteFolderAlertVisible(false);
+    setIsFolderOptionsVisible(false);
+    setActiveFolderId("All");
+    setEditingFolderId(null);
+    setFolders(normalizedFolders);
+    if (shouldClearActiveSplit) {
+      setActiveSplitFolderId(null);
+    }
+
+    Promise.resolve()
+      .then(async () => {
+        if (uid && folderToDelete) {
+          await markConfigItemsDeletedLocally("folders", [folderToDelete], uid);
+        }
+        await saveFolders(normalizedFolders);
+        if (shouldClearActiveSplit) {
+          await saveActiveSplitFolder(null);
+        }
+      })
+      .catch((error) => {
+        console.log("Folder delete persistence delayed:", error);
+      });
+  };
+
+  const dismissTemplateUndo = useCallback(() => {
+    setTemplateUndo(null);
+  }, []);
+
+  const undoTemplateDelete = useCallback(async () => {
+    if (!templateUndo) return;
+
+    Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
+    await clearConfigItemsDeletedLocally(
+      "templates",
+      templateUndo.templates,
+      uid,
+    );
+    await saveTemplates(templateUndo.templates);
+    await saveFolders(templateUndo.folders);
+    setActiveFolderId(templateUndo.activeFolderId);
+    setTemplateUndo(null);
+  }, [templateUndo]);
 
   const toggleTemplateSelection = (templateId: string) => {
     Haptics.selectionAsync();
@@ -791,7 +1685,16 @@ export default function TemplatesScreen({ navigation }: any) {
             </Text>
           </View>
           <View style={localStyles.splitHeaderActions}>
-            {activeFolder.id !== activeSplitFolderId && (
+            {activeFolder.id === activeSplitFolderId ? (
+              <TouchableOpacity
+                style={localStyles.disableActiveSplitButtonCompact}
+                onPress={disableActiveSplit}
+              >
+                <Text style={localStyles.disableActiveSplitButtonText}>
+                  Disable
+                </Text>
+              </TouchableOpacity>
+            ) : (
               <TouchableOpacity
                 style={localStyles.setActiveSplitButtonCompact}
                 onPress={() => setFolderAsActiveSplit(activeFolder)}
@@ -892,10 +1795,11 @@ export default function TemplatesScreen({ navigation }: any) {
           {
             text: "Delete",
             style: "destructive",
-            onPress: async () => {
-              if (!selectedTemplate) return;
-              await deleteTemplatesByIds([selectedTemplate.id]);
-            },
+            onPress: () =>
+              runTemplateBlockingAction("Deleting template...", async () => {
+                if (!selectedTemplate) return;
+                await deleteTemplatesByIds([selectedTemplate.id]);
+              }),
           },
         ]}
         onClose={() => setDeleteAlertVisible(false)}
@@ -910,9 +1814,10 @@ export default function TemplatesScreen({ navigation }: any) {
           {
             text: "Delete",
             style: "destructive",
-            onPress: async () => {
-              await deleteTemplatesByIds(selectedTemplateIds);
-            },
+            onPress: () =>
+              runTemplateBlockingAction("Deleting templates...", async () => {
+                await deleteTemplatesByIds(selectedTemplateIds);
+              }),
           },
         ]}
         onClose={() => setBatchDeleteAlertVisible(false)}
@@ -927,17 +1832,7 @@ export default function TemplatesScreen({ navigation }: any) {
           {
             text: "Delete",
             style: "destructive",
-            onPress: () => {
-              Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Heavy);
-              const newFolders = folders.filter(
-                (f) => f.id !== editingFolderId,
-              );
-              saveFolders(newFolders);
-              if (editingFolderId === activeSplitFolderId) {
-                saveActiveSplitFolder(null);
-              }
-              setActiveFolderId("All");
-            },
+            onPress: () => deleteFolderById(editingFolderId),
           },
         ]}
         onClose={() => setDeleteFolderAlertVisible(false)}
@@ -1022,7 +1917,13 @@ export default function TemplatesScreen({ navigation }: any) {
                 </TouchableOpacity>
                 <TouchableOpacity
                   style={styles.reorderDoneButton}
-                  onPress={saveTemplateReorder}
+                  disabled={isTemplatesBlocking}
+                  onPress={() =>
+                    runTemplateBlockingAction(
+                      "Saving order...",
+                      saveTemplateReorder,
+                    )
+                  }
                 >
                   <Text style={styles.reorderDoneButtonText}>Done</Text>
                 </TouchableOpacity>
@@ -1037,7 +1938,7 @@ export default function TemplatesScreen({ navigation }: any) {
         animationType="slide"
         transparent={false}
       >
-        <View style={styles.screen}>
+        <View style={[styles.screen, localStyles.detailModalScreen]}>
           <View
             style={[
               localStyles.detailHeader,
@@ -1047,7 +1948,10 @@ export default function TemplatesScreen({ navigation }: any) {
             <View style={localStyles.detailHeaderContent}>
               <TouchableOpacity
                 style={localStyles.detailHeaderButton}
-                onPress={() => setDetailTemplate(null)}
+                onPress={() => {
+                  closeNextSessionNoteModal();
+                  setDetailTemplate(null);
+                }}
                 hitSlop={{ top: 10, bottom: 10, left: 10, right: 10 }}
               >
                 <Ionicons name="close" size={30} color="#FFF" />
@@ -1066,6 +1970,7 @@ export default function TemplatesScreen({ navigation }: any) {
                 ]}
                 onPress={() => {
                   const template = detailTemplate;
+                  closeNextSessionNoteModal();
                   setDetailTemplate(null);
                   setTimeout(() => {
                     navigation.navigate("EditTemplate", {
@@ -1166,16 +2071,27 @@ export default function TemplatesScreen({ navigation }: any) {
                                 </Text>
                                 {group.exercises.map(
                                   (member: any, memberIndex: number) => (
-                                    <Text
+                                    <View
                                       key={`${member.name}-${memberIndex}`}
-                                      style={localStyles.detailExerciseMeta}
-                                      numberOfLines={1}
+                                      style={localStyles.detailSupersetMemberRow}
                                     >
-                                      {group.label}
-                                      {member.supersetOrder ||
-                                        memberIndex + 1}{" "}
-                                      {member.name}
-                                    </Text>
+                                      <Text
+                                        style={[
+                                          localStyles.detailExerciseMeta,
+                                          { flex: 1, marginTop: 0 },
+                                        ]}
+                                        numberOfLines={1}
+                                      >
+                                        {group.label}
+                                        {member.supersetOrder ||
+                                          memberIndex + 1}{" "}
+                                        {member.name}
+                                      </Text>
+                                      {renderDetailNoteButton(
+                                        detailTemplate,
+                                        member,
+                                      )}
+                                    </View>
                                   ),
                                 )}
                               </View>
@@ -1190,12 +2106,6 @@ export default function TemplatesScreen({ navigation }: any) {
                             : Array.isArray(ex.sets)
                               ? ex.sets.length
                               : ex.sets || 1;
-                        const variant =
-                          typeof ex !== "string" &&
-                          ex.exerciseVariant &&
-                          ex.exerciseVariant !== "Normal"
-                            ? ex.exerciseVariant
-                            : null;
                         return (
                           <View
                             key={`${exName}-${index}`}
@@ -1213,7 +2123,7 @@ export default function TemplatesScreen({ navigation }: any) {
                                 style={localStyles.detailExerciseName}
                                 numberOfLines={2}
                               >
-                                {variant ? `${exName} · ${variant}` : exName}
+                                {exName}
                               </Text>
                               <Text
                                 style={localStyles.detailExerciseMeta}
@@ -1225,6 +2135,7 @@ export default function TemplatesScreen({ navigation }: any) {
                                   : ""}
                               </Text>
                             </View>
+                            {renderDetailNoteButton(detailTemplate, ex)}
                           </View>
                         );
                       },
@@ -1249,6 +2160,8 @@ export default function TemplatesScreen({ navigation }: any) {
               </View>
             </>
           )}
+
+          {renderNextSessionNoteEditor()}
         </View>
       </Modal>
 
@@ -1278,15 +2191,19 @@ export default function TemplatesScreen({ navigation }: any) {
             </TouchableOpacity>
             <TouchableOpacity
               style={styles.actionMenuBtn}
-              onPress={() =>
+              onPress={() => {
+                if (editingFolderId === activeSplitFolderId) {
+                  disableActiveSplit();
+                  return;
+                }
                 setFolderAsActiveSplit(
                   folders.find((f) => f.id === editingFolderId) || null,
-                )
-              }
+                );
+              }}
             >
               <Text style={styles.actionMenuBtnText}>
                 {editingFolderId === activeSplitFolderId
-                  ? "Active Split"
+                  ? "Disable Active Split"
                   : "Set as Active Split"}
               </Text>
             </TouchableOpacity>
@@ -1321,7 +2238,10 @@ export default function TemplatesScreen({ navigation }: any) {
             <TextInput
               style={styles.modalInput}
               value={folderName}
-              onChangeText={setFolderName}
+              onChangeText={(value) =>
+                setFolderName(limitText(value, LIMITS.nameChars))
+              }
+              maxLength={LIMITS.nameChars}
               placeholder="e.g., Current Split, PPL, Upper Lower"
               placeholderTextColor="#48484A"
               selectionColor="#FFF"
@@ -1361,68 +2281,90 @@ export default function TemplatesScreen({ navigation }: any) {
                 <Text style={styles.modalActionText}>Cancel</Text>
               </TouchableOpacity>
               <TouchableOpacity
-                onPress={() => {
-                  const finalName = folderName.trim();
-                  if (!finalName) return;
+                disabled={isTemplatesBlocking}
+                onPress={() =>
+                  runTemplateBlockingAction(
+                    editingFolderId ? "Saving folder..." : "Creating folder...",
+                    async () => {
+                      const finalName = cleanLimitedText(
+                        folderName,
+                        LIMITS.nameChars,
+                      );
+                      if (!finalName) return;
+                      if (
+                        !editingFolderId &&
+                        folders.length >= LIMITS.foldersPerUser
+                      ) {
+                        Haptics.notificationAsync(
+                          Haptics.NotificationFeedbackType.Warning,
+                        );
+                        Alert.alert(
+                          "Folder Limit Reached",
+                          "You can save up to 20 folders.",
+                        );
+                        return;
+                      }
 
-                  const duplicate = folders.find(
-                    (f) =>
-                      f.name.toLowerCase() === finalName.toLowerCase() &&
-                      f.id !== editingFolderId,
-                  );
-                  if (duplicate) {
-                    Haptics.notificationAsync(
-                      Haptics.NotificationFeedbackType.Warning,
-                    );
-                    Alert.alert(
-                      "Name Taken",
-                      "A folder with this name already exists.",
-                    );
-                    return;
-                  }
+                      const duplicate = folders.find(
+                        (f) =>
+                          f.name.toLowerCase() === finalName.toLowerCase() &&
+                          f.id !== editingFolderId,
+                      );
+                      if (duplicate) {
+                        Haptics.notificationAsync(
+                          Haptics.NotificationFeedbackType.Warning,
+                        );
+                        Alert.alert(
+                          "Name Taken",
+                          "A folder with this name already exists.",
+                        );
+                        return;
+                      }
 
-                  Haptics.notificationAsync(
-                    Haptics.NotificationFeedbackType.Success,
-                  );
-                  if (editingFolderId) {
-                    saveFolders(
-                      folders.map((f) => {
-                        if (f.id !== editingFolderId) return f;
-                        return normalizeFolder({
-                          ...f,
+                      Haptics.notificationAsync(
+                        Haptics.NotificationFeedbackType.Success,
+                      );
+                      if (editingFolderId) {
+                        await saveFolders(
+                          folders.map((f) => {
+                            if (f.id !== editingFolderId) return f;
+                            return normalizeFolder({
+                              ...f,
+                              name: finalName,
+                              cycleLength: folderCycleLength,
+                              days: resizeSplitDays(
+                                f.days,
+                                folderCycleLength,
+                                f.templateIds,
+                              ),
+                              updatedAt: Date.now(),
+                            });
+                          }),
+                        );
+                      } else {
+                        const newFolder = normalizeFolder({
+                          id: genId("fldr-"),
                           name: finalName,
+                          templateIds: [],
                           cycleLength: folderCycleLength,
-                          days: resizeSplitDays(
-                            f.days,
-                            folderCycleLength,
-                            f.templateIds,
-                          ),
+                          days: normalizeSplitDays([], folderCycleLength, []),
+                          startDate: startOfLocalDay(Date.now()),
+                          createdAt: Date.now(),
                           updatedAt: Date.now(),
                         });
-                      }),
-                    );
-                  } else {
-                    const newFolder = normalizeFolder({
-                      id: genId("fldr-"),
-                      name: finalName,
-                      templateIds: [],
-                      cycleLength: folderCycleLength,
-                      days: normalizeSplitDays([], folderCycleLength, []),
-                      startDate: startOfLocalDay(Date.now()),
-                      createdAt: Date.now(),
-                      updatedAt: Date.now(),
-                    });
-                    saveFolders([...folders, newFolder]);
-                    setActiveFolderId(newFolder.id);
-                    if (
-                      folders.length === 0 ||
-                      finalName.trim().toLowerCase() === "current split"
-                    ) {
-                      saveActiveSplitFolder(newFolder.id);
-                    }
-                  }
-                  setIsFolderModalVisible(false);
-                }}
+                        await saveFolders([...folders, newFolder]);
+                        setActiveFolderId(newFolder.id);
+                        if (
+                          folders.length === 0 ||
+                          finalName.trim().toLowerCase() === "current split"
+                        ) {
+                          await saveActiveSplitFolder(newFolder.id);
+                        }
+                      }
+                      setIsFolderModalVisible(false);
+                    },
+                  )
+                }
               >
                 <Text
                   style={[
@@ -1455,7 +2397,10 @@ export default function TemplatesScreen({ navigation }: any) {
               <TouchableOpacity
                 style={localStyles.splitModalHeaderButtonRight}
                 hitSlop={{ top: 10, bottom: 10, left: 10, right: 10 }}
-                onPress={saveSplitSchedule}
+                disabled={isTemplatesBlocking}
+                onPress={() =>
+                  runTemplateBlockingAction("Saving split...", saveSplitSchedule)
+                }
               >
                 <Text style={localStyles.headerSaveText}>Save</Text>
               </TouchableOpacity>
@@ -1507,7 +2452,13 @@ export default function TemplatesScreen({ navigation }: any) {
                 </View>
                 <TouchableOpacity
                   style={localStyles.splitStartButton}
-                  onPress={resetSplitStartDateToToday}
+                  disabled={isTemplatesBlocking}
+                  onPress={() =>
+                    runTemplateBlockingAction(
+                      "Saving start date...",
+                      resetSplitStartDateToToday,
+                    )
+                  }
                 >
                   <Text style={localStyles.splitStartButtonText}>
                     Set Today
@@ -1529,8 +2480,7 @@ export default function TemplatesScreen({ navigation }: any) {
                   No templates in this folder
                 </Text>
                 <Text style={localStyles.emptyBody}>
-                  Add templates to this folder first, then assign them to split
-                  days.
+                  Templates are optional. Add routines here only if you want this folder to act as a split.
                 </Text>
               </View>
             )}
@@ -1636,33 +2586,42 @@ export default function TemplatesScreen({ navigation }: any) {
                 <TouchableOpacity
                   key={f.id}
                   style={styles.actionMenuBtn}
-                  onPress={() => {
-                    Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
-                    const updatedFolders = folders.map((folder) => {
-                      if (folder.id === f.id) {
-                        if (
-                          !folder.templateIds.includes(selectedTemplate?.id)
-                        ) {
-                          return normalizeFolder({
-                            ...folder,
-                            templateIds: [
-                              ...folder.templateIds,
-                              selectedTemplate?.id,
-                            ],
-                            updatedAt: Date.now(),
-                          });
-                        }
-                      }
-                      return folder;
-                    });
-                    saveFolders(updatedFolders);
-                    setIsMoveModalVisible(false);
-                    setInfoAlert({
-                      visible: true,
-                      title: "Added",
-                      message: `Added to ${f.name}`,
-                    });
-                  }}
+                  onPress={() =>
+                    runTemplateBlockingAction(
+                      "Adding to folder...",
+                      async () => {
+                        Haptics.impactAsync(
+                          Haptics.ImpactFeedbackStyle.Light,
+                        );
+                        const updatedFolders = folders.map((folder) => {
+                          if (folder.id === f.id) {
+                            if (
+                              !folder.templateIds.includes(
+                                selectedTemplate?.id,
+                              )
+                            ) {
+                              return normalizeFolder({
+                                ...folder,
+                                templateIds: [
+                                  ...folder.templateIds,
+                                  selectedTemplate?.id,
+                                ],
+                                updatedAt: Date.now(),
+                              });
+                            }
+                          }
+                          return folder;
+                        });
+                        await saveFolders(updatedFolders);
+                        setIsMoveModalVisible(false);
+                        setInfoAlert({
+                          visible: true,
+                          title: "Added",
+                          message: `Added to ${f.name}`,
+                        });
+                      },
+                    )
+                  }
                 >
                   <Text style={styles.actionMenuBtnText}>{f.name}</Text>
                 </TouchableOpacity>
@@ -1715,32 +2674,38 @@ export default function TemplatesScreen({ navigation }: any) {
                 Folder Templates
               </Text>
               <TouchableOpacity
-                onPress={() => {
-                  Haptics.notificationAsync(
-                    Haptics.NotificationFeedbackType.Success,
-                  );
-                  const updatedFolders = folders.map((f) => {
-                    if (f.id !== activeFolderId) return f;
-                    const days = f.days.map((day) => {
-                      if (
-                        day.type === "template" &&
-                        day.templateId &&
-                        !batchSelectIds.includes(day.templateId)
-                      ) {
-                        return createRestDay(day.dayNumber);
-                      }
-                      return day;
-                    });
-                    return normalizeFolder({
-                      ...f,
-                      templateIds: batchSelectIds,
-                      days,
-                      updatedAt: Date.now(),
-                    });
-                  });
-                  saveFolders(updatedFolders);
-                  setIsBatchSelectVisible(false);
-                }}
+                disabled={isTemplatesBlocking}
+                onPress={() =>
+                  runTemplateBlockingAction(
+                    "Saving folder templates...",
+                    async () => {
+                      Haptics.notificationAsync(
+                        Haptics.NotificationFeedbackType.Success,
+                      );
+                      const updatedFolders = folders.map((f) => {
+                        if (f.id !== activeFolderId) return f;
+                        const days = f.days.map((day) => {
+                          if (
+                            day.type === "template" &&
+                            day.templateId &&
+                            !batchSelectIds.includes(day.templateId)
+                          ) {
+                            return createRestDay(day.dayNumber);
+                          }
+                          return day;
+                        });
+                        return normalizeFolder({
+                          ...f,
+                          templateIds: batchSelectIds,
+                          days,
+                          updatedAt: Date.now(),
+                        });
+                      });
+                      await saveFolders(updatedFolders);
+                      setIsBatchSelectVisible(false);
+                    },
+                  )
+                }
               >
                 <Text
                   style={{ color: "#32D74B", fontSize: 17, fontWeight: "700" }}
@@ -1849,6 +2814,33 @@ export default function TemplatesScreen({ navigation }: any) {
             <TouchableOpacity
               style={styles.actionMenuBtn}
               onPress={() => {
+                const template = selectedTemplate;
+                setIsMenuVisible(false);
+                setTimeout(() => duplicateTemplate(template), 250);
+              }}
+            >
+              <Text style={styles.actionMenuBtnText}>Duplicate Template</Text>
+            </TouchableOpacity>
+
+            <TouchableOpacity
+              style={styles.actionMenuBtn}
+              onPress={() => {
+                const template = selectedTemplate;
+                setIsMenuVisible(false);
+                runTemplateBlockingAction("Preparing share...", async () => {
+                  await new Promise((resolve) => setTimeout(resolve, 250));
+                  await shareTemplate(template);
+                });
+              }}
+            >
+              <Text style={styles.actionMenuBtnText}>
+                {isTemplateSharing ? "Preparing Share..." : "Share Template"}
+              </Text>
+            </TouchableOpacity>
+
+            <TouchableOpacity
+              style={styles.actionMenuBtn}
+              onPress={() => {
                 setIsMenuVisible(false);
                 setTimeout(() => setIsMoveModalVisible(true), 400);
               }}
@@ -1859,31 +2851,38 @@ export default function TemplatesScreen({ navigation }: any) {
             {activeFolderId !== "All" && (
               <TouchableOpacity
                 style={styles.actionMenuBtn}
-                onPress={() => {
-                  Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
-                  const updatedFolders = folders.map((f) => {
-                    if (f.id !== activeFolderId) return f;
-                    const days = f.days.map((day) => {
-                      if (
-                        day.type === "template" &&
-                        day.templateId === selectedTemplate?.id
-                      ) {
-                        return createRestDay(day.dayNumber);
-                      }
-                      return day;
-                    });
-                    return normalizeFolder({
-                      ...f,
-                      templateIds: f.templateIds.filter(
-                        (id: string) => id !== selectedTemplate?.id,
-                      ),
-                      days,
-                      updatedAt: Date.now(),
-                    });
-                  });
-                  saveFolders(updatedFolders);
-                  setIsMenuVisible(false);
-                }}
+                onPress={() =>
+                  runTemplateBlockingAction(
+                    "Removing from folder...",
+                    async () => {
+                      Haptics.impactAsync(
+                        Haptics.ImpactFeedbackStyle.Light,
+                      );
+                      const updatedFolders = folders.map((f) => {
+                        if (f.id !== activeFolderId) return f;
+                        const days = f.days.map((day) => {
+                          if (
+                            day.type === "template" &&
+                            day.templateId === selectedTemplate?.id
+                          ) {
+                            return createRestDay(day.dayNumber);
+                          }
+                          return day;
+                        });
+                        return normalizeFolder({
+                          ...f,
+                          templateIds: f.templateIds.filter(
+                            (id: string) => id !== selectedTemplate?.id,
+                          ),
+                          days,
+                          updatedAt: Date.now(),
+                        });
+                      });
+                      await saveFolders(updatedFolders);
+                      setIsMenuVisible(false);
+                    },
+                  )
+                }
               >
                 <Text style={[styles.actionMenuBtnText, { color: "#FF9F0A" }]}>
                   Remove from this Folder
@@ -1910,6 +2909,133 @@ export default function TemplatesScreen({ navigation }: any) {
             </TouchableOpacity>
           </View>
         </TouchableOpacity>
+      </Modal>
+
+      <Modal
+        visible={!!templateImportPreview}
+        transparent
+        animationType="fade"
+        onRequestClose={() => {
+          setTemplateImportPreview(null);
+          setTemplateImportName("");
+        }}
+      >
+        <KeyboardAvoidingView
+          behavior={Platform.OS === "ios" ? "padding" : "height"}
+          style={styles.modalOverlay}
+        >
+          <View style={localStyles.importModalContent}>
+            <Text style={styles.actionMenuTitle}>Import Template</Text>
+            <Text style={localStyles.importModalSubtitle}>
+              This IronVault template passed safety checks before previewing.
+            </Text>
+
+            <View style={localStyles.importSummaryCard}>
+              <Text style={localStyles.importSummaryName} numberOfLines={2}>
+                {templateImportPreview?.suggestedName || "Shared Template"}
+              </Text>
+              <Text style={localStyles.importSummaryMeta}>
+                {templateImportPreview?.exerciseCount || 0} exercises •{" "}
+                {templateImportPreview?.setCount || 0} sets
+              </Text>
+              <Text style={localStyles.importSummaryMeta}>
+                {templateImportPreview?.customExercisesToAdd.length || 0} custom
+                exercise
+                {templateImportPreview?.customExercisesToAdd.length === 1
+                  ? ""
+                  : "s"}{" "}
+                will be added
+              </Text>
+            </View>
+
+            <Text style={localStyles.importFieldLabel}>Template name</Text>
+            <TextInput
+              style={[
+                styles.modalInput,
+                {
+                  marginBottom: 8,
+                  borderColor: templateNameExists(templateImportName, templates)
+                    ? "#FF453A"
+                    : "#3A3A3C",
+                },
+              ]}
+              value={templateImportName}
+              onChangeText={(value) =>
+                setTemplateImportName(limitText(value, LIMITS.nameChars))
+              }
+              placeholder="Template name"
+              placeholderTextColor="#636366"
+              selectionColor="#FFF"
+              maxLength={LIMITS.nameChars}
+            />
+
+            {templateNameExists(templateImportName, templates) && (
+              <Text style={localStyles.importWarningText}>
+                This name already exists. Rename it before importing.
+              </Text>
+            )}
+
+            {!!templateImportPreview?.customExercisesToAdd.length && (
+              <View style={localStyles.importDetailBox}>
+                <Text style={localStyles.importDetailTitle}>
+                  Custom exercises to add
+                </Text>
+                <Text style={localStyles.importDetailText} numberOfLines={3}>
+                  {templateImportPreview.customExercisesToAdd
+                    .map((exercise: any) => exercise.name)
+                    .join(", ")}
+                </Text>
+              </View>
+            )}
+
+            {!!templateImportPreview?.existingCustomExerciseNames.length && (
+              <View style={localStyles.importDetailBox}>
+                <Text style={localStyles.importDetailTitle}>
+                  Existing custom exercises reused
+                </Text>
+                <Text style={localStyles.importDetailText} numberOfLines={2}>
+                  {templateImportPreview.existingCustomExerciseNames.join(", ")}
+                </Text>
+              </View>
+            )}
+
+            <View style={styles.modalButtonRow}>
+              <TouchableOpacity
+                disabled={isTemplateImporting}
+                onPress={() => {
+                  setTemplateImportPreview(null);
+                  setTemplateImportName("");
+                }}
+              >
+                <Text style={styles.modalActionText}>Cancel</Text>
+              </TouchableOpacity>
+              <TouchableOpacity
+                disabled={
+                  isTemplateImporting ||
+                  !templateImportName.trim() ||
+                  templateNameExists(templateImportName, templates)
+                }
+                onPress={confirmTemplateImport}
+              >
+                <Text
+                  style={[
+                    styles.modalActionText,
+                    {
+                      color:
+                        isTemplateImporting ||
+                        !templateImportName.trim() ||
+                        templateNameExists(templateImportName, templates)
+                          ? "#636366"
+                          : "#32D74B",
+                    },
+                  ]}
+                >
+                  {isTemplateImporting ? "Importing..." : "Import"}
+                </Text>
+              </TouchableOpacity>
+            </View>
+          </View>
+        </KeyboardAvoidingView>
       </Modal>
 
       <SafeAreaView edges={["top"]} style={styles.headerContainer}>
@@ -2032,12 +3158,30 @@ export default function TemplatesScreen({ navigation }: any) {
             />
             <Text style={localStyles.newFolderChipText}>Folder</Text>
           </TouchableOpacity>
+
+          {!isManageMode && (
+            <TouchableOpacity
+              style={localStyles.importTemplateChip}
+              onPress={chooseTemplateImportFile}
+              disabled={isTemplateImporting}
+            >
+              <Ionicons
+                name="download-outline"
+                size={15}
+                color="#32D74B"
+                style={{ marginRight: 5 }}
+              />
+              <Text style={localStyles.importTemplateChipText}>
+                {isTemplateImporting ? "Importing" : "Import"}
+              </Text>
+            </TouchableOpacity>
+          )}
         </ScrollView>
       </View>
 
       <FlatList
         ref={listRef}
-        data={displayedTemplates}
+        data={templateListData}
         keyExtractor={(item) => item?.id || Math.random().toString()}
         contentContainerStyle={[
           localStyles.listContent,
@@ -2077,14 +3221,14 @@ export default function TemplatesScreen({ navigation }: any) {
               </View>
             )}
 
-            {!isManageMode && activeFolderId === "All" && (
+            {!isManageMode && (
               <TouchableOpacity
                 style={localStyles.createCard}
                 activeOpacity={0.82}
                 onPress={() =>
-                  navigation.navigate("EditTemplate", {
-                    folderId: null,
-                  })
+                  createTemplateInFolder(
+                    activeFolderId === "All" ? null : activeFolderId,
+                  )
                 }
               >
                 <View style={localStyles.createIcon}>
@@ -2092,16 +3236,31 @@ export default function TemplatesScreen({ navigation }: any) {
                 </View>
                 <View style={{ flex: 1 }}>
                   <Text style={localStyles.createKicker}>TEMPLATE</Text>
-                  <Text style={localStyles.createTitle}>Create New Template</Text>
+                  <Text style={localStyles.createTitle}>
+                    Create New Template
+                  </Text>
                   <Text style={localStyles.createSub}>
-                    Build a reusable workout structure
+                    {activeFolderId === "All"
+                      ? "Optional: build a reusable workout structure"
+                      : `Saved into ${activeFolder?.name || "this folder"} and your template library`}
                   </Text>
                 </View>
               </TouchableOpacity>
             )}
+
+            {renderAllFolderOverview()}
+
+            {showAllFolderOverview && unfiledTemplates.length > 0 && (
+              <View style={localStyles.unfiledHeader}>
+                <Text style={localStyles.unfiledKicker}>UNFILED</Text>
+                <Text style={localStyles.unfiledTitle}>
+                  Templates not in a folder
+                </Text>
+              </View>
+            )}
           </View>
         }
-        renderItem={({ item, index }) => {
+        renderItem={({ item }) => {
           const { exCount, totalSets } = getTemplateCounts(item);
           const preview = getTemplatePreview(item);
           const muscleSummary = getTemplateMuscleSummary(item);
@@ -2188,56 +3347,57 @@ export default function TemplatesScreen({ navigation }: any) {
           );
         }}
         ListEmptyComponent={
-          <View style={localStyles.emptyCard}>
-            <View style={localStyles.emptyIcon}>
-              <Ionicons name="clipboard-outline" size={26} color="#32D74B" />
+          showAllFolderOverview ? null : (
+            <View style={localStyles.emptyCard}>
+              <View style={localStyles.emptyIcon}>
+                <Ionicons name="clipboard-outline" size={26} color="#32D74B" />
+              </View>
+              <Text style={localStyles.emptyTitle}>
+                {loading
+                  ? "Restoring routines..."
+                  : hasTemplateSearch
+                    ? "No matching templates"
+                    : activeFolderId === "All"
+                      ? "No templates yet"
+                      : "This folder is empty"}
+              </Text>
+              <Text style={localStyles.emptyBody}>
+                {activeFolderId !== "All" && !hasTemplateSearch
+                  ? "Add existing templates from your library to organize this split."
+                  : "Templates are optional. Start a workout freely from Home, or build reusable routines if you repeat the same training often."}
+              </Text>
+
+              {activeFolderId !== "All" &&
+                !loading &&
+                !hasTemplateSearch &&
+                !isManageMode && (
+                  <View style={localStyles.emptyFolderActions}>
+                    <TouchableOpacity
+                      style={localStyles.emptyFolderPrimaryButton}
+                      onPress={() => {
+                        const currentFolder = folders.find(
+                          (f) => f.id === activeFolderId,
+                        );
+                        setBatchSelectIds(
+                          currentFolder ? currentFolder.templateIds : [],
+                        );
+                        setIsBatchSelectVisible(true);
+                      }}
+                    >
+                      <Ionicons
+                        name="folder-open-outline"
+                        size={16}
+                        color="#32D74B"
+                        style={{ marginRight: 7 }}
+                      />
+                      <Text style={localStyles.emptyFolderPrimaryText}>
+                        Add Existing
+                      </Text>
+                    </TouchableOpacity>
+                  </View>
+                )}
             </View>
-            <Text style={localStyles.emptyTitle}>
-              {loading
-                ? "Restoring routines..."
-                : hasTemplateSearch
-                  ? "No matching templates"
-                  : activeFolderId === "All"
-                    ? "No templates yet"
-                    : "This folder is empty"}
-            </Text>
-            <Text style={localStyles.emptyBody}>
-              {activeFolderId !== "All" && !hasTemplateSearch
-                ? "Add existing templates from your library to organize this split."
-                : "Build reusable routines so you can start your workouts faster and keep your training structure consistent."}
-            </Text>
-
-            {activeFolderId !== "All" &&
-              !loading &&
-              !hasTemplateSearch &&
-              !isManageMode && (
-                <View style={localStyles.emptyFolderActions}>
-                  <TouchableOpacity
-                    style={localStyles.emptyFolderPrimaryButton}
-                    onPress={() => {
-                      const currentFolder = folders.find(
-                        (f) => f.id === activeFolderId,
-                      );
-                      setBatchSelectIds(
-                        currentFolder ? currentFolder.templateIds : [],
-                      );
-                      setIsBatchSelectVisible(true);
-                    }}
-                  >
-                    <Ionicons
-                      name="folder-open-outline"
-                      size={16}
-                      color="#32D74B"
-                      style={{ marginRight: 7 }}
-                    />
-                    <Text style={localStyles.emptyFolderPrimaryText}>
-                      Add Existing
-                    </Text>
-                  </TouchableOpacity>
-
-                </View>
-              )}
-          </View>
+          )
         }
         ListFooterComponent={
           <View>
@@ -2272,6 +3432,16 @@ export default function TemplatesScreen({ navigation }: any) {
         }
       />
 
+      <UndoToast
+        visible={!!templateUndo}
+        message={templateUndo?.message || "Templates deleted"}
+        actionLabel="Undo"
+        onAction={() =>
+          runTemplateBlockingAction("Restoring templates...", undoTemplateDelete)
+        }
+        onDismiss={dismissTemplateUndo}
+      />
+
       {isManageMode && selectedTemplateIds.length > 0 && (
         <SafeAreaView edges={["bottom"]} style={localStyles.manageBottomBar}>
           <TouchableOpacity
@@ -2291,6 +3461,14 @@ export default function TemplatesScreen({ navigation }: any) {
           </TouchableOpacity>
         </SafeAreaView>
       )}
+
+      <BlockingOverlay
+        visible={isTemplatesBlocking}
+        message={
+          templateBlockingMessage ||
+          (isTemplateImporting ? "Importing template..." : "Preparing share...")
+        }
+      />
     </View>
   );
 }
@@ -2396,9 +3574,97 @@ const localStyles = StyleSheet.create({
     marginRight: 10,
   },
   newFolderChipText: { color: "#32D74B", fontSize: 14, fontWeight: "900" },
+  importTemplateChip: {
+    flexDirection: "row",
+    alignItems: "center",
+    paddingHorizontal: 16,
+    paddingVertical: 10,
+    borderRadius: 999,
+    backgroundColor: "rgba(50, 215, 75, 0.08)",
+    borderWidth: 1,
+    borderColor: "rgba(50, 215, 75, 0.28)",
+    marginRight: 10,
+  },
+  importTemplateChipText: {
+    color: "#32D74B",
+    fontSize: 14,
+    fontWeight: "900",
+  },
+  importModalContent: {
+    width: "90%",
+    maxHeight: "82%",
+    backgroundColor: "#1C1C1E",
+    borderRadius: 18,
+    borderWidth: 1,
+    borderColor: "#2C2C2E",
+    padding: 20,
+  },
+  importModalSubtitle: {
+    color: "#8E8E93",
+    fontSize: 13,
+    fontWeight: "700",
+    lineHeight: 19,
+    textAlign: "center",
+    marginTop: -6,
+    marginBottom: 14,
+  },
+  importSummaryCard: {
+    backgroundColor: "#111113",
+    borderWidth: 1,
+    borderColor: "#2C2C2E",
+    borderRadius: 16,
+    padding: 14,
+    marginBottom: 14,
+  },
+  importSummaryName: {
+    color: "#FFF",
+    fontSize: 20,
+    fontWeight: "900",
+    marginBottom: 6,
+  },
+  importSummaryMeta: {
+    color: "#8E8E93",
+    fontSize: 13,
+    fontWeight: "800",
+    lineHeight: 19,
+  },
+  importFieldLabel: {
+    color: "#8E8E93",
+    fontSize: 12,
+    fontWeight: "900",
+    letterSpacing: 1.3,
+    textTransform: "uppercase",
+    marginBottom: 8,
+  },
+  importWarningText: {
+    color: "#FF453A",
+    fontSize: 12,
+    fontWeight: "800",
+    marginBottom: 10,
+  },
+  importDetailBox: {
+    backgroundColor: "#111113",
+    borderRadius: 14,
+    padding: 12,
+    marginTop: 10,
+  },
+  importDetailTitle: {
+    color: "#32D74B",
+    fontSize: 12,
+    fontWeight: "900",
+    letterSpacing: 1,
+    textTransform: "uppercase",
+    marginBottom: 5,
+  },
+  importDetailText: {
+    color: "#C7C7CC",
+    fontSize: 13,
+    fontWeight: "700",
+    lineHeight: 18,
+  },
   listContent: { flexGrow: 1, paddingHorizontal: 20 },
   listContentCompact: { paddingBottom: 18 },
-  listContentWithBottomBar: { paddingBottom: 132 },
+  listContentWithBottomBar: { paddingBottom: 88 },
   splitCardCompact: {
     backgroundColor: "#1C1C1E",
     borderWidth: 1,
@@ -2472,6 +3738,114 @@ const localStyles = StyleSheet.create({
     color: "#FFF",
     fontSize: 12,
     fontWeight: "900",
+  },
+  disableActiveSplitButtonCompact: {
+    paddingHorizontal: 12,
+    paddingVertical: 8,
+    borderRadius: 999,
+    backgroundColor: "rgba(255, 69, 58, 0.12)",
+    borderWidth: 1,
+    borderColor: "rgba(255, 69, 58, 0.32)",
+    marginRight: 8,
+  },
+  disableActiveSplitButtonText: {
+    color: "#FF453A",
+    fontSize: 12,
+    fontWeight: "900",
+  },
+  folderOverviewSection: {
+    marginBottom: 14,
+  },
+  folderOverviewHeader: {
+    flexDirection: "row",
+    alignItems: "flex-end",
+    justifyContent: "space-between",
+    marginBottom: 10,
+  },
+  folderOverviewKicker: {
+    color: "#32D74B",
+    fontSize: 12,
+    fontWeight: "900",
+    letterSpacing: 2.2,
+  },
+  folderOverviewTitle: {
+    color: "#FFF",
+    fontSize: 20,
+    fontWeight: "900",
+    marginTop: 3,
+  },
+  folderOverviewCount: {
+    color: "#8E8E93",
+    fontSize: 13,
+    fontWeight: "900",
+    marginBottom: 2,
+  },
+  folderOverviewCard: {
+    flexDirection: "row",
+    alignItems: "center",
+    backgroundColor: "#1C1C1E",
+    borderWidth: 1,
+    borderColor: "#2C2C2E",
+    borderRadius: 18,
+    padding: 14,
+    marginBottom: 10,
+  },
+  folderOverviewIcon: {
+    width: 48,
+    height: 48,
+    borderRadius: 16,
+    backgroundColor: "rgba(50, 215, 75, 0.1)",
+    alignItems: "center",
+    justifyContent: "center",
+    marginRight: 12,
+  },
+  folderOverviewNameRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    minWidth: 0,
+  },
+  folderOverviewName: {
+    color: "#FFF",
+    fontSize: 18,
+    fontWeight: "900",
+    flexShrink: 1,
+    marginRight: 8,
+  },
+  folderOverviewMeta: {
+    color: "#8E8E93",
+    fontSize: 13,
+    fontWeight: "800",
+    marginTop: 3,
+  },
+  folderOverviewPreview: {
+    color: "#C7C7CC",
+    fontSize: 13,
+    fontWeight: "700",
+    marginTop: 5,
+  },
+  folderOverviewOptionsButton: {
+    width: 38,
+    height: 38,
+    borderRadius: 19,
+    alignItems: "center",
+    justifyContent: "center",
+    marginLeft: 8,
+  },
+  unfiledHeader: {
+    marginTop: 6,
+    marginBottom: 10,
+  },
+  unfiledKicker: {
+    color: "#8E8E93",
+    fontSize: 12,
+    fontWeight: "900",
+    letterSpacing: 1.8,
+  },
+  unfiledTitle: {
+    color: "#FFF",
+    fontSize: 18,
+    fontWeight: "900",
+    marginTop: 3,
   },
   splitTimelineContent: { paddingRight: 2 },
   splitTimelineChip: {
@@ -2932,6 +4306,9 @@ const localStyles = StyleSheet.create({
   },
   deleteSelectedText: { color: "#FFF", fontSize: 16, fontWeight: "900" },
 
+  detailModalScreen: {
+    position: "relative",
+  },
   detailHeader: {
     backgroundColor: "#000",
     borderBottomWidth: 1,
@@ -3075,6 +4452,91 @@ const localStyles = StyleSheet.create({
     fontSize: 13,
     fontWeight: "800",
     marginTop: 4,
+  },
+  detailSupersetMemberRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    marginTop: 7,
+    minHeight: 30,
+  },
+  detailNoteButton: {
+    width: 34,
+    height: 34,
+    borderRadius: 17,
+    alignItems: "center",
+    justifyContent: "center",
+    backgroundColor: "#111113",
+    borderWidth: 1,
+    borderColor: "#2C2C2E",
+    marginLeft: 10,
+  },
+  detailNoteButtonActive: {
+    backgroundColor: "rgba(50, 215, 75, 0.12)",
+    borderColor: "rgba(50, 215, 75, 0.4)",
+  },
+  nextSessionNoteInlineOverlay: {
+    ...StyleSheet.absoluteFillObject,
+    zIndex: 20,
+    elevation: 20,
+    paddingHorizontal: 20,
+  },
+  nextSessionNoteExerciseTitle: {
+    color: "#F2F2F7",
+    fontSize: 14,
+    fontWeight: "900",
+    marginTop: 12,
+  },
+  nextSessionNoteInput: {
+    marginTop: 14,
+    minHeight: 116,
+    borderRadius: 16,
+    borderWidth: 1,
+    borderColor: "#3A3A3C",
+    backgroundColor: "#111113",
+    color: "#F2F2F7",
+    fontSize: 15,
+    fontWeight: "700",
+    paddingHorizontal: 14,
+    paddingVertical: 12,
+    textAlignVertical: "top",
+  },
+  nextSessionNoteCount: {
+    color: "#8E8E93",
+    fontSize: 11,
+    fontWeight: "800",
+    marginTop: 8,
+    textAlign: "right",
+  },
+  nextSessionNoteFooter: {
+    flexDirection: "row",
+    gap: 10,
+    marginTop: 16,
+  },
+  nextSessionNoteCancelButton: {
+    flex: 1,
+    minHeight: 50,
+    borderRadius: 16,
+    backgroundColor: "#2C2C2E",
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  nextSessionNoteCancelText: {
+    color: "#F2F2F7",
+    fontSize: 16,
+    fontWeight: "900",
+  },
+  nextSessionNoteSaveButton: {
+    flex: 1,
+    minHeight: 50,
+    borderRadius: 16,
+    backgroundColor: "#32D74B",
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  nextSessionNoteSaveText: {
+    color: "#000",
+    fontSize: 16,
+    fontWeight: "900",
   },
   detailEmptyCard: {
     backgroundColor: "#111112",

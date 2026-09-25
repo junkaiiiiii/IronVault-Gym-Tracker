@@ -1,0 +1,387 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="description" content="IronVault support, Privacy Policy, Terms of Service, and account deletion information." />
+  <title>IronVault - Support, Privacy Policy, and Terms</title>
+  <style>
+    :root {
+      --bg: #000000;
+      --panel: #111113;
+      --surface: #1c1c1e;
+      --surface-2: #242426;
+      --text: #ffffff;
+      --muted: #d1d1d6;
+      --subtle: #8e8e93;
+      --border: #2c2c2e;
+      --accent: #32d74b;
+      --blue: #0a84ff;
+      --warning: #ff9f0a;
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    html {
+      scroll-behavior: smooth;
+    }
+
+    body {
+      margin: 0;
+      background: #000;
+      color: var(--muted);
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+      line-height: 1.65;
+    }
+
+    main {
+      width: min(920px, calc(100% - 32px));
+      margin: 0 auto;
+      padding: 34px 0 56px;
+    }
+
+    header {
+      padding: 34px 0 22px;
+      border-bottom: 1px solid var(--border);
+      margin-bottom: 24px;
+    }
+
+    .brand-row {
+      display: flex;
+      align-items: center;
+      gap: 14px;
+      margin-bottom: 18px;
+    }
+
+    .mark {
+      width: 54px;
+      height: 54px;
+      border-radius: 16px;
+      background: linear-gradient(145deg, var(--accent), #19b83a);
+      color: #001405;
+      display: grid;
+      place-items: center;
+      font-size: 26px;
+      font-weight: 900;
+      box-shadow: 0 14px 42px rgba(50, 215, 75, 0.18);
+    }
+
+    h1 {
+      color: var(--text);
+      font-size: clamp(34px, 7vw, 52px);
+      line-height: 1.02;
+      margin: 0;
+      font-weight: 950;
+    }
+
+    h2 {
+      color: var(--accent);
+      font-size: 26px;
+      margin: 42px 0 16px;
+      padding-bottom: 12px;
+      border-bottom: 1px solid var(--border);
+    }
+
+    h3 {
+      color: var(--text);
+      font-size: 18px;
+      margin: 28px 0 8px;
+    }
+
+    p, li {
+      font-size: 15px;
+    }
+
+    a {
+      color: var(--accent);
+      font-weight: 800;
+    }
+
+    ul {
+      padding-left: 22px;
+    }
+
+    strong {
+      color: var(--text);
+    }
+
+    nav {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      margin-top: 20px;
+    }
+
+    nav a {
+      color: var(--text);
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 999px;
+      padding: 9px 13px;
+      text-decoration: none;
+      font-size: 13px;
+    }
+
+    .intro {
+      color: var(--subtle);
+      font-size: 15px;
+      max-width: 680px;
+      margin: 12px 0 0;
+    }
+
+    .last-updated {
+      color: var(--subtle);
+      font-size: 14px;
+      margin: 0;
+      font-weight: 800;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+    }
+
+    .card {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 18px;
+      padding: 22px;
+      margin: 18px 0;
+    }
+
+    .support-grid {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 12px;
+      margin-top: 16px;
+    }
+
+    .support-item {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      padding: 16px;
+    }
+
+    .support-item span {
+      color: var(--subtle);
+      display: block;
+      font-size: 12px;
+      font-weight: 900;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      margin-bottom: 6px;
+    }
+
+    .note {
+      color: var(--subtle);
+      font-size: 14px;
+    }
+
+    .warning {
+      border-color: rgba(255, 159, 10, 0.36);
+      background: rgba(255, 159, 10, 0.08);
+    }
+
+    footer {
+      border-top: 1px solid var(--border);
+      padding-top: 22px;
+      margin-top: 42px;
+      color: var(--subtle);
+      font-size: 13px;
+    }
+
+    @media (max-width: 760px) {
+      main {
+        width: min(100% - 24px, 920px);
+        padding-top: 18px;
+      }
+
+      header {
+        padding-top: 18px;
+      }
+
+      .support-grid {
+        grid-template-columns: 1fr;
+      }
+
+      .card {
+        padding: 18px;
+        border-radius: 16px;
+      }
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <header>
+      <div class="brand-row">
+        <div class="mark">IV</div>
+        <div>
+          <p class="last-updated">Last Updated: June 2026</p>
+          <h1>IronVault</h1>
+        </div>
+      </div>
+      <p class="intro">
+        Support information, Privacy Policy, Terms of Service, and account deletion instructions for IronVault.
+      </p>
+      <nav aria-label="Page sections">
+        <a href="#support">Support</a>
+        <a href="#privacy">Privacy Policy</a>
+        <a href="#terms">Terms</a>
+        <a href="#deletion">Account Deletion</a>
+      </nav>
+    </header>
+
+    <section id="support" class="card">
+      <h2>Support</h2>
+      <p>
+        IronVault is a workout logging, training organisation, and progress tracking app. If you need help with sync, backups,
+        sign-in, account deletion, or app behavior, contact <a href="mailto:ironvault.app@gmail.com">ironvault.app@gmail.com</a>.
+      </p>
+      <div class="support-grid">
+        <div class="support-item">
+          <span>Email support</span>
+          <strong><a href="mailto:ironvault.app@gmail.com">ironvault.app@gmail.com</a></strong>
+          <p class="note">For app support, privacy, and account deletion questions.</p>
+        </div>
+        <div class="support-item">
+          <span>Account deletion</span>
+          <strong>Settings > Delete Account</strong>
+          <p class="note">Deletes your account and associated cloud data where supported.</p>
+        </div>
+        <div class="support-item">
+          <span>Backups</span>
+          <strong>Settings > Export Data</strong>
+          <p class="note">Create a JSON backup before deleting accounts, changing devices, or importing data.</p>
+        </div>
+        <div class="support-item">
+          <span>Privacy URL</span>
+          <strong>#privacy</strong>
+          <p class="note">Use this page as the Privacy Policy URL for App Store Connect and Play Console.</p>
+        </div>
+      </div>
+    </section>
+
+    <section id="privacy" class="card">
+      <h2>Privacy Policy</h2>
+
+      <h3>1. Information We Collect</h3>
+      <p>IronVault collects and stores the information needed to provide workout tracking, app personalisation, sync, backup, and account features:</p>
+      <ul>
+        <li><strong>Account information:</strong> email address, authentication identifiers, sign-in provider details, username/display name, and username reservation records.</li>
+        <li><strong>Workout and fitness data:</strong> workouts, exercises, warm-up sets, working sets, reps, weights, duration, volume, workout history, exercise remarks, notes, PRs, records, and progress/statistics generated from your logs.</li>
+        <li><strong>Training organisation data:</strong> templates, folders, split days, rest days, scheduled routines, favorite exercises, recent exercises, custom exercises, exercise cues, and gym-specific exercise swaps.</li>
+        <li><strong>Gym and equipment data:</strong> gym names, machine brands, machine brand defaults, exercise variants, equipment tags, and gym or machine-brand history filters.</li>
+        <li><strong>App preferences and status data:</strong> KG/LBS, rest timer and warm-up rest timer settings, auto-check sets, plate calculator settings, available plates, onboarding/setup choices, active session state, import/export details, sync status, and backup settings.</li>
+      </ul>
+
+      <h3>2. How We Use Information</h3>
+      <p>
+        Your information is used to create and secure your account, reserve usernames, save and sync workouts, resume active sessions,
+        personalise the Home screen, manage templates, folders, split schedules, gyms, machine brands, gym-specific swaps, and exercise
+        libraries, calculate statistics and PRs, filter history, support backup/import/export, troubleshoot reliability, and maintain app
+        functionality. We do not sell your personal information or workout data to third-party data brokers.
+      </p>
+
+      <h3>3. Third-Party Services</h3>
+      <p>
+        IronVault uses Google Firebase for authentication, database hosting, cloud sync, and account-related services. Email/password,
+        Google sign-in, and Apple sign-in data are handled through Firebase authentication and the relevant sign-in provider. IronVault
+        may also include open-source exercise data provided under public or permissive licences.
+      </p>
+
+      <h3>4. Sync, Export, and Import</h3>
+      <p>
+        Sync and backup features may store, merge, export, or restore workouts, templates, folders, split settings, custom exercises,
+        favorites, gyms, machine brands, gym-specific swaps, app preferences, and sync metadata. Exported backup files are created for
+        your own use; you are responsible for storing and sharing those files safely.
+      </p>
+
+      <h3>5. Your Rights and Choices</h3>
+      <p>
+        You can manage many app settings inside IronVault. You may update your username, export data, import backups, sync with cloud,
+        sign out, or initiate account and data deletion where supported. Deleting your account is intended to remove associated app data
+        from IronVault systems, subject to technical, legal, platform, and backup limitations. It does not remove backup files you exported
+        or data stored outside IronVault's systems.
+      </p>
+
+      <h3>6. Data Security</h3>
+      <p>We use Firebase and reasonable technical safeguards to protect data, but no internet-connected service can guarantee absolute security.</p>
+
+      <h3>7. Contact</h3>
+      <p>
+        For privacy, support, or account deletion questions, contact
+        <a href="mailto:ironvault.app@gmail.com">ironvault.app@gmail.com</a>.
+      </p>
+    </section>
+
+    <section id="terms" class="card">
+      <h2>Terms of Service</h2>
+
+      <h3>1. Acceptance of Terms</h3>
+      <p>By creating an account or using IronVault, you agree to these Terms of Service and the Privacy Policy.</p>
+
+      <h3>2. Fitness and Medical Disclaimer</h3>
+      <p>
+        IronVault is a workout logging, training organisation, and progress tracking tool. It does not provide medical advice, diagnosis,
+        treatment, coaching, personalised programming, or emergency assistance. Statistics, PRs, trends, and estimates are informational
+        only. Always consult a qualified healthcare or fitness professional before beginning or changing an exercise program. Weightlifting
+        and physical exercise involve risk, and you are responsible for training safely, using proper equipment, and stopping if you feel
+        pain, dizziness, or unsafe symptoms.
+      </p>
+
+      <h3>3. User Responsibility</h3>
+      <p>
+        You are responsible for the workouts, exercises, weights, reps, notes, remarks, templates, folders, split schedules, custom exercises,
+        favorites, gyms, machine brands, gym-specific swaps, rest timer settings, imports, exports, and other information you create or enter
+        in IronVault. You agree not to use the app to abuse, disrupt, reverse engineer, overload, scrape, or attempt to breach any service,
+        account, or database.
+      </p>
+
+      <h3>4. Sync, Backup, and Data Loss</h3>
+      <p>
+        IronVault saves data locally on your device and provides cloud sync, backup export, and backup import tools to help keep your data
+        available. Sync is merge-based where supported, but no sync, storage, import, export, or device system can be guaranteed to be
+        error-free. You are encouraged to keep your own backups, especially before deleting accounts, changing devices, importing data, or
+        making major routine changes.
+      </p>
+
+      <h3>5. Account Deletion</h3>
+      <p>
+        You may initiate account deletion from Settings where supported. Deletion is intended to remove your Firebase account, username
+        reservation, workouts, and cloud-stored app configuration data associated with that account, subject to technical, legal, platform,
+        and backup limitations. Deleting your account may not remove backup files you exported or data stored outside IronVault's systems.
+        Some deletion or backup operations may take time to complete.
+      </p>
+
+      <h3>6. Limitation of Liability</h3>
+      <p>
+        To the maximum extent permitted by law, IronVault and its creator(s) are not liable for direct, indirect, incidental, or consequential
+        damages, including physical injury, lost progress, or data loss, resulting from use of the app.
+      </p>
+
+      <h3>7. Changes to Terms</h3>
+      <p>
+        These terms may be updated as IronVault changes. Continued use of the app after updates means you accept the revised terms. If a
+        change is material, IronVault may ask you to review the updated terms again.
+      </p>
+    </section>
+
+    <section id="deletion" class="card warning">
+      <h2>Account Deletion</h2>
+      <p>
+        You can initiate account deletion inside IronVault from <strong>Settings > Account Actions > Delete Account</strong>. For security,
+        you may need to sign out and sign back in before deletion can proceed.
+      </p>
+      <p>
+        Account deletion is intended to remove your Firebase account, username reservation, workouts, and cloud-stored app configuration data
+        associated with your account. Exported backup files, screenshots, or files you saved outside IronVault are not deleted automatically.
+      </p>
+    </section>
+
+    <footer>
+      <p>IronVault - workout tracking only. Not medical advice.</p>
+    </footer>
+  </main>
+</body>
+</html>

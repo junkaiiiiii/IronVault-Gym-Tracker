@@ -21,35 +21,74 @@ import { styles } from "../constants/globalStyles";
 import {
   genId,
   getExerciseVariationOptions,
+  getExerciseSupportsVariantsForStorage,
+  getExerciseAttachmentOptions,
+  getDefaultExerciseAttachment,
+  getExerciseAttachmentForSave,
+  getExerciseAttachmentForStorage,
+  hasExplicitNoAttachment,
+  NO_ATTACHMENT_OPTION_LABEL,
+  normalizeExerciseForAttachmentStorage,
   formatExerciseDisplayName,
   isFirstInSuperset,
   getSupersetInfo,
   assignSuperset,
   removeSupersetFromExercise,
+  cleanInvalidSupersets,
+  createGymReplacementEntry,
+  normalizeGymReplacements,
   buildReorderBlocks,
   flattenReorderBlocks,
 } from "../utils/helpers";
 import {
-  syncTemplatesToCloud,
+  fetchConfigFromCloud,
+  safeJsonParse,
+  saveTemplatesLocallyAndToCloud,
   syncFoldersToCloud,
 } from "../utils/firebaseSync";
+import {
+  getExerciseAttachmentSelectionOptions,
+  getExerciseAttachmentOptionsWithCustom,
+  mergeAttachmentOptions,
+  normalizeAttachmentIdentity,
+  readCustomAttachments,
+  removeCustomAttachmentFromList,
+  replaceCustomAttachmentInList,
+  saveCustomAttachments,
+  sanitizeCustomAttachmentName,
+  validateCustomAttachmentName,
+} from "../utils/customAttachments";
+import { LIMITS, cleanLimitedText, limitText } from "../constants/limits";
+import CustomAttachmentModal from "../components/CustomAttachmentModal";
 import CustomAlert from "../components/CustomAlert";
-
+import BlockingOverlay from "../components/BlockingOverlay";
 
 const serializeTemplateDraft = (templateName: string, exercises: any[]) => {
   return JSON.stringify({
-    name: (templateName || "").trim(),
-    exercises: (exercises || []).map((ex: any) => ({
-      name: ex?.name || "",
-      reminder: ex?.reminder || "",
-      exerciseVariant: ex?.exerciseVariant || "Normal",
-      variationOptions: ex?.variationOptions || null,
-      is_unilateral: !!ex?.is_unilateral,
-      warmupSets: Number(ex?.warmupSets || 0),
-      workingSets: Number(ex?.workingSets || 0),
-      supersetId: ex?.supersetId || null,
-      supersetOrder: ex?.supersetOrder || null,
-    })),
+    name: cleanLimitedText(templateName, LIMITS.nameChars),
+    exercises: (exercises || [])
+      .slice(0, LIMITS.exercisesPerWorkout)
+      .map((ex: any) => ({
+        name: limitText(ex?.name || "", LIMITS.nameChars),
+        reminder: limitText(ex?.reminder || "", LIMITS.cueChars),
+        exerciseVariant: ex?.exerciseVariant || "Normal",
+        variationOptions: ex?.variationOptions || null,
+        attachment: ex?.attachment || null,
+        attachmentOptions: ex?.attachmentOptions || null,
+        supportsAttachments: ex?.supportsAttachments === true,
+        is_unilateral: !!ex?.is_unilateral,
+        warmupSets: Math.min(
+          LIMITS.warmupSetsPerExercise,
+          Math.max(0, Number(ex?.warmupSets || 0)),
+        ),
+        workingSets: Math.min(
+          LIMITS.workingSetsPerExercise,
+          Math.max(0, Number(ex?.workingSets || 0)),
+        ),
+        supersetId: ex?.supersetId || null,
+        supersetOrder: ex?.supersetOrder || null,
+        gymReplacements: normalizeGymReplacements(ex?.gymReplacements),
+      })),
   });
 };
 
@@ -66,6 +105,16 @@ export default function EditTemplateScreen({ navigation, route }: any) {
   const uid = auth.currentUser?.uid;
   const [name, setName] = useState("New Template");
   const [selected, setSelected] = useState<any[]>([]);
+  const [gyms, setGyms] = useState<any[]>([]);
+  const [isGymReplacementModalVisible, setIsGymReplacementModalVisible] =
+    useState(false);
+  const [replacementExerciseIndex, setReplacementExerciseIndex] = useState<
+    number | null
+  >(null);
+  const [isGymSwapManagerVisible, setIsGymSwapManagerVisible] = useState(false);
+  const [gymSwapExerciseIndex, setGymSwapExerciseIndex] = useState<
+    number | null
+  >(null);
   const [editingId, setEditingId] = useState<string | null>(null);
   const [isReorderModalVisible, setIsReorderModalVisible] = useState(false);
   const [reorderDraft, setReorderDraft] = useState<any[]>([]);
@@ -86,11 +135,42 @@ export default function EditTemplateScreen({ navigation, route }: any) {
   const [initialDraftSnapshot, setInitialDraftSnapshot] = useState(
     serializeTemplateDraft("New Template", []),
   );
-  const [discardAlert, setDiscardAlert] = useState<{ visible: boolean; action: any | null }>({
+  const [templateSaveMessage, setTemplateSaveMessage] = useState("");
+  const [discardAlert, setDiscardAlert] = useState<{
+    visible: boolean;
+    action: any | null;
+  }>({
     visible: false,
     action: null,
   });
+  const [deleteExerciseAlert, setDeleteExerciseAlert] = useState<{
+    visible: boolean;
+    index: number | null;
+    name: string;
+  }>({
+    visible: false,
+    index: null,
+    name: "",
+  });
+  const [customAttachments, setCustomAttachments] = useState<string[]>([]);
+  const [customAttachmentModal, setCustomAttachmentModal] = useState<{
+    visible: boolean;
+    exerciseIndex: number | null;
+    value: string;
+    error: string;
+    editingAttachment: string | null;
+  }>({
+    visible: false,
+    exerciseIndex: null,
+    value: "",
+    error: "",
+    editingAttachment: null,
+  });
   const allowTemplateLeaveRef = useRef(false);
+  const templateSaveInFlightRef = useRef(false);
+  const isTemplateSaveBlocking = templateSaveMessage.length > 0;
+  const templateData = route.params?.templateData;
+  const duplicateTemplateData = route.params?.duplicateTemplateData;
 
   const showInfo = (
     title: string,
@@ -106,14 +186,53 @@ export default function EditTemplateScreen({ navigation, route }: any) {
   };
 
   useEffect(() => {
-    if (!route.params?.templateData) return;
-    setName(route.params.templateData.name || "Edit Template");
-    const mappedEx = (route.params.templateData.exercises || []).map(
+    if (!uid) return;
+
+    const loadGyms = async () => {
+      try {
+        const savedGyms = await AsyncStorage.getItem(`@user_gyms_${uid}`);
+        let parsedGyms = savedGyms ? safeJsonParse<any[]>(savedGyms, []) : [];
+        if (!Array.isArray(parsedGyms) || parsedGyms.length === 0) {
+          const cloudGyms = await fetchConfigFromCloud("gyms");
+          parsedGyms = Array.isArray(cloudGyms) ? cloudGyms : [];
+        }
+        setGyms(Array.isArray(parsedGyms) ? parsedGyms.filter(Boolean) : []);
+      } catch (error) {
+        console.log("Unable to load gyms for template replacements", error);
+        setGyms([]);
+      }
+    };
+
+    loadGyms();
+  }, [uid]);
+
+  useEffect(() => {
+    let isMounted = true;
+
+    readCustomAttachments(uid).then((attachments) => {
+      if (isMounted) setCustomAttachments(attachments);
+    });
+
+    return () => {
+      isMounted = false;
+    };
+  }, [uid]);
+
+  useEffect(() => {
+    const sourceTemplate = duplicateTemplateData || templateData;
+    if (!sourceTemplate) return;
+    setName(
+      limitText(
+        sourceTemplate.name || "Edit Template",
+        LIMITS.nameChars,
+      ),
+    );
+    const mappedEx = (sourceTemplate.exercises || []).map(
       (ex: any, idx: number) => {
         if (typeof ex === "string") {
           return {
             id: genId(`ex-${idx}-`),
-            name: ex,
+            name: limitText(ex, LIMITS.nameChars),
             warmupSets: 0,
             workingSets: 1,
             is_unilateral: false,
@@ -123,35 +242,77 @@ export default function EditTemplateScreen({ navigation, route }: any) {
         let warmups = 0;
         let workings = 1;
         if (Array.isArray(ex.sets)) {
-          warmups = ex.sets.filter((s: any) => s.isWarmup).length;
-          workings = ex.sets.filter((s: any) => !s.isWarmup).length;
+          warmups = Math.min(
+            LIMITS.warmupSetsPerExercise,
+            ex.sets.filter((s: any) => s.isWarmup).length,
+          );
+          workings = Math.min(
+            LIMITS.workingSetsPerExercise,
+            ex.sets.filter((s: any) => !s.isWarmup).length,
+          );
         } else {
-          workings = ex.sets || 1;
+          workings = Math.min(
+            LIMITS.workingSetsPerExercise,
+            Math.max(0, Number(ex.sets || 1)),
+          );
         }
 
+        const attachmentExercise = normalizeExerciseForAttachmentStorage(ex);
+        const attachmentOptions = getExerciseAttachmentOptions(attachmentExercise);
+
         return {
-          ...ex,
-          id: ex.id || genId(`ex-${idx}-`),
-          exerciseVariant: ex.exerciseVariant || "Normal",
-          is_unilateral: !!ex.is_unilateral,
+          ...attachmentExercise,
+          id: attachmentExercise.id || genId(`ex-${idx}-`),
+          name: limitText(
+            attachmentExercise.name || "Exercise",
+            LIMITS.nameChars,
+          ),
+          reminder: limitText(
+            attachmentExercise.reminder || "",
+            LIMITS.cueChars,
+          ),
+          exerciseVariant: attachmentExercise.exerciseVariant || "Normal",
+          variationOptions: getExerciseVariationOptions(attachmentExercise),
+          supportsVariants:
+            getExerciseSupportsVariantsForStorage(attachmentExercise),
+          attachment: getExerciseAttachmentForSave(attachmentExercise),
+          attachmentOptions:
+            attachmentOptions.length > 0 ? attachmentOptions : undefined,
+          supportsAttachments: attachmentOptions.length > 0 ? true : undefined,
+          is_unilateral: !!attachmentExercise.is_unilateral,
           warmupSets: warmups,
           workingSets: workings,
-          supersetId: ex.supersetId || null,
-          supersetOrder: ex.supersetOrder,
+          supersetId: attachmentExercise.supersetId || null,
+          supersetOrder: attachmentExercise.supersetOrder,
+          gymReplacements: normalizeGymReplacements(
+            attachmentExercise.gymReplacements,
+          ),
         };
       },
     );
-    setSelected(mappedEx);
-    setEditingId(route.params.templateData.id);
-    setInitialDraftSnapshot(
-      serializeTemplateDraft(route.params.templateData.name || "Edit Template", mappedEx),
+    const cleanedMappedEx = cleanInvalidSupersets(
+      mappedEx.slice(0, LIMITS.exercisesPerWorkout),
     );
-  }, [route.params]);
+    setSelected(cleanedMappedEx);
+    setEditingId(duplicateTemplateData ? null : sourceTemplate.id);
+    setInitialDraftSnapshot(
+      serializeTemplateDraft(
+        limitText(
+          sourceTemplate.name || "Edit Template",
+          LIMITS.nameChars,
+        ),
+        cleanedMappedEx,
+      ),
+    );
+  }, [duplicateTemplateData, templateData]);
 
   useEffect(() => {
-    if (route.params?.templateData) return;
+    if (templateData || duplicateTemplateData) return;
+    setName("New Template");
+    setSelected([]);
+    setEditingId(null);
     setInitialDraftSnapshot(serializeTemplateDraft("New Template", []));
-  }, [route.params?.templateData]);
+  }, [duplicateTemplateData, templateData]);
 
   const currentDraftSnapshot = useMemo(
     () => serializeTemplateDraft(name, selected),
@@ -218,7 +379,376 @@ export default function EditTemplateScreen({ navigation, route }: any) {
     Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
   };
 
+  const requestDeleteExercise = (index: number) => {
+    const exerciseName = selected[index]?.name || "this exercise";
+    Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
+    setDeleteExerciseAlert({ visible: true, index, name: exerciseName });
+  };
+
+  const confirmDeleteExercise = () => {
+    const index = deleteExerciseAlert.index;
+    if (index === null) return;
+
+    setSelected((prev) =>
+      cleanInvalidSupersets(prev.filter((_, idx) => idx !== index)),
+    );
+    setDeleteExerciseAlert({ visible: false, index: null, name: "" });
+    Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
+  };
+
+  const replaceExerciseAtIndex = (index: number, exData: any) => {
+    setSelected((prev) =>
+      prev.map((existing, idx) => {
+        if (idx !== index) return existing;
+        const attachmentExercise = normalizeExerciseForAttachmentStorage(exData);
+        const variationOptions = getExerciseVariationOptions(attachmentExercise);
+        const attachmentOptions = getExerciseAttachmentOptions(attachmentExercise);
+        return {
+          ...existing,
+          name: attachmentExercise.name || existing.name,
+          reminder: attachmentExercise.reminder || "",
+          muscle: attachmentExercise.muscle,
+          equipment: attachmentExercise.equipment,
+          image: attachmentExercise.image,
+          brand: undefined,
+          machineBrand: undefined,
+          equipmentTag: undefined,
+          exerciseVariant: variationOptions.length > 0 ? "Normal" : undefined,
+          variationOptions,
+          supportsVariants:
+            getExerciseSupportsVariantsForStorage(attachmentExercise),
+          attachment: getExerciseAttachmentForSave(attachmentExercise),
+          attachmentOptions:
+            attachmentOptions.length > 0 ? attachmentOptions : undefined,
+          supportsAttachments: attachmentOptions.length > 0 ? true : undefined,
+          is_unilateral: !!attachmentExercise.is_unilateral,
+          gymReplacements: {},
+        };
+      }),
+    );
+    Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
+  };
+
+  const buildTemplateExercise = (exData: any) => {
+    const attachmentExercise = normalizeExerciseForAttachmentStorage(exData);
+    const variationOptions = getExerciseVariationOptions(attachmentExercise);
+    const attachmentOptions = getExerciseAttachmentOptions(attachmentExercise);
+    return {
+      id: genId("ex-"),
+      name: limitText(attachmentExercise.name || "Exercise", LIMITS.nameChars),
+      reminder: limitText(attachmentExercise.reminder || "", LIMITS.cueChars),
+      muscle: attachmentExercise.muscle,
+      equipment: attachmentExercise.equipment,
+      image: attachmentExercise.image,
+      exerciseVariant: variationOptions.length > 0 ? "Normal" : undefined,
+      variationOptions,
+      supportsVariants:
+        getExerciseSupportsVariantsForStorage(attachmentExercise),
+      attachment: getExerciseAttachmentForSave(attachmentExercise),
+      attachmentOptions:
+        attachmentOptions.length > 0 ? attachmentOptions : undefined,
+      supportsAttachments: attachmentOptions.length > 0 ? true : undefined,
+      is_unilateral: !!attachmentExercise.is_unilateral,
+      gymReplacements: {},
+      warmupSets: 0,
+      workingSets: 1,
+    };
+  };
+
+  const addExercisesToTemplate = (exerciseList: any[]) => {
+    const incoming = Array.isArray(exerciseList)
+      ? exerciseList.filter(Boolean)
+      : [];
+    if (incoming.length === 0) return;
+
+    const availableSlots = LIMITS.exercisesPerWorkout - selected.length;
+    if (availableSlots <= 0) {
+      showInfo(
+        "Exercise Limit Reached",
+        "Each template can have up to 25 exercises.",
+      );
+      return;
+    }
+
+    const exercisesToAdd = incoming.slice(0, availableSlots);
+    if (incoming.length > availableSlots) {
+      showInfo(
+        "Some Exercises Were Not Added",
+        `This template only has room for ${availableSlots} more exercise${availableSlots === 1 ? "" : "s"}.`,
+      );
+    }
+
+    setSelected((prev) => [
+      ...prev,
+      ...exercisesToAdd.map((exData) => buildTemplateExercise(exData)),
+    ]);
+    Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
+  };
+
+  const openReplaceExercise = (index: number) => {
+    Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
+    navigation.navigate("Search", {
+      mode: "replace",
+      existingExercises: selected
+        .filter((_, idx) => idx !== index)
+        .map((e) => e.name),
+      onSelect: (exData: any) => replaceExerciseAtIndex(index, exData),
+    });
+  };
+
+  const getGymName = (gymId: string) =>
+    gyms.find((gym: any) => gym.id === gymId)?.name || "Unknown Gym";
+
+  const getGymSwapSummary = (exercise: any) => {
+    const gymIds = Object.keys(
+      normalizeGymReplacements(exercise?.gymReplacements),
+    );
+    if (gymIds.length === 0) return "Swap this exercise at selected gyms";
+    if (gymIds.length <= 2) return gymIds.map(getGymName).join(", ");
+    return `${gymIds.length} gyms configured`;
+  };
+
+  const openGymSwapManager = (index: number) => {
+    if (gyms.length < 2) {
+      showInfo(
+        "More Gyms Needed",
+        "Gym-specific swaps are useful when you train at more than one gym.",
+      );
+      return;
+    }
+    Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
+    setGymSwapExerciseIndex(index);
+    setIsGymSwapManagerVisible(true);
+  };
+
+  const openGymReplacementPicker = (index: number) => {
+    if (gyms.length < 2) {
+      showInfo(
+        "More Gyms Needed",
+        "Add another gym before setting up gym-specific exercise swaps.",
+      );
+      return;
+    }
+    Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
+    setReplacementExerciseIndex(index);
+    setIsGymSwapManagerVisible(false);
+    setIsGymReplacementModalVisible(true);
+  };
+
+  const selectReplacementGym = (gymId: string) => {
+    const index = replacementExerciseIndex;
+    if (index === null) return;
+    setIsGymReplacementModalVisible(false);
+    navigation.navigate("Search", {
+      mode: "gymSwap",
+      existingExercises: selected.map((e) => e.name),
+      onSelect: (exData: any) => {
+        setSelected((prev) =>
+          prev.map((existing, idx) => {
+            if (idx !== index) return existing;
+            return {
+              ...existing,
+              gymReplacements: {
+                ...normalizeGymReplacements(existing.gymReplacements),
+                [gymId]: createGymReplacementEntry(exData),
+              },
+            };
+          }),
+        );
+        Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
+      },
+    });
+    setReplacementExerciseIndex(null);
+  };
+
+  const removeGymReplacement = (exerciseIndex: number, gymId: string) => {
+    setSelected((prev) =>
+      prev.map((existing, idx) => {
+        if (idx !== exerciseIndex) return existing;
+        const replacements = normalizeGymReplacements(existing.gymReplacements);
+        delete replacements[gymId];
+        return { ...existing, gymReplacements: replacements };
+      }),
+    );
+    Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
+  };
+
+  const openCustomAttachmentModal = (exerciseIndex: number) => {
+    setCustomAttachmentModal({
+      visible: true,
+      exerciseIndex,
+      value: "",
+      error: "",
+      editingAttachment: null,
+    });
+  };
+
+  const closeCustomAttachmentModal = () => {
+    setCustomAttachmentModal({
+      visible: false,
+      exerciseIndex: null,
+      value: "",
+      error: "",
+      editingAttachment: null,
+    });
+  };
+
+  const reconcileExerciseCustomAttachment = (
+    exercise: any,
+    previousAttachment: string,
+    nextAttachment: string | null,
+    nextCustomAttachments: string[],
+  ) => {
+    const previousKey = normalizeAttachmentIdentity(previousAttachment);
+    const explicitNoAttachment = hasExplicitNoAttachment(exercise);
+    const currentAttachment = explicitNoAttachment
+      ? ""
+      : getDefaultExerciseAttachment(exercise);
+    const currentKey = normalizeAttachmentIdentity(currentAttachment);
+    const attachmentOptions = Array.isArray(exercise?.attachmentOptions)
+      ? exercise.attachmentOptions
+          .map((attachment: string) =>
+            normalizeAttachmentIdentity(attachment) === previousKey
+              ? nextAttachment
+              : attachment,
+          )
+          .filter(Boolean)
+      : [];
+    const fallbackExercise = {
+      ...exercise,
+      attachment: undefined,
+      attachmentOptions,
+    };
+    const attachment =
+      currentKey === previousKey
+        ? nextAttachment || getDefaultExerciseAttachment(fallbackExercise)
+        : currentAttachment;
+    const savedAttachment =
+      (attachment || explicitNoAttachment) ? attachment : undefined;
+    const options = getExerciseAttachmentOptionsWithCustom(
+      {
+        ...exercise,
+        attachment: savedAttachment,
+        attachmentOptions,
+      },
+      nextCustomAttachments,
+    );
+
+    return {
+      ...exercise,
+      attachment: savedAttachment,
+      attachmentOptions: options.length > 0 ? options : undefined,
+      supportsAttachments: options.length > 0 ? true : undefined,
+    };
+  };
+
+  const editCustomAttachment = (attachment: string) => {
+    setCustomAttachmentModal((prev) => ({
+      ...prev,
+      visible: true,
+      value: attachment,
+      error: "",
+      editingAttachment: attachment,
+    }));
+  };
+
+  const deleteCustomAttachment = async (attachment: string) => {
+    const nextCustomAttachments = await saveCustomAttachments(
+      removeCustomAttachmentFromList(customAttachments, attachment),
+      uid,
+    );
+
+    setCustomAttachments(nextCustomAttachments);
+    setSelected((prev) =>
+      prev.map((exercise) =>
+        reconcileExerciseCustomAttachment(
+          exercise,
+          attachment,
+          null,
+          nextCustomAttachments,
+        ),
+      ),
+    );
+    setCustomAttachmentModal((prev) =>
+      normalizeAttachmentIdentity(prev.editingAttachment) ===
+      normalizeAttachmentIdentity(attachment)
+        ? { ...prev, value: "", error: "", editingAttachment: null }
+        : prev,
+    );
+    Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
+  };
+
+  const saveCustomAttachmentForExercise = async () => {
+    const exerciseIndex = customAttachmentModal.exerciseIndex;
+    if (exerciseIndex === null) return;
+
+    const targetExercise = selected[exerciseIndex];
+    if (!targetExercise) return;
+
+    const { attachment, error } = validateCustomAttachmentName(
+      customAttachmentModal.value,
+      getExerciseAttachmentOptions(targetExercise),
+      customAttachments,
+      customAttachmentModal.editingAttachment,
+    );
+
+    if (error) {
+      setCustomAttachmentModal((prev) => ({ ...prev, error }));
+      return;
+    }
+
+    const isEditingAttachment = !!customAttachmentModal.editingAttachment;
+    const nextCustomAttachments = await saveCustomAttachments(
+      isEditingAttachment
+        ? replaceCustomAttachmentInList(
+            customAttachments,
+            customAttachmentModal.editingAttachment!,
+            attachment,
+          )
+        : [...customAttachments, attachment],
+      uid,
+    );
+
+    setCustomAttachments(nextCustomAttachments);
+    setSelected((prev) => {
+      const up = [...prev];
+      if (!up[exerciseIndex]) return prev;
+      return up.map((exercise, index) => {
+        if (isEditingAttachment) {
+          const reconciled = reconcileExerciseCustomAttachment(
+            exercise,
+            customAttachmentModal.editingAttachment!,
+            attachment,
+            nextCustomAttachments,
+          );
+          return index === exerciseIndex
+            ? {
+                ...reconciled,
+                attachment: sanitizeCustomAttachmentName(attachment),
+              }
+            : reconciled;
+        }
+
+        if (index !== exerciseIndex) return exercise;
+        const nextOptions = mergeAttachmentOptions(
+          [attachment, ...getExerciseAttachmentOptions(exercise)],
+          nextCustomAttachments,
+        );
+        return {
+          ...exercise,
+          attachment: sanitizeCustomAttachmentName(attachment),
+          attachmentOptions: nextOptions,
+          supportsAttachments: true,
+        };
+      });
+    });
+    Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
+    closeCustomAttachmentModal();
+  };
+
   const save = async () => {
+    if (templateSaveInFlightRef.current) return;
+
     if (selected.length === 0) {
       showInfo(
         "Empty Template",
@@ -228,111 +758,193 @@ export default function EditTemplateScreen({ navigation, route }: any) {
     }
     if (!uid) return;
 
-    const raw = await AsyncStorage.getItem(`@workout_templates_${uid}`);
-    const list = raw ? JSON.parse(raw).filter((t: any) => t) : [];
-    const finalName = name.trim() || "New Template";
-    const isDuplicate = list.some(
-      (t: any) =>
-        t.name.trim().toLowerCase() === finalName.toLowerCase() &&
-        t.id !== editingId,
+    templateSaveInFlightRef.current = true;
+    setTemplateSaveMessage(
+      editingId ? "Saving template..." : "Creating template...",
     );
 
-    if (isDuplicate) {
-      showInfo(
-        "Name Taken",
-        `A template named "${finalName}" already exists. Please choose a different name.`,
-      );
-      return;
-    }
+    try {
+      const raw = await AsyncStorage.getItem(`@workout_templates_${uid}`);
+      const list = raw
+        ? safeJsonParse<any[]>(raw, []).filter((t: any) => t)
+        : [];
 
-    const exercisesToSave = selected.map((ex) => {
-      const generatedSets = [
-        ...Array.from({ length: ex.warmupSets || 0 }).map(() => ({
-          isWarmup: true,
-        })),
-        ...Array.from({ length: ex.workingSets || 0 }).map(() => ({
-          isWarmup: false,
-        })),
-      ];
-      if (generatedSets.length === 0) generatedSets.push({ isWarmup: false });
-      return {
-        id: ex.id || genId("ex-"),
-        name: ex.name || "Exercise",
-        reminder: ex.reminder || "",
-        exerciseVariant: ex.exerciseVariant || "Normal",
-        variationOptions: ex.variationOptions,
-        is_unilateral: !!ex.is_unilateral,
-        supersetId: ex.supersetId || null,
-        supersetOrder: ex.supersetOrder,
-        sets: generatedSets,
-      };
-    });
+      if (!editingId && list.length >= LIMITS.templatesPerUser) {
+        showInfo("Template Limit Reached", "You can save up to 50 templates.");
+        return;
+      }
 
-    let updatedTemplates;
-    if (editingId) {
-      updatedTemplates = list.map((t: any) =>
-        t.id === editingId
-          ? { ...t, name: finalName, exercises: exercisesToSave }
-          : t,
+      const finalName =
+        cleanLimitedText(name, LIMITS.nameChars) || "New Template";
+      const isDuplicate = list.some(
+        (t: any) =>
+          t.name.trim().toLowerCase() === finalName.toLowerCase() &&
+          t.id !== editingId,
       );
-    } else {
-      const newTemplateId = genId("tpl-");
-      updatedTemplates = [
-        ...list,
-        {
-          id: newTemplateId,
-          name: finalName,
-          exercises: exercisesToSave,
-          createdAt: Date.now(),
-        },
-      ];
-      if (route.params?.folderId) {
+
+      if (isDuplicate) {
+        showInfo(
+          "Name Taken",
+          duplicateTemplateData
+            ? `Rename this duplicated template before saving. "${finalName}" already exists.`
+            : `A template named "${finalName}" already exists. Please choose a different name.`,
+        );
+        return;
+      }
+
+      const cleanedSelected = cleanInvalidSupersets(
+        selected.slice(0, LIMITS.exercisesPerWorkout),
+      );
+
+      const exercisesToSave = cleanedSelected.map((ex) => {
+        const attachmentExercise = normalizeExerciseForAttachmentStorage(ex);
+        const variationOptions = getExerciseVariationOptions(attachmentExercise);
+        const attachmentOptions = getExerciseAttachmentOptions(attachmentExercise);
+        const warmupCount = Math.min(
+          LIMITS.warmupSetsPerExercise,
+          Math.max(0, Number(attachmentExercise.warmupSets || 0)),
+        );
+        const workingCount = Math.min(
+          LIMITS.workingSetsPerExercise,
+          Math.max(0, Number(attachmentExercise.workingSets || 0)),
+        );
+        const generatedSets = [
+          ...Array.from({ length: warmupCount }).map(() => ({
+            isWarmup: true,
+          })),
+          ...Array.from({ length: workingCount }).map(() => ({
+            isWarmup: false,
+          })),
+        ];
+        if (generatedSets.length === 0) generatedSets.push({ isWarmup: false });
+
+        return {
+          id: attachmentExercise.id || genId("ex-"),
+          name: limitText(
+            attachmentExercise.name || "Exercise",
+            LIMITS.nameChars,
+          ),
+          reminder: limitText(
+            attachmentExercise.reminder || "",
+            LIMITS.cueChars,
+          ),
+          muscle: attachmentExercise.muscle,
+          equipment: attachmentExercise.equipment,
+          image: attachmentExercise.image,
+          exerciseVariant:
+            attachmentExercise.exerciseVariant ||
+            (variationOptions.length > 0 ? "Normal" : undefined),
+          variationOptions:
+            variationOptions.length > 0 ? variationOptions : undefined,
+          supportsVariants:
+            getExerciseSupportsVariantsForStorage(attachmentExercise),
+          attachment: getExerciseAttachmentForSave(attachmentExercise),
+          attachmentOptions:
+            attachmentOptions.length > 0 ? attachmentOptions : undefined,
+          supportsAttachments: attachmentOptions.length > 0 ? true : undefined,
+          is_unilateral: !!attachmentExercise.is_unilateral,
+          supersetId: attachmentExercise.supersetId || null,
+          supersetOrder: attachmentExercise.supersetOrder,
+          gymReplacements: normalizeGymReplacements(
+            attachmentExercise.gymReplacements,
+          ),
+          sets: generatedSets,
+        };
+      });
+
+      let updatedTemplates;
+      let newTemplateId: string | null = null;
+
+      if (editingId) {
+        updatedTemplates = list.map((t: any) =>
+          t.id === editingId
+            ? {
+                ...t,
+                name: finalName,
+                exercises: exercisesToSave,
+                updatedAt: Date.now(),
+              }
+            : t,
+        );
+      } else {
+        newTemplateId = genId("tpl-");
+        updatedTemplates = [
+          ...list,
+          {
+            id: newTemplateId,
+            name: finalName,
+            exercises: exercisesToSave,
+            createdAt: Date.now(),
+            updatedAt: Date.now(),
+          },
+        ];
+      }
+
+      try {
+        await saveTemplatesLocallyAndToCloud(updatedTemplates, uid);
+      } catch (e) {
+        await AsyncStorage.setItem(
+          `@workout_templates_${uid}`,
+          JSON.stringify(updatedTemplates),
+        );
+        console.log("Cloud routine backup delayed.", e);
+      }
+
+      if (newTemplateId && route.params?.folderId) {
         const fRaw = await AsyncStorage.getItem(`@workout_folders_${uid}`);
         if (fRaw) {
-          const storedFolders = JSON.parse(fRaw);
+          const storedFolders = safeJsonParse<any[]>(fRaw, []);
           const fIndex = storedFolders.findIndex(
             (f: any) => f.id === route.params.folderId,
           );
+
           if (fIndex !== -1) {
-            const currentIds = storedFolders[fIndex].templateIds || [];
-            storedFolders[fIndex].templateIds = Array.from(
-              new Set([...currentIds, newTemplateId]),
-            );
+            const currentIds = Array.isArray(storedFolders[fIndex].templateIds)
+              ? storedFolders[fIndex].templateIds
+              : [];
+            storedFolders[fIndex] = {
+              ...storedFolders[fIndex],
+              templateIds: Array.from(new Set([...currentIds, newTemplateId])),
+              updatedAt: Date.now(),
+            };
             await AsyncStorage.setItem(
               `@workout_folders_${uid}`,
               JSON.stringify(storedFolders),
             );
-            try {
-              await syncFoldersToCloud(storedFolders);
-            } catch (e) {
+            syncFoldersToCloud(storedFolders).catch((e) => {
               console.log("Failed to sync folder update", e);
-            }
+            });
           }
         }
       }
-    }
 
-    await AsyncStorage.setItem(
-      `@workout_templates_${uid}`,
-      JSON.stringify(updatedTemplates),
-    );
-    try {
-      await syncTemplatesToCloud(updatedTemplates);
-    } catch (e) {
-      console.log("Cloud routine backup delayed.", e);
+      setSelected(cleanedSelected);
+      setInitialDraftSnapshot(
+        serializeTemplateDraft(finalName, cleanedSelected),
+      );
+      allowTemplateLeaveRef.current = true;
+      Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
+      setSuccessAlertVisible(true);
+    } catch (error) {
+      console.error("Template save failed:", error);
+      showInfo(
+        "Save Failed",
+        "IronVault could not finish saving this template. Please try again.",
+      );
+    } finally {
+      templateSaveInFlightRef.current = false;
+      setTemplateSaveMessage("");
     }
-    setInitialDraftSnapshot(serializeTemplateDraft(finalName, selected));
-    allowTemplateLeaveRef.current = true;
-    Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
-    setSuccessAlertVisible(true);
   };
-
   const updateWorkingSets = (index: number, change: number) => {
     setSelected((prev) => {
       const up = [...prev];
       up[index] = {
         ...up[index],
-        workingSets: Math.max(0, (up[index].workingSets || 0) + change),
+        workingSets: Math.min(
+          LIMITS.workingSetsPerExercise,
+          Math.max(0, (up[index].workingSets || 0) + change),
+        ),
       };
       return up;
     });
@@ -343,7 +955,10 @@ export default function EditTemplateScreen({ navigation, route }: any) {
       const up = [...prev];
       up[index] = {
         ...up[index],
-        warmupSets: Math.max(0, (up[index].warmupSets || 0) + change),
+        warmupSets: Math.min(
+          LIMITS.warmupSetsPerExercise,
+          Math.max(0, (up[index].warmupSets || 0) + change),
+        ),
       };
       return up;
     });
@@ -357,6 +972,17 @@ export default function EditTemplateScreen({ navigation, route }: any) {
     const supersetOrderLabel = ex.supersetId
       ? `${supersetLabel}${ex.supersetOrder || 1}`
       : null;
+    const showGymSwapRow = gyms.length > 1;
+    const gymSwapSummary = getGymSwapSummary(ex);
+    const variationOptions = getExerciseVariationOptions(ex);
+    const attachmentOptions = getExerciseAttachmentOptionsWithCustom(
+      ex,
+      customAttachments,
+    );
+    const attachmentSelectionOptions = getExerciseAttachmentSelectionOptions(
+      ex,
+      customAttachments,
+    );
 
     return (
       <View key={ex.id || `${ex.name}-${i}`}>
@@ -419,13 +1045,13 @@ export default function EditTemplateScreen({ navigation, route }: any) {
                 </Text>
               )}
 
-              {getExerciseVariationOptions(ex).length > 0 && (
+              {variationOptions.length > 0 && (
                 <ScrollView
                   horizontal
                   showsHorizontalScrollIndicator={false}
                   contentContainerStyle={{ paddingTop: 10 }}
                 >
-                  {getExerciseVariationOptions(ex).map((variant) => {
+                  {variationOptions.map((variant) => {
                     const active = (ex.exerciseVariant || "Normal") === variant;
                     return (
                       <TouchableOpacity
@@ -461,7 +1087,95 @@ export default function EditTemplateScreen({ navigation, route }: any) {
                   })}
                 </ScrollView>
               )}
+
+              {attachmentSelectionOptions.length > 0 && (
+                <ScrollView
+                  horizontal
+                  showsHorizontalScrollIndicator={false}
+                  contentContainerStyle={{ paddingTop: 8 }}
+                >
+                  {attachmentSelectionOptions.map((attachment) => {
+                    const isNoAttachment =
+                      attachment === NO_ATTACHMENT_OPTION_LABEL;
+                    const currentAttachment =
+                      getExerciseAttachmentForStorage(ex);
+                    const active = isNoAttachment
+                      ? !currentAttachment
+                      : currentAttachment === attachment;
+                    return (
+                      <TouchableOpacity
+                        key={attachment}
+                        style={{
+                          paddingHorizontal: 10,
+                          paddingVertical: 6,
+                          borderRadius: 999,
+                          marginRight: 8,
+                          backgroundColor: active ? "#32D74B" : "#2C2C2E",
+                          borderWidth: 1,
+                          borderColor: active ? "#32D74B" : "#3A3A3C",
+                        }}
+                        onPress={() => {
+                          setSelected((prev) => {
+                            const up = [...prev];
+                            up[i] = {
+                              ...up[i],
+                              attachment: isNoAttachment ? "" : attachment,
+                              attachmentOptions,
+                              supportsAttachments: true,
+                            };
+                            return up;
+                          });
+                        }}
+                      >
+                        <Text
+                          style={{
+                            color: active ? "#000" : "#D1D1D6",
+                            fontSize: 11,
+                            fontWeight: "900",
+                          }}
+                        >
+                          {attachment}
+                        </Text>
+                      </TouchableOpacity>
+                    );
+                  })}
+                  <TouchableOpacity
+                    key="custom-attachment"
+                    style={{
+                      paddingHorizontal: 10,
+                      paddingVertical: 6,
+                      borderRadius: 999,
+                      marginRight: 8,
+                      backgroundColor: "#111113",
+                      borderWidth: 1,
+                      borderColor: "#32D74B",
+                    }}
+                    onPress={() => openCustomAttachmentModal(i)}
+                  >
+                    <Text
+                      style={{
+                        color: "#32D74B",
+                        fontSize: 11,
+                        fontWeight: "900",
+                      }}
+                    >
+                      + Custom
+                    </Text>
+                  </TouchableOpacity>
+                </ScrollView>
+              )}
             </View>
+
+            <TouchableOpacity
+              onPress={() => openReplaceExercise(i)}
+              style={{ paddingHorizontal: 8, paddingVertical: 4 }}
+            >
+              <Ionicons
+                name="swap-horizontal-outline"
+                size={22}
+                color="#32D74B"
+              />
+            </TouchableOpacity>
 
             {ex.supersetId ? (
               <TouchableOpacity
@@ -480,9 +1194,7 @@ export default function EditTemplateScreen({ navigation, route }: any) {
             ) : null}
 
             <TouchableOpacity
-              onPress={() =>
-                setSelected((prev) => prev.filter((_, idx) => idx !== i))
-              }
+              onPress={() => requestDeleteExercise(i)}
               style={{ paddingHorizontal: 4, paddingVertical: 4 }}
             >
               <Ionicons name="trash-outline" size={22} color="#FF3B30" />
@@ -491,86 +1203,195 @@ export default function EditTemplateScreen({ navigation, route }: any) {
 
           <View
             style={{
-              flexDirection: "row",
-              justifyContent: "space-between",
-              alignItems: "center",
-              marginBottom: 15,
+              marginTop: 14,
+              paddingTop: 12,
+              borderTopWidth: 1,
+              borderTopColor: "#2C2C2E",
             }}
           >
-            <View style={{ flexDirection: "row", alignItems: "center" }}>
-              <Text
+            <View
+              style={{
+                flexDirection: "row",
+                alignItems: "center",
+                justifyContent: "space-between",
+              }}
+            >
+              <View style={{ flex: 1, paddingRight: 12 }}>
+                <Text
+                  style={{ color: "#F2F2F7", fontSize: 14, fontWeight: "800" }}
+                >
+                  Warm-ups
+                </Text>
+                <Text style={{ color: "#8E8E93", fontSize: 11, marginTop: 2 }}>
+                  Preparation sets before working weight
+                </Text>
+              </View>
+              <View
                 style={{
-                  color: "#FFD700",
-                  fontSize: 16,
-                  fontWeight: "600",
-                  width: 110,
+                  flexDirection: "row",
+                  alignItems: "center",
+                  backgroundColor: "#1C1C1E",
+                  borderRadius: 999,
+                  borderWidth: 1,
+                  borderColor: "#2C2C2E",
+                  padding: 3,
                 }}
               >
-                Warm-ups: {ex.warmupSets || 0}
-              </Text>
-              <TouchableOpacity
-                style={styles.moveBtn}
-                onPress={() => updateWarmupSets(i, -1)}
-                disabled={(ex.warmupSets || 0) === 0}
-              >
-                <Text
+                <TouchableOpacity
                   style={[
-                    styles.moveBtnText,
-                    (ex.warmupSets || 0) === 0 && { color: "#3A3A3C" },
+                    styles.moveBtn,
+                    { marginRight: 0, backgroundColor: "transparent" },
                   ]}
+                  onPress={() => updateWarmupSets(i, -1)}
+                  disabled={(ex.warmupSets || 0) === 0}
                 >
-                  -
+                  <Text
+                    style={[
+                      styles.moveBtnText,
+                      (ex.warmupSets || 0) === 0 && { color: "#3A3A3C" },
+                    ]}
+                  >
+                    -
+                  </Text>
+                </TouchableOpacity>
+                <Text
+                  style={{
+                    color: "#FFD700",
+                    fontSize: 15,
+                    fontWeight: "900",
+                    minWidth: 28,
+                    textAlign: "center",
+                  }}
+                >
+                  {ex.warmupSets || 0}
                 </Text>
-              </TouchableOpacity>
-              <TouchableOpacity
-                style={styles.moveBtn}
-                onPress={() => updateWarmupSets(i, 1)}
+                <TouchableOpacity
+                  style={[
+                    styles.moveBtn,
+                    { marginRight: 0, backgroundColor: "transparent" },
+                  ]}
+                  onPress={() => updateWarmupSets(i, 1)}
+                >
+                  <Text style={styles.moveBtnText}>+</Text>
+                </TouchableOpacity>
+              </View>
+            </View>
+
+            <View
+              style={{
+                flexDirection: "row",
+                alignItems: "center",
+                justifyContent: "space-between",
+                marginTop: 12,
+              }}
+            >
+              <View style={{ flex: 1, paddingRight: 12 }}>
+                <Text
+                  style={{ color: "#F2F2F7", fontSize: 14, fontWeight: "800" }}
+                >
+                  Working sets
+                </Text>
+                <Text style={{ color: "#8E8E93", fontSize: 11, marginTop: 2 }}>
+                  Main logged sets for this exercise
+                </Text>
+              </View>
+              <View
+                style={{
+                  flexDirection: "row",
+                  alignItems: "center",
+                  backgroundColor: "#1C1C1E",
+                  borderRadius: 999,
+                  borderWidth: 1,
+                  borderColor: "#2C2C2E",
+                  padding: 3,
+                }}
               >
-                <Text style={styles.moveBtnText}>+</Text>
-              </TouchableOpacity>
+                <TouchableOpacity
+                  style={[
+                    styles.moveBtn,
+                    { marginRight: 0, backgroundColor: "transparent" },
+                  ]}
+                  onPress={() => updateWorkingSets(i, -1)}
+                  disabled={(ex.workingSets || 0) === 0}
+                >
+                  <Text
+                    style={[
+                      styles.moveBtnText,
+                      (ex.workingSets || 0) === 0 && { color: "#3A3A3C" },
+                    ]}
+                  >
+                    -
+                  </Text>
+                </TouchableOpacity>
+                <Text
+                  style={{
+                    color: "#F2F2F7",
+                    fontSize: 15,
+                    fontWeight: "900",
+                    minWidth: 28,
+                    textAlign: "center",
+                  }}
+                >
+                  {ex.workingSets ?? 1}
+                </Text>
+                <TouchableOpacity
+                  style={[
+                    styles.moveBtn,
+                    { marginRight: 0, backgroundColor: "transparent" },
+                  ]}
+                  onPress={() => updateWorkingSets(i, 1)}
+                >
+                  <Text style={styles.moveBtnText}>+</Text>
+                </TouchableOpacity>
+              </View>
             </View>
           </View>
 
-          <View
-            style={{
-              flexDirection: "row",
-              justifyContent: "space-between",
-              alignItems: "center",
-            }}
-          >
-            <View style={{ flexDirection: "row", alignItems: "center" }}>
-              <Text
+          {showGymSwapRow && (
+            <TouchableOpacity
+              activeOpacity={0.85}
+              onPress={() => openGymSwapManager(i)}
+              style={{
+                marginTop: 13,
+                paddingTop: 12,
+                borderTopWidth: 1,
+                borderTopColor: "#2C2C2E",
+                flexDirection: "row",
+                alignItems: "center",
+                justifyContent: "space-between",
+              }}
+            >
+              <View style={{ flex: 1, paddingRight: 12 }}>
+                <Text
+                  style={{
+                    color: "#F2F2F7",
+                    fontSize: 14,
+                    fontWeight: "800",
+                  }}
+                >
+                  Gym-specific swaps
+                </Text>
+                <Text
+                  style={{ color: "#8E8E93", fontSize: 11, marginTop: 3 }}
+                  numberOfLines={1}
+                >
+                  {gymSwapSummary}
+                </Text>
+              </View>
+              <View
                 style={{
-                  color: "#8E8E93",
-                  fontSize: 16,
-                  fontWeight: "600",
-                  width: 110,
+                  width: 28,
+                  height: 28,
+                  borderRadius: 14,
+                  backgroundColor: "#1C1C1E",
+                  alignItems: "center",
+                  justifyContent: "center",
                 }}
               >
-                Working: {ex.workingSets ?? 1}
-              </Text>
-              <TouchableOpacity
-                style={styles.moveBtn}
-                onPress={() => updateWorkingSets(i, -1)}
-                disabled={(ex.workingSets || 0) === 0}
-              >
-                <Text
-                  style={[
-                    styles.moveBtnText,
-                    (ex.workingSets || 0) === 0 && { color: "#3A3A3C" },
-                  ]}
-                >
-                  -
-                </Text>
-              </TouchableOpacity>
-              <TouchableOpacity
-                style={styles.moveBtn}
-                onPress={() => updateWorkingSets(i, 1)}
-              >
-                <Text style={styles.moveBtnText}>+</Text>
-              </TouchableOpacity>
-            </View>
-          </View>
+                <Ionicons name="chevron-forward" size={17} color="#8E8E93" />
+              </View>
+            </TouchableOpacity>
+          )}
         </View>
       </View>
     );
@@ -601,9 +1422,47 @@ export default function EditTemplateScreen({ navigation, route }: any) {
         message="You have unsaved template changes. Leaving now will discard them."
         buttons={[
           { text: "Keep Editing", style: "cancel" },
-          { text: "Discard", style: "destructive", onPress: discardTemplateChanges },
+          {
+            text: "Discard",
+            style: "destructive",
+            onPress: discardTemplateChanges,
+          },
         ]}
         onClose={() => setDiscardAlert((prev) => ({ ...prev, visible: false }))}
+      />
+      <CustomAlert
+        visible={deleteExerciseAlert.visible}
+        title="Delete Exercise?"
+        message={`Remove ${deleteExerciseAlert.name || "this exercise"} from this template? This will also remove its saved set structure from the template.`}
+        buttons={[
+          { text: "Cancel", style: "cancel" },
+          {
+            text: "Delete",
+            style: "destructive",
+            onPress: confirmDeleteExercise,
+          },
+        ]}
+        onClose={() =>
+          setDeleteExerciseAlert({ visible: false, index: null, name: "" })
+        }
+      />
+      <CustomAttachmentModal
+        visible={customAttachmentModal.visible}
+        value={customAttachmentModal.value}
+        error={customAttachmentModal.error}
+        customAttachments={customAttachments}
+        editingAttachment={customAttachmentModal.editingAttachment}
+        onChangeText={(value) =>
+          setCustomAttachmentModal((prev) => ({
+            ...prev,
+            value,
+            error: "",
+          }))
+        }
+        onCancel={closeCustomAttachmentModal}
+        onSave={saveCustomAttachmentForExercise}
+        onEditAttachment={editCustomAttachment}
+        onDeleteAttachment={deleteCustomAttachment}
       />
 
       <Modal visible={isReorderModalVisible} transparent animationType="fade">
@@ -776,6 +1635,243 @@ export default function EditTemplateScreen({ navigation, route }: any) {
         </View>
       </Modal>
 
+      <Modal visible={isGymSwapManagerVisible} transparent animationType="fade">
+        <View style={styles.modalOverlay}>
+          <View style={styles.actionMenuCard}>
+            <Text style={styles.actionMenuTitle}>Gym-specific swaps</Text>
+            <Text style={styles.actionMenuSubtitle}>
+              Swap this exercise only when starting this template at selected
+              gyms.
+            </Text>
+
+            {gymSwapExerciseIndex !== null && selected[gymSwapExerciseIndex] ? (
+              <View style={{ marginTop: 12 }}>
+                <Text
+                  style={{
+                    color: "#F2F2F7",
+                    fontSize: 14,
+                    fontWeight: "900",
+                    marginBottom: 10,
+                  }}
+                  numberOfLines={2}
+                >
+                  {formatExerciseDisplayName(selected[gymSwapExerciseIndex])}
+                </Text>
+
+                {Object.entries(
+                  normalizeGymReplacements(
+                    selected[gymSwapExerciseIndex]?.gymReplacements,
+                  ),
+                ).length === 0 ? (
+                  <View
+                    style={{
+                      paddingVertical: 14,
+                      paddingHorizontal: 12,
+                      borderRadius: 12,
+                      backgroundColor: "#1C1C1E",
+                      borderWidth: 1,
+                      borderColor: "#2C2C2E",
+                    }}
+                  >
+                    <Text
+                      style={{ color: "#8E8E93", fontSize: 12, lineHeight: 18 }}
+                    >
+                      No swaps set yet. Add one if this gym uses a different
+                      exercise for the same template slot.
+                    </Text>
+                  </View>
+                ) : (
+                  <ScrollView
+                    style={{ maxHeight: 260 }}
+                    showsVerticalScrollIndicator={false}
+                  >
+                    {Object.entries(
+                      normalizeGymReplacements(
+                        selected[gymSwapExerciseIndex]?.gymReplacements,
+                      ),
+                    ).map(([gymId, replacement]: any) => (
+                      <View
+                        key={gymId}
+                        style={{
+                          paddingVertical: 11,
+                          paddingHorizontal: 12,
+                          borderRadius: 12,
+                          backgroundColor: "#1C1C1E",
+                          borderWidth: 1,
+                          borderColor: "#2C2C2E",
+                          marginBottom: 8,
+                          flexDirection: "row",
+                          alignItems: "center",
+                        }}
+                      >
+                        <View style={{ flex: 1, paddingRight: 10 }}>
+                          <Text
+                            style={{
+                              color: "#F2F2F7",
+                              fontSize: 12,
+                              fontWeight: "900",
+                            }}
+                            numberOfLines={1}
+                          >
+                            {getGymName(gymId)}
+                          </Text>
+                          <Text
+                            style={{
+                              color: "#32D74B",
+                              fontSize: 12,
+                              marginTop: 3,
+                            }}
+                            numberOfLines={2}
+                          >
+                            → {replacement?.name || "Replacement exercise"}
+                          </Text>
+                        </View>
+                        <TouchableOpacity
+                          onPress={() => {
+                            if (gymSwapExerciseIndex !== null) {
+                              removeGymReplacement(gymSwapExerciseIndex, gymId);
+                            }
+                          }}
+                          style={{ padding: 6 }}
+                        >
+                          <Ionicons
+                            name="close-outline"
+                            size={20}
+                            color="#8E8E93"
+                          />
+                        </TouchableOpacity>
+                      </View>
+                    ))}
+                  </ScrollView>
+                )}
+
+                <TouchableOpacity
+                  style={{
+                    marginTop: 14,
+                    width: "100%",
+                    minHeight: 52,
+                    borderRadius: 18,
+                    backgroundColor: "#32D74B",
+                    alignItems: "center",
+                    justifyContent: "center",
+                    paddingHorizontal: 18,
+                  }}
+                  activeOpacity={0.82}
+                  onPress={() => {
+                    if (gymSwapExerciseIndex !== null) {
+                      openGymReplacementPicker(gymSwapExerciseIndex);
+                    }
+                  }}
+                >
+                  <Text
+                    style={{
+                      color: "#000",
+                      fontSize: 16,
+                      fontWeight: "900",
+                    }}
+                  >
+                    Add gym swap
+                  </Text>
+                </TouchableOpacity>
+              </View>
+            ) : null}
+
+            <TouchableOpacity
+              style={{
+                marginTop: 12,
+                width: "100%",
+                minHeight: 50,
+                borderRadius: 18,
+                backgroundColor: "#2C2C2E",
+                alignItems: "center",
+                justifyContent: "center",
+                paddingHorizontal: 18,
+              }}
+              activeOpacity={0.82}
+              onPress={() => {
+                setIsGymSwapManagerVisible(false);
+                setGymSwapExerciseIndex(null);
+              }}
+            >
+              <Text
+                style={{
+                  color: "#F2F2F7",
+                  fontSize: 16,
+                  fontWeight: "900",
+                }}
+              >
+                Close
+              </Text>
+            </TouchableOpacity>
+          </View>
+        </View>
+      </Modal>
+
+      <Modal
+        visible={isGymReplacementModalVisible}
+        transparent
+        animationType="fade"
+      >
+        <View style={styles.modalOverlay}>
+          <View style={styles.actionMenuCard}>
+            <Text style={styles.actionMenuTitle}>Choose gym</Text>
+            <Text style={styles.actionMenuSubtitle}>
+              Select the gym where this exercise should swap to a different
+              movement.
+            </Text>
+            <ScrollView
+              style={{ maxHeight: 320 }}
+              showsVerticalScrollIndicator={false}
+            >
+              {gyms.map((gym: any) => (
+                <TouchableOpacity
+                  key={gym.id}
+                  style={styles.supersetPickerRow}
+                  onPress={() => selectReplacementGym(gym.id)}
+                >
+                  <View style={{ flex: 1 }}>
+                    <Text style={styles.supersetPickerTitle} numberOfLines={1}>
+                      {gym.name}
+                    </Text>
+                    <Text style={styles.supersetPickerMeta}>
+                      Choose or update this gym swap
+                    </Text>
+                  </View>
+                  <Ionicons name="chevron-forward" size={18} color="#8E8E93" />
+                </TouchableOpacity>
+              ))}
+            </ScrollView>
+            <TouchableOpacity
+              style={{
+                marginTop: 14,
+                width: "100%",
+                minHeight: 50,
+                borderRadius: 18,
+                backgroundColor: "#2C2C2E",
+                alignItems: "center",
+                justifyContent: "center",
+                paddingHorizontal: 18,
+              }}
+              activeOpacity={0.82}
+              onPress={() => {
+                setIsGymReplacementModalVisible(false);
+                setReplacementExerciseIndex(null);
+              }}
+            >
+              <Text
+                style={{
+                  color: "#F2F2F7",
+                  fontSize: 16,
+                  fontWeight: "900",
+                }}
+              >
+                Close
+              </Text>
+            </TouchableOpacity>
+          </View>
+        </View>
+      </Modal>
+
       <SafeAreaView edges={["top"]} style={styles.headerContainer}>
         <View style={styles.headerContentFlex}>
           <TouchableOpacity
@@ -788,14 +1884,22 @@ export default function EditTemplateScreen({ navigation, route }: any) {
             <TextInput
               style={styles.headerTitleInput}
               value={name}
-              onChangeText={setName}
+              onChangeText={(value) => setName(limitText(value, LIMITS.nameChars))}
+              maxLength={LIMITS.nameChars}
               selectTextOnFocus
               textAlign="center"
               selectionColor="#FFF"
             />
           </View>
           <View style={styles.headerRightActionGroup}>
-            <TouchableOpacity style={styles.headerSideBtn} onPress={save}>
+            <TouchableOpacity
+              style={[
+                styles.headerSideBtn,
+                isTemplateSaveBlocking && { opacity: 0.45 },
+              ]}
+              onPress={save}
+              disabled={isTemplateSaveBlocking}
+            >
               <Text style={styles.headerActionText}>Save</Text>
             </TouchableOpacity>
           </View>
@@ -827,33 +1931,34 @@ export default function EditTemplateScreen({ navigation, route }: any) {
 
           <TouchableOpacity
             style={styles.addExerciseCard}
-            onPress={() =>
+            onPress={() => {
+              if (selected.length >= LIMITS.exercisesPerWorkout) {
+                showInfo(
+                  "Exercise Limit Reached",
+                  "Each template can have up to 25 exercises.",
+                );
+                return;
+              }
               navigation.navigate("Search", {
+                multiSelect: true,
+                selectionContext: "template",
+                maxSelectable: LIMITS.exercisesPerWorkout - selected.length,
                 existingExercises: selected.map((e) => e.name),
-                onSelect: (exData: any) =>
-                  setSelected((prev) => [
-                    ...prev,
-                    {
-                      id: genId("ex-"),
-                      name: exData.name,
-                      reminder: exData.reminder,
-                      exerciseVariant:
-                        getExerciseVariationOptions(exData).length > 0
-                          ? "Normal"
-                          : undefined,
-                      variationOptions: getExerciseVariationOptions(exData),
-                      is_unilateral: !!exData.is_unilateral,
-                      warmupSets: 0,
-                      workingSets: 1,
-                    },
-                  ]),
-              })
-            }
+                onSelect: (exData: any) => addExercisesToTemplate([exData]),
+                onSelectMany: (exerciseList: any[]) =>
+                  addExercisesToTemplate(exerciseList),
+              });
+            }}
           >
             <Text style={styles.addExerciseText}>+ Add Exercise</Text>
           </TouchableOpacity>
         </ScrollView>
       </KeyboardAvoidingView>
+
+      <BlockingOverlay
+        visible={isTemplateSaveBlocking}
+        message={templateSaveMessage}
+      />
     </View>
   );
 }

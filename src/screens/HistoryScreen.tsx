@@ -7,6 +7,7 @@ import React, {
 } from "react";
 import {
   Alert,
+  Modal,
   ScrollView,
   SectionList,
   StyleSheet,
@@ -19,11 +20,16 @@ import { SafeAreaView } from "react-native-safe-area-context";
 import AsyncStorage from "@react-native-async-storage/async-storage";
 import * as Haptics from "expo-haptics";
 import { Ionicons } from "@expo/vector-icons";
-import { doc, deleteDoc } from "firebase/firestore";
 
-import { auth, db } from "../config/firebaseConfig";
+import { auth } from "../config/firebaseConfig";
 import {
+  clearWorkoutDeletedLocally,
+  deleteWorkoutFromCloud,
   getLocalWorkoutHistory,
+  markWorkoutDeletedLocally,
+  pushWorkoutToCloud,
+  safeJsonParse,
+  saveLocalWorkoutHistory,
   syncWorkoutHistoryWithCloud,
 } from "../utils/firebaseSync";
 import { styles } from "../constants/globalStyles";
@@ -32,8 +38,19 @@ import {
   buildHistoricalWorkoutPRMap,
   getUniquePRExerciseCount,
 } from "../utils/performance";
+import { formatExerciseDisplayName } from "../utils/helpers";
+import {
+  MAX_WORKOUT_DURATION_MS,
+} from "../constants/limits";
+import UndoToast from "../components/UndoToast";
+import BlockingOverlay from "../components/BlockingOverlay";
 
 type GymOption = {
+  id: string;
+  name: string;
+};
+
+type TemplateOption = {
   id: string;
   name: string;
 };
@@ -44,6 +61,7 @@ type WorkoutSection = {
 };
 
 type HistoryFilter = "ALL" | "WEEK" | "MONTH";
+type HighlightFilter = "ALL" | "PRS" | "NOTES";
 
 const startOfLocalDay = (value: number) => {
   const date = new Date(value);
@@ -140,14 +158,99 @@ const getWorkoutTimestamp = (workout: any): number => {
   return 0;
 };
 
-const formatWorkoutDate = (workout: any): string => {
+
+const getWorkoutEndTimestamp = (workout: any): number => {
+  const finishedAt = Number(
+    workout?.finishedAt || workout?.completedAt || workout?.timestamp,
+  );
+  if (Number.isFinite(finishedAt) && finishedAt > 0) return finishedAt;
+
+  const startedAt = getWorkoutTimestamp(workout);
+  const durationSeconds = Number(workout?.durationSeconds);
+  if (startedAt && Number.isFinite(durationSeconds) && durationSeconds >= 0) {
+    return startedAt + durationSeconds * 1000;
+  }
+
+  const parsedDurationSeconds = parseDurationToSeconds(workout?.duration);
+  if (startedAt && parsedDurationSeconds > 0) {
+    return startedAt + parsedDurationSeconds * 1000;
+  }
+
+  return 0;
+};
+
+const formatWorkoutMetaDate = (workout: any): string => {
   const timestamp = getWorkoutTimestamp(workout);
-  if (!timestamp) return workout?.date || "Unknown Date";
+  if (!timestamp) return workout?.date || "Unknown date";
 
   return new Date(timestamp).toLocaleDateString(undefined, {
+    weekday: "short",
+    day: "numeric",
+    month: "short",
+  });
+};
+
+const formatInputDate = (timestamp: number) => {
+  const date = new Date(timestamp);
+  const year = date.getFullYear();
+  const month = String(date.getMonth() + 1).padStart(2, "0");
+  const day = String(date.getDate()).padStart(2, "0");
+  return `${year}-${month}-${day}`;
+};
+
+const formatInputTime = (timestamp: number) => {
+  const date = new Date(timestamp);
+  const hours = String(date.getHours()).padStart(2, "0");
+  const minutes = String(date.getMinutes()).padStart(2, "0");
+  return `${hours}:${minutes}`;
+};
+
+const parseLocalDateTimeInput = (dateInput: string, timeInput: string) => {
+  const dateMatch = dateInput.trim().match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  const timeMatch = timeInput.trim().match(/^(\d{1,2}):(\d{2})$/);
+  if (!dateMatch || !timeMatch) return null;
+
+  const year = Number(dateMatch[1]);
+  const month = Number(dateMatch[2]);
+  const day = Number(dateMatch[3]);
+  const hours = Number(timeMatch[1]);
+  const minutes = Number(timeMatch[2]);
+
+  if (
+    month < 1 ||
+    month > 12 ||
+    day < 1 ||
+    day > 31 ||
+    hours < 0 ||
+    hours > 23 ||
+    minutes < 0 ||
+    minutes > 59
+  ) {
+    return null;
+  }
+
+  const parsed = new Date(year, month - 1, day, hours, minutes, 0, 0);
+  if (
+    parsed.getFullYear() !== year ||
+    parsed.getMonth() !== month - 1 ||
+    parsed.getDate() !== day ||
+    parsed.getHours() !== hours ||
+    parsed.getMinutes() !== minutes
+  ) {
+    return null;
+  }
+
+  return parsed.getTime();
+};
+
+const formatEndTimeLabel = (timestamp: number) => {
+  if (!timestamp) return "Not recorded";
+  return new Date(timestamp).toLocaleString(undefined, {
     day: "numeric",
     month: "short",
     year: "numeric",
+    hour: "numeric",
+    minute: "2-digit",
   });
 };
 
@@ -233,7 +336,7 @@ const getTopExerciseLines = (workout: any, limit = 2) => {
         const bestSet = getBestSetForExercise(exercise, unit);
         return bestSet
           ? {
-              name: exercise.name,
+              name: formatExerciseDisplayName(exercise),
               bestSet,
               completedSets:
                 exercise?.sets?.filter(
@@ -260,21 +363,40 @@ const HISTORY_FILTERS: { label: string; value: HistoryFilter }[] = [
   { label: "Month", value: "MONTH" },
 ];
 
+const HIGHLIGHT_FILTERS: { label: string; value: HighlightFilter }[] = [
+  { label: "All", value: "ALL" },
+  { label: "PRs", value: "PRS" },
+  { label: "Notes", value: "NOTES" },
+];
+
 export default function HistoryScreen({ navigation }: any) {
   const [history, setHistory] = useState<any[]>([]);
   const [gyms, setGyms] = useState<GymOption[]>([]);
+  const [templates, setTemplates] = useState<TemplateOption[]>([]);
   const [searchQuery, setSearchQuery] = useState("");
   const [selectedGymId, setSelectedGymId] = useState<string>("ALL");
+  const [selectedTemplateId, setSelectedTemplateId] = useState<string>("ALL");
   const [historyFilter, setHistoryFilter] = useState<HistoryFilter>("ALL");
+  const [highlightFilter, setHighlightFilter] = useState<HighlightFilter>("ALL");
   const [selectedMonthStart, setSelectedMonthStart] = useState(() =>
     getMonthStart(Date.now()),
   );
   const [loading, setLoading] = useState(false);
   const [isGlobalKg, setIsGlobalKg] = useState(false);
+  const [editingEndWorkout, setEditingEndWorkout] = useState<any | null>(null);
+  const [endDateInput, setEndDateInput] = useState("");
+  const [endTimeInput, setEndTimeInput] = useState("");
+  const [isSavingEndTime, setIsSavingEndTime] = useState(false);
+  const [deletedWorkoutForUndo, setDeletedWorkoutForUndo] = useState<any | null>(
+    null,
+  );
+  const [actionWorkout, setActionWorkout] = useState<any | null>(null);
 
   const listRef = useRef<SectionList<any, WorkoutSection>>(null);
   const pendingScrollToTopRef = useRef(false);
+  const actionMenuOpenRef = useRef(false);
   const uid = auth.currentUser?.uid;
+  const isHistoryBlocking = isSavingEndTime;
 
   const load = async () => {
     if (!uid) return;
@@ -285,27 +407,51 @@ export default function HistoryScreen({ navigation }: any) {
       setIsGlobalKg(pref === "KG");
 
       const savedGyms = await AsyncStorage.getItem(`@user_gyms_${uid}`);
-      setGyms(savedGyms ? JSON.parse(savedGyms) : []);
+      setGyms(savedGyms ? safeJsonParse(savedGyms, []) : []);
+      const savedTemplates = await AsyncStorage.getItem(
+        `@workout_templates_${uid}`,
+      );
+      setTemplates(savedTemplates ? safeJsonParse(savedTemplates, []) : []);
 
-      await syncWorkoutHistoryWithCloud();
-
-      const mergedData = await getLocalWorkoutHistory(uid);
+      const localData = await getLocalWorkoutHistory(uid);
       setHistory(
-        mergedData
+        localData
           .filter((workout: any) => workout && workout.id)
           .sort(
             (a: any, b: any) => getWorkoutTimestamp(b) - getWorkoutTimestamp(a),
           ),
       );
+
+      syncWorkoutHistoryWithCloud()
+        .then(async () => {
+          const mergedData = await getLocalWorkoutHistory(uid);
+          setHistory(
+            mergedData
+              .filter((workout: any) => workout && workout.id)
+              .sort(
+                (a: any, b: any) =>
+                  getWorkoutTimestamp(b) - getWorkoutTimestamp(a),
+              ),
+          );
+        })
+        .catch((error) => {
+          console.log("History cloud refresh delayed:", error);
+        });
     } catch (error) {
       console.error("Failed to sync history with cloud:", error);
 
       const savedGyms = await AsyncStorage.getItem(`@user_gyms_${uid}`);
-      setGyms(savedGyms ? JSON.parse(savedGyms) : []);
+      setGyms(savedGyms ? safeJsonParse(savedGyms, []) : []);
+      const savedTemplates = await AsyncStorage.getItem(
+        `@workout_templates_${uid}`,
+      );
+      setTemplates(savedTemplates ? safeJsonParse(savedTemplates, []) : []);
 
       const saved = await AsyncStorage.getItem(`@workout_history_${uid}`);
       const localData = saved
-        ? JSON.parse(saved).filter((workout: any) => workout && workout.id)
+        ? safeJsonParse<any[]>(saved, []).filter(
+            (workout: any) => workout && workout.id,
+          )
         : [];
 
       setHistory(
@@ -348,26 +494,67 @@ export default function HistoryScreen({ navigation }: any) {
     );
   }, [dateFilteredHistory, selectedGymId]);
 
+  const templateFilteredHistory = useMemo(() => {
+    if (selectedTemplateId === "ALL") return gymFilteredHistory;
+    if (selectedTemplateId === "NONE") {
+      return gymFilteredHistory.filter((workout) => !workout.templateId);
+    }
+    return gymFilteredHistory.filter(
+      (workout) =>
+        String(workout?.templateId || "") === String(selectedTemplateId),
+    );
+  }, [gymFilteredHistory, selectedTemplateId]);
+
+  const workoutPRMap = useMemo(() => {
+    return buildHistoricalWorkoutPRMap(history, { isKg: isGlobalKg });
+  }, [history, isGlobalKg]);
+
+  const getWorkoutPRs = useCallback(
+    (workout: any) => {
+      const saved = Array.isArray(workout?.prs) ? workout.prs : [];
+      if (saved.length > 0) return saved;
+      return workoutPRMap[String(workout?.id || "")] || [];
+    },
+    [workoutPRMap],
+  );
+
+  const highlightFilteredHistory = useMemo(() => {
+    if (highlightFilter === "ALL") return templateFilteredHistory;
+    if (highlightFilter === "PRS") {
+      return templateFilteredHistory.filter(
+        (workout) => getWorkoutPRs(workout).length > 0 || !!workout?.prType,
+      );
+    }
+    return templateFilteredHistory.filter(hasRemark);
+  }, [getWorkoutPRs, highlightFilter, templateFilteredHistory]);
+
   const visibleHistory = useMemo(() => {
     const query = searchQuery.toLowerCase().trim();
-    if (!query) return gymFilteredHistory;
+    if (!query) return highlightFilteredHistory;
 
-    return gymFilteredHistory.filter((workout) => {
+    return highlightFilteredHistory.filter((workout) => {
       const workoutName = workout?.workoutName?.toLowerCase() || "";
       const currentGymName =
         gyms.find((gym) => String(gym.id) === String(workout?.gymId))?.name ||
         workout?.gymName ||
         "";
       const gymName = currentGymName.toLowerCase();
+      const templateName =
+        templates.find(
+          (template) => String(template.id) === String(workout?.templateId),
+        )?.name?.toLowerCase() || "";
       const exerciseMatch = workout?.fullWorkoutData?.some((exercise: any) =>
         exercise?.name?.toLowerCase().includes(query),
       );
 
       return (
-        workoutName.includes(query) || gymName.includes(query) || exerciseMatch
+        workoutName.includes(query) ||
+        gymName.includes(query) ||
+        templateName.includes(query) ||
+        exerciseMatch
       );
     });
-  }, [gymFilteredHistory, searchQuery, gyms]);
+  }, [highlightFilteredHistory, searchQuery, gyms, templates]);
 
   const activeMonthLabel = useMemo(
     () => formatMonthLabel(selectedMonthStart),
@@ -390,12 +577,16 @@ export default function HistoryScreen({ navigation }: any) {
   const hasActiveFilters =
     searchQuery.trim().length > 0 ||
     selectedGymId !== "ALL" ||
+    selectedTemplateId !== "ALL" ||
+    highlightFilter !== "ALL" ||
     historyFilter !== "ALL";
 
   const clearHistoryFilters = useCallback(() => {
     Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
     setSearchQuery("");
     setSelectedGymId("ALL");
+    setSelectedTemplateId("ALL");
+    setHighlightFilter("ALL");
     setHistoryFilter("ALL");
     setSelectedMonthStart(getMonthStart(Date.now()));
   }, []);
@@ -420,18 +611,29 @@ export default function HistoryScreen({ navigation }: any) {
       .sort((a, b) => a.name.localeCompare(b.name));
   }, [gyms, history]);
 
-  const workoutPRMap = useMemo(() => {
-    return buildHistoricalWorkoutPRMap(history, { isKg: isGlobalKg });
-  }, [history, isGlobalKg]);
+  const templateOptions = useMemo(() => {
+    const map = new Map<string, string>();
+    templates.forEach((template) => {
+      if (template?.id) {
+        map.set(String(template.id), template.name || "Unnamed Template");
+      }
+    });
 
-  const getWorkoutPRs = useCallback(
-    (workout: any) => {
-      const saved = Array.isArray(workout?.prs) ? workout.prs : [];
-      if (saved.length > 0) return saved;
-      return workoutPRMap[String(workout?.id || "")] || [];
-    },
-    [workoutPRMap],
-  );
+    history.forEach((workout) => {
+      if (workout?.templateId) {
+        map.set(
+          String(workout.templateId),
+          map.get(String(workout.templateId)) ||
+            workout.workoutName ||
+            "Unknown Template",
+        );
+      }
+    });
+
+    return Array.from(map.entries())
+      .map(([id, name]) => ({ id, name }))
+      .sort((a, b) => a.name.localeCompare(b.name));
+  }, [history, templates]);
 
   const sections = useMemo<WorkoutSection[]>(() => {
     const grouped = new Map<string, any[]>();
@@ -479,28 +681,178 @@ export default function HistoryScreen({ navigation }: any) {
     pendingScrollToTopRef.current = false;
   }, [sections, loading, scrollToTop]);
 
-  const deleteWorkout = async (workout: any) => {
+  const deleteWorkout = (workout: any) => {
     if (!uid) return;
+    if (isSavingEndTime) return;
 
     Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Heavy);
-
     const updatedHistory = history.filter(
       (item) => item && item.id && String(item.id) !== String(workout?.id),
     );
 
     setHistory(updatedHistory);
-    await AsyncStorage.setItem(
-      `@workout_history_${uid}`,
-      JSON.stringify(updatedHistory),
-    );
+    setDeletedWorkoutForUndo(workout);
+
+    Promise.resolve()
+      .then(async () => {
+        await saveLocalWorkoutHistory(updatedHistory, uid);
+        await markWorkoutDeletedLocally(String(workout?.id || ""), uid);
+
+        deleteWorkoutFromCloud(String(workout?.id || ""), uid).catch((error) => {
+          console.error("Failed to delete workout from cloud:", error);
+        });
+      })
+      .catch((error) => {
+        console.log("Workout delete persistence delayed:", error);
+      });
+  };
+
+  const closeWorkoutActions = useCallback(() => {
+    actionMenuOpenRef.current = false;
+    setActionWorkout(null);
+  }, []);
+
+  const openWorkoutActions = (workout: any) => {
+    if (isSavingEndTime || actionMenuOpenRef.current || !workout) return;
+
+    Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
+    actionMenuOpenRef.current = true;
+    setActionWorkout(workout);
+  };
+
+  const editActionWorkout = useCallback(() => {
+    if (!actionWorkout) return;
+    const workoutToEdit = actionWorkout;
+    closeWorkoutActions();
+    navigation.navigate("Workout", { editData: workoutToEdit });
+  }, [actionWorkout, closeWorkoutActions, navigation]);
+
+  const deleteActionWorkout = useCallback(() => {
+    if (!actionWorkout) return;
+    const workoutToDelete = actionWorkout;
+    closeWorkoutActions();
+    deleteWorkout(workoutToDelete);
+  }, [actionWorkout, closeWorkoutActions, deleteWorkout]);
+
+  const dismissDeletedWorkoutToast = useCallback(() => {
+    setDeletedWorkoutForUndo(null);
+  }, []);
+
+  const undoDeletedWorkout = useCallback(async () => {
+    if (!uid || !deletedWorkoutForUndo) return;
+    if (isSavingEndTime) return;
+
+    Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
+    const restoredWorkout = deletedWorkoutForUndo;
+    const restoredHistory = [
+      ...history.filter(
+        (item) => String(item?.id || "") !== String(restoredWorkout?.id || ""),
+      ),
+      restoredWorkout,
+    ].sort((a, b) => getWorkoutTimestamp(b) - getWorkoutTimestamp(a));
+
+    setHistory(restoredHistory);
+    setDeletedWorkoutForUndo(null);
+
+    Promise.resolve()
+      .then(async () => {
+        await saveLocalWorkoutHistory(restoredHistory, uid);
+        await clearWorkoutDeletedLocally(String(restoredWorkout?.id || ""), uid);
+        pushWorkoutToCloud(restoredWorkout).catch((error) => {
+          console.log("Workout restore cloud sync delayed:", error);
+        });
+      })
+      .catch((error) => {
+        console.log("Workout restore persistence delayed:", error);
+      });
+  }, [deletedWorkoutForUndo, history, isSavingEndTime, uid]);
+
+  const openEditEndTime = useCallback((workout: any) => {
+    Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
+    const fallbackEnd = Number(workout?.finishedAt || workout?.completedAt || workout?.timestamp || workout?.id || Date.now());
+    const safeEnd = Number.isFinite(fallbackEnd) && fallbackEnd > 0 ? fallbackEnd : Date.now();
+    setEditingEndWorkout(workout);
+    setEndDateInput(formatInputDate(safeEnd));
+    setEndTimeInput(formatInputTime(safeEnd));
+  }, []);
+
+  const closeEditEndTime = useCallback(() => {
+    if (isSavingEndTime) return;
+    setEditingEndWorkout(null);
+    setEndDateInput("");
+    setEndTimeInput("");
+  }, [isSavingEndTime]);
+
+  const saveEditedEndTime = useCallback(async () => {
+    if (!uid || !editingEndWorkout || isSavingEndTime) return;
+
+    const finishedAt = parseLocalDateTimeInput(endDateInput, endTimeInput);
+    if (!finishedAt) {
+      Alert.alert("Invalid End Time", "Use the format YYYY-MM-DD and HH:mm.");
+      return;
+    }
+    if (finishedAt > Date.now()) {
+      Alert.alert("Invalid End Time", "End time cannot be in the future.");
+      return;
+    }
+
+    const startedAt = getWorkoutTimestamp(editingEndWorkout);
+    if (startedAt && finishedAt < startedAt) {
+      Alert.alert("Invalid End Time", "End time cannot be before the workout start time.");
+      return;
+    }
+    const pausedMs = Math.max(0, Number(editingEndWorkout.totalPausedMs || 0));
+    if (startedAt && finishedAt - startedAt - pausedMs > MAX_WORKOUT_DURATION_MS) {
+      Alert.alert(
+        "Invalid End Time",
+        "Workout duration cannot be longer than 24 hours.",
+      );
+      return;
+    }
+
+    const durationSeconds = startedAt
+      ? Math.max(0, Math.round((finishedAt - startedAt - pausedMs) / 1000))
+      : parseDurationToSeconds(editingEndWorkout.duration);
+
+    const updatedWorkout = {
+      ...editingEndWorkout,
+      finishedAt,
+      completedAt: finishedAt,
+      timestamp: finishedAt,
+      duration: formatDuration(durationSeconds),
+      durationSeconds,
+      updatedAt: Date.now(),
+    };
+
+    const updatedHistory = history
+      .map((item) =>
+        String(item?.id) === String(editingEndWorkout.id) ? updatedWorkout : item,
+      )
+      .sort((a, b) => getWorkoutTimestamp(b) - getWorkoutTimestamp(a));
 
     try {
-      const workoutRef = doc(db, "users", uid, "workouts", String(workout?.id));
-      await deleteDoc(workoutRef);
+      setIsSavingEndTime(true);
+      setHistory(updatedHistory);
+      await saveLocalWorkoutHistory(updatedHistory, uid);
+      closeEditEndTime();
+      pushWorkoutToCloud(updatedWorkout).catch((error) => {
+        console.log("Workout end-time cloud sync delayed:", error);
+      });
     } catch (error) {
-      console.error("Failed to delete workout from cloud:", error);
+      console.error("Failed to update workout end time:", error);
+      Alert.alert("Could Not Save", "The end time could not be updated. Please try again.");
+    } finally {
+      setIsSavingEndTime(false);
     }
-  };
+  }, [
+    closeEditEndTime,
+    editingEndWorkout,
+    endDateInput,
+    endTimeInput,
+    history,
+    isSavingEndTime,
+    uid,
+  ]);
 
   const renderHistoryFilters = () => (
     <View style={localStyles.historyFilterRow}>
@@ -568,6 +920,36 @@ export default function HistoryScreen({ navigation }: any) {
       </View>
     );
   };
+
+  const renderHighlightFilters = () => (
+    <View style={localStyles.highlightFilterRow}>
+      {HIGHLIGHT_FILTERS.map((filter) => {
+        const active = highlightFilter === filter.value;
+        return (
+          <TouchableOpacity
+            key={filter.value}
+            style={[
+              localStyles.historyFilterChip,
+              active && localStyles.historyFilterChipActive,
+            ]}
+            onPress={() => {
+              Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
+              setHighlightFilter(filter.value);
+            }}
+          >
+            <Text
+              style={[
+                localStyles.historyFilterChipText,
+                active && localStyles.historyFilterChipTextActive,
+              ]}
+            >
+              {filter.label}
+            </Text>
+          </TouchableOpacity>
+        );
+      })}
+    </View>
+  );
 
   const renderGymFilters = () => (
     <ScrollView
@@ -646,6 +1028,107 @@ export default function HistoryScreen({ navigation }: any) {
     </ScrollView>
   );
 
+  const renderTemplateFilters = () => {
+    const showTemplateFilters =
+      templateOptions.length > 0 ||
+      history.some((workout) => workout?.templateId);
+    if (!showTemplateFilters) return null;
+
+    return (
+      <>
+        <View style={localStyles.filterHeaderRow}>
+          <Text style={localStyles.filterTitle}>Template</Text>
+          <Text style={localStyles.resultCount} numberOfLines={1}>
+            {selectedTemplateId === "ALL"
+              ? "All templates"
+              : selectedTemplateId === "NONE"
+                ? "No template"
+                : templateOptions.find(
+                    (template) => template.id === selectedTemplateId,
+                  )?.name || "Selected template"}
+          </Text>
+        </View>
+
+        <ScrollView
+          horizontal
+          showsHorizontalScrollIndicator={false}
+          contentContainerStyle={localStyles.gymChipContent}
+        >
+          <TouchableOpacity
+            style={[
+              localStyles.filterChip,
+              selectedTemplateId === "ALL" && localStyles.activeFilterChip,
+            ]}
+            onPress={() => {
+              Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
+              setSelectedTemplateId("ALL");
+            }}
+          >
+            <Text
+              style={[
+                localStyles.filterChipText,
+                selectedTemplateId === "ALL" &&
+                  localStyles.activeFilterChipText,
+              ]}
+            >
+              All Templates
+            </Text>
+          </TouchableOpacity>
+
+          {templateOptions.map((template) => {
+            const active = selectedTemplateId === template.id;
+            return (
+              <TouchableOpacity
+                key={template.id}
+                style={[
+                  localStyles.filterChip,
+                  active && localStyles.activeFilterChip,
+                ]}
+                onPress={() => {
+                  Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
+                  setSelectedTemplateId(template.id);
+                }}
+              >
+                <Text
+                  style={[
+                    localStyles.filterChipText,
+                    active && localStyles.activeFilterChipText,
+                  ]}
+                  numberOfLines={1}
+                >
+                  {template.name}
+                </Text>
+              </TouchableOpacity>
+            );
+          })}
+
+          {history.some((workout) => !workout?.templateId) && (
+            <TouchableOpacity
+              style={[
+                localStyles.filterChip,
+                selectedTemplateId === "NONE" && localStyles.activeFilterChip,
+              ]}
+              onPress={() => {
+                Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
+                setSelectedTemplateId("NONE");
+              }}
+            >
+              <Text
+                style={[
+                  localStyles.filterChipText,
+                  selectedTemplateId === "NONE" &&
+                    localStyles.activeFilterChipText,
+                ]}
+              >
+                No Template
+              </Text>
+            </TouchableOpacity>
+          )}
+        </ScrollView>
+      </>
+    );
+  };
+
   const renderProgressEntryCard = () => (
     <TouchableOpacity
       style={localStyles.progressEntryCard}
@@ -707,6 +1190,7 @@ export default function HistoryScreen({ navigation }: any) {
 
       {renderHistoryFilters()}
       {renderMonthSelector()}
+      {renderHighlightFilters()}
 
       <View style={localStyles.filterHeaderRow}>
         <Text style={localStyles.filterTitle}>Gym</Text>
@@ -721,6 +1205,7 @@ export default function HistoryScreen({ navigation }: any) {
       </View>
 
       {renderGymFilters()}
+      {renderTemplateFilters()}
     </View>
   );
 
@@ -734,56 +1219,75 @@ export default function HistoryScreen({ navigation }: any) {
       item.gymName || gyms.find((gym) => gym.id === item.gymId)?.name || null;
     const workoutPRs = getWorkoutPRs(item);
     const workoutPRExerciseCount = getUniquePRExerciseCount(workoutPRs);
+    const hasFooterBadges = workoutPRExerciseCount > 0 || item.prType || hasRemark(item);
 
     return (
       <TouchableOpacity
         style={localStyles.card}
         activeOpacity={0.85}
         onPress={() => navigation.navigate("Workout", { editData: item })}
-        onLongPress={() => {
-          Alert.alert("Delete Workout", "Remove this session permanently?", [
-            { text: "Cancel", style: "cancel" },
-            {
-              text: "Delete",
-              style: "destructive",
-              onPress: () => deleteWorkout(item),
-            },
-          ]);
-        }}
+        onLongPress={() => openWorkoutActions(item)}
       >
         <View style={localStyles.cardTopRow}>
-          <View style={{ flex: 1 }}>
-            <Text style={localStyles.cardTitle} numberOfLines={1}>
+          <View style={localStyles.cardTitleBlock}>
+            <Text style={localStyles.cardTitle} numberOfLines={2}>
               {item.workoutName || "Unnamed Workout"}
             </Text>
             <Text style={localStyles.cardMeta} numberOfLines={1}>
-              {[
-                gymName,
-                durationText,
-                `${totalExercises} ${totalExercises === 1 ? "exercise" : "exercises"}`,
-                `${completedSets} ${completedSets === 1 ? "set" : "sets"}`,
-              ]
-                .filter(Boolean)
-                .join(" • ")}
+              {[gymName || "No gym", formatWorkoutMetaDate(item)].filter(Boolean).join(" • ")}
             </Text>
           </View>
 
-          <View style={localStyles.cardAction}>
+          <TouchableOpacity
+            style={localStyles.cardAction}
+            activeOpacity={0.72}
+            onPress={(event) => {
+              event.stopPropagation();
+              openWorkoutActions(item);
+            }}
+          >
             <Ionicons
-              name="chevron-forward"
+              name="ellipsis-horizontal"
               size={18}
               color={Colors.textMuted}
             />
+          </TouchableOpacity>
+        </View>
+
+        <View style={localStyles.sessionInfoBlock}>
+          <View style={localStyles.sessionInfoItem}>
+            <Text style={localStyles.sessionInfoLabel}>Duration</Text>
+            <Text style={localStyles.sessionInfoValue} numberOfLines={1}>
+              {durationText}
+            </Text>
           </View>
+
+          <View style={localStyles.sessionInfoDivider} />
+
+          <TouchableOpacity
+            style={localStyles.endTimeInlineRow}
+            activeOpacity={0.86}
+            onPress={() => openEditEndTime(item)}
+          >
+            <View style={localStyles.endTimeInlineCopy}>
+              <Text style={localStyles.sessionInfoLabel}>Ended</Text>
+              <Text style={localStyles.sessionInfoValue} numberOfLines={1}>
+                {formatEndTimeLabel(getWorkoutEndTimestamp(item))}
+              </Text>
+            </View>
+            <View style={localStyles.endTimeEditPill}>
+              <Text style={localStyles.endTimeEditText}>Edit</Text>
+            </View>
+          </TouchableOpacity>
         </View>
 
         <View style={localStyles.metricRow}>
           <View style={localStyles.metricItem}>
-            <Text style={localStyles.metricValue}>
+            <Text style={localStyles.metricValue} numberOfLines={1}>
               {formatCompactNumber(convertedVolume)}
             </Text>
             <Text style={localStyles.metricLabel}>
-              {isGlobalKg ? "kg" : "lbs"}
+              {isGlobalKg ? "kg volume" : "lbs volume"}
             </Text>
           </View>
           <View style={localStyles.metricDivider} />
@@ -793,8 +1297,8 @@ export default function HistoryScreen({ navigation }: any) {
           </View>
           <View style={localStyles.metricDivider} />
           <View style={localStyles.metricItem}>
-            <Text style={localStyles.metricValue}>{durationText}</Text>
-            <Text style={localStyles.metricLabel}>Time</Text>
+            <Text style={localStyles.metricValue}>{totalExercises}</Text>
+            <Text style={localStyles.metricLabel}>Exercises</Text>
           </View>
         </View>
 
@@ -822,50 +1326,41 @@ export default function HistoryScreen({ navigation }: any) {
           </View>
         )}
 
-        <View style={localStyles.cardFooter}>
-          <View style={localStyles.footerBadge}>
-            <Ionicons
-              name="calendar-outline"
-              size={12}
-              color={Colors.textMuted}
-            />
-            <Text style={localStyles.footerBadgeText}>
-              {formatWorkoutDate(item)}
-            </Text>
+        {hasFooterBadges && (
+          <View style={localStyles.cardFooter}>
+            {(workoutPRExerciseCount > 0 || item.prType) && (
+              <View style={localStyles.footerBadge}>
+                <Ionicons
+                  name="barbell-outline"
+                  size={12}
+                  color={Colors.accent}
+                />
+                <Text
+                  style={[localStyles.footerBadgeText, { color: Colors.accent }]}
+                >
+                  {workoutPRExerciseCount > 0
+                    ? `${workoutPRExerciseCount} PR${workoutPRExerciseCount === 1 ? "" : "s"}`
+                    : item.prType}
+                </Text>
+              </View>
+            )}
+
+            {hasRemark(item) && (
+              <View style={localStyles.footerBadge}>
+                <Ionicons
+                  name="chatbubble-ellipses-outline"
+                  size={12}
+                  color={Colors.accent}
+                />
+                <Text
+                  style={[localStyles.footerBadgeText, { color: Colors.accent }]}
+                >
+                  Notes
+                </Text>
+              </View>
+            )}
           </View>
-
-          {(workoutPRExerciseCount > 0 || item.prType) && (
-            <View style={localStyles.footerBadge}>
-              <Ionicons
-                name="barbell-outline"
-                size={12}
-                color={Colors.accent}
-              />
-              <Text
-                style={[localStyles.footerBadgeText, { color: Colors.accent }]}
-              >
-                {workoutPRExerciseCount > 0
-                  ? `${workoutPRExerciseCount} PR${workoutPRExerciseCount === 1 ? "" : "s"}`
-                  : item.prType}
-              </Text>
-            </View>
-          )}
-
-          {hasRemark(item) && (
-            <View style={localStyles.footerBadge}>
-              <Ionicons
-                name="chatbubble-ellipses-outline"
-                size={12}
-                color={Colors.accent}
-              />
-              <Text
-                style={[localStyles.footerBadgeText, { color: Colors.accent }]}
-              >
-                Notes
-              </Text>
-            </View>
-          )}
-        </View>
+        )}
       </TouchableOpacity>
     );
   };
@@ -892,7 +1387,10 @@ export default function HistoryScreen({ navigation }: any) {
 
     if (
       searchQuery.trim() &&
-      (selectedGymId !== "ALL" || historyFilter !== "ALL")
+      (selectedGymId !== "ALL" ||
+        selectedTemplateId !== "ALL" ||
+        highlightFilter !== "ALL" ||
+        historyFilter !== "ALL")
     ) {
       return {
         icon: "search-outline" as keyof typeof Ionicons.glyphMap,
@@ -911,6 +1409,24 @@ export default function HistoryScreen({ navigation }: any) {
       };
     }
 
+    if (highlightFilter === "PRS") {
+      return {
+        icon: "barbell-outline" as keyof typeof Ionicons.glyphMap,
+        title: "No PR workouts found",
+        subtitle: "Try clearing filters or viewing a wider date range.",
+        showClear: true,
+      };
+    }
+
+    if (highlightFilter === "NOTES") {
+      return {
+        icon: "chatbubble-ellipses-outline" as keyof typeof Ionicons.glyphMap,
+        title: "No noted workouts found",
+        subtitle: "Try clearing filters or viewing another date range.",
+        showClear: true,
+      };
+    }
+
     if (selectedGymId !== "ALL") {
       return {
         icon: "location-outline" as keyof typeof Ionicons.glyphMap,
@@ -919,6 +1435,18 @@ export default function HistoryScreen({ navigation }: any) {
             ? "No workouts without a gym"
             : "No workouts at this gym",
         subtitle: "Try selecting another gym or clearing the filter.",
+        showClear: true,
+      };
+    }
+
+    if (selectedTemplateId !== "ALL") {
+      return {
+        icon: "albums-outline" as keyof typeof Ionicons.glyphMap,
+        title:
+          selectedTemplateId === "NONE"
+            ? "No freestyle workouts found"
+            : "No workouts for this template",
+        subtitle: "Try another template or clear the filter.",
         showClear: true,
       };
     }
@@ -1002,6 +1530,171 @@ export default function HistoryScreen({ navigation }: any) {
             )}
           </View>
         }
+      />
+
+      <Modal
+        visible={!!actionWorkout}
+        transparent
+        animationType="fade"
+        onRequestClose={closeWorkoutActions}
+      >
+        <TouchableOpacity
+          style={localStyles.modalOverlay}
+          activeOpacity={1}
+          onPress={closeWorkoutActions}
+        >
+          <TouchableOpacity
+            activeOpacity={1}
+            style={localStyles.actionMenuCard}
+            onPress={(event) => event.stopPropagation()}
+          >
+            <Text style={localStyles.actionMenuTitle} numberOfLines={2}>
+              {actionWorkout?.workoutName || "Workout"}
+            </Text>
+            <Text style={localStyles.actionMenuSubtitle}>
+              Choose what you want to do with this session.
+            </Text>
+
+            <TouchableOpacity
+              style={localStyles.actionMenuRow}
+              activeOpacity={0.86}
+              onPress={editActionWorkout}
+            >
+              <View style={localStyles.actionMenuIconCircle}>
+                <Ionicons name="create-outline" size={20} color={Colors.accent} />
+              </View>
+              <View style={localStyles.actionMenuTextBlock}>
+                <Text style={localStyles.actionMenuRowTitle}>Edit Session</Text>
+                <Text style={localStyles.actionMenuRowSubtitle}>
+                  Change sets, notes, duration, or end time.
+                </Text>
+              </View>
+              <Ionicons name="chevron-forward" size={20} color={Colors.textMuted} />
+            </TouchableOpacity>
+
+            <TouchableOpacity
+              style={localStyles.actionMenuRow}
+              activeOpacity={0.86}
+              onPress={deleteActionWorkout}
+            >
+              <View
+                style={[
+                  localStyles.actionMenuIconCircle,
+                  localStyles.actionMenuDeleteIcon,
+                ]}
+              >
+                <Ionicons name="trash-outline" size={20} color={Colors.danger} />
+              </View>
+              <View style={localStyles.actionMenuTextBlock}>
+                <Text
+                  style={[
+                    localStyles.actionMenuRowTitle,
+                    localStyles.actionMenuDeleteText,
+                  ]}
+                >
+                  Delete
+                </Text>
+                <Text style={localStyles.actionMenuRowSubtitle}>
+                  Remove this workout from history.
+                </Text>
+              </View>
+              <Ionicons name="chevron-forward" size={20} color={Colors.textMuted} />
+            </TouchableOpacity>
+
+            <TouchableOpacity
+              style={localStyles.actionMenuCancelButton}
+              activeOpacity={0.84}
+              onPress={closeWorkoutActions}
+            >
+              <Text style={localStyles.actionMenuCancelText}>Cancel</Text>
+            </TouchableOpacity>
+          </TouchableOpacity>
+        </TouchableOpacity>
+      </Modal>
+
+      <Modal visible={!!editingEndWorkout} transparent animationType="fade">
+        <TouchableOpacity
+          style={localStyles.modalOverlay}
+          activeOpacity={1}
+          onPress={closeEditEndTime}
+        >
+          <TouchableOpacity
+            activeOpacity={1}
+            style={localStyles.editEndModal}
+            onPress={(event) => event.stopPropagation()}
+          >
+            <Text style={localStyles.editEndTitle}>Edit End Time</Text>
+            <Text style={localStyles.editEndSubtitle}>
+              Start time stays locked. Change only when the workout actually ended.
+            </Text>
+
+            {editingEndWorkout && (
+              <View style={localStyles.editEndInfoBox}>
+                <Text style={localStyles.editEndInfoLabel}>Started</Text>
+                <Text style={localStyles.editEndInfoValue}>
+                  {formatEndTimeLabel(getWorkoutTimestamp(editingEndWorkout))}
+                </Text>
+              </View>
+            )}
+
+            <Text style={localStyles.inputLabel}>End date</Text>
+            <TextInput
+              value={endDateInput}
+              onChangeText={setEndDateInput}
+              placeholder="YYYY-MM-DD"
+              placeholderTextColor={Colors.textMuted}
+              style={localStyles.editInput}
+              autoCapitalize="none"
+              keyboardType="numbers-and-punctuation"
+            />
+
+            <Text style={[localStyles.inputLabel, { marginTop: 14 }]}>End time</Text>
+            <TextInput
+              value={endTimeInput}
+              onChangeText={setEndTimeInput}
+              placeholder="HH:mm"
+              placeholderTextColor={Colors.textMuted}
+              style={localStyles.editInput}
+              autoCapitalize="none"
+              keyboardType="numbers-and-punctuation"
+            />
+
+            <TouchableOpacity
+              style={[
+                localStyles.saveEndButton,
+                isSavingEndTime && { opacity: 0.7 },
+              ]}
+              activeOpacity={0.86}
+              disabled={isSavingEndTime}
+              onPress={saveEditedEndTime}
+            >
+              <Text style={localStyles.saveEndButtonText}>
+                {isSavingEndTime ? "Saving..." : "Save End Time"}
+              </Text>
+            </TouchableOpacity>
+
+            <TouchableOpacity
+              style={localStyles.closeEndButton}
+              activeOpacity={0.84}
+              onPress={closeEditEndTime}
+            >
+              <Text style={localStyles.closeEndButtonText}>Close</Text>
+            </TouchableOpacity>
+          </TouchableOpacity>
+        </TouchableOpacity>
+      </Modal>
+
+      <UndoToast
+        visible={!!deletedWorkoutForUndo}
+        message="Workout deleted"
+        actionLabel="Undo"
+        onAction={undoDeletedWorkout}
+        onDismiss={dismissDeletedWorkoutToast}
+      />
+
+      <BlockingOverlay
+        visible={isHistoryBlocking}
+        message="Saving workout..."
       />
     </View>
   );
@@ -1111,6 +1804,15 @@ const localStyles = StyleSheet.create({
     borderRadius: 14,
     padding: 4,
     marginBottom: 14,
+  },
+  highlightFilterRow: {
+    flexDirection: "row",
+    backgroundColor: Colors.card,
+    borderRadius: 14,
+    padding: 4,
+    marginBottom: 14,
+    borderWidth: 1,
+    borderColor: Colors.border,
   },
   historyFilterChip: {
     flex: 1,
@@ -1223,7 +1925,7 @@ const localStyles = StyleSheet.create({
   },
   card: {
     backgroundColor: Colors.card,
-    borderRadius: 20,
+    borderRadius: 22,
     padding: 16,
     marginBottom: 12,
     borderWidth: 1,
@@ -1231,23 +1933,75 @@ const localStyles = StyleSheet.create({
   },
   cardTopRow: {
     flexDirection: "row",
-    alignItems: "center",
+    alignItems: "flex-start",
     marginBottom: 14,
+  },
+  cardTitleBlock: {
+    flex: 1,
+    minWidth: 0,
+    paddingRight: 8,
   },
   cardTitle: {
     color: Colors.text,
-    fontSize: 19,
+    fontSize: 20,
     fontWeight: "900",
-    marginBottom: 4,
+    letterSpacing: -0.35,
+    marginBottom: 5,
   },
   cardMeta: {
     color: Colors.textMuted,
     fontSize: 12,
-    fontWeight: "700",
+    fontWeight: "800",
   },
   cardAction: {
-    width: 30,
-    alignItems: "flex-end",
+    width: 34,
+    height: 34,
+    borderRadius: 17,
+    alignItems: "center",
+    justifyContent: "center",
+    backgroundColor: Colors.cardAlt,
+  },
+  sessionInfoBlock: {
+    flexDirection: "row",
+    alignItems: "stretch",
+    backgroundColor: Colors.cardAlt,
+    borderRadius: 17,
+    padding: 12,
+    marginBottom: 12,
+    borderWidth: 1,
+    borderColor: Colors.border,
+  },
+  sessionInfoItem: {
+    width: 86,
+    justifyContent: "center",
+  },
+  sessionInfoDivider: {
+    width: 1,
+    backgroundColor: Colors.border,
+    marginHorizontal: 12,
+  },
+  sessionInfoLabel: {
+    color: Colors.textMuted,
+    fontSize: 10,
+    fontWeight: "900",
+    textTransform: "uppercase",
+    letterSpacing: 0.6,
+    marginBottom: 4,
+  },
+  sessionInfoValue: {
+    color: Colors.text,
+    fontSize: 13,
+    fontWeight: "900",
+  },
+  endTimeInlineRow: {
+    flex: 1,
+    minWidth: 0,
+    flexDirection: "row",
+    alignItems: "center",
+  },
+  endTimeInlineCopy: {
+    flex: 1,
+    minWidth: 0,
   },
   metricRow: {
     flexDirection: "row",
@@ -1270,16 +2024,72 @@ const localStyles = StyleSheet.create({
   },
   metricLabel: {
     color: Colors.textMuted,
-    fontSize: 10,
+    fontSize: 9,
     fontWeight: "900",
     textTransform: "uppercase",
+    letterSpacing: 0.35,
+    textAlign: "center",
   },
   metricDivider: {
     width: 1,
     height: 28,
     backgroundColor: Colors.border,
   },
+
+  endTimeEditRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    backgroundColor: Colors.cardAlt,
+    borderRadius: 16,
+    padding: 12,
+    marginTop: -4,
+    marginBottom: 14,
+    borderWidth: 1,
+    borderColor: Colors.border,
+  },
+  endTimeIcon: {
+    width: 34,
+    height: 34,
+    borderRadius: 12,
+    backgroundColor: Colors.elevated,
+    alignItems: "center",
+    justifyContent: "center",
+    marginRight: 10,
+  },
+  endTimeCopy: {
+    flex: 1,
+    minWidth: 0,
+  },
+  endTimeLabel: {
+    color: Colors.textMuted,
+    fontSize: 10,
+    fontWeight: "900",
+    textTransform: "uppercase",
+    letterSpacing: 0.6,
+    marginBottom: 3,
+  },
+  endTimeValue: {
+    color: Colors.text,
+    fontSize: 13,
+    fontWeight: "800",
+  },
+  endTimeEditPill: {
+    backgroundColor: Colors.surface,
+    borderRadius: 999,
+    paddingHorizontal: 12,
+    paddingVertical: 7,
+    marginLeft: 10,
+    borderWidth: 1,
+    borderColor: Colors.borderStrong,
+  },
+  endTimeEditText: {
+    color: Colors.text,
+    fontSize: 12,
+    fontWeight: "900",
+  },
+
   exercisePreviewBlock: {
+    paddingTop: 2,
     marginBottom: 12,
   },
   exerciseLine: {
@@ -1311,6 +2121,7 @@ const localStyles = StyleSheet.create({
     alignItems: "center",
     flexWrap: "wrap",
     gap: 8,
+    paddingTop: 2,
   },
   footerBadge: {
     flexDirection: "row",
@@ -1353,6 +2164,175 @@ const localStyles = StyleSheet.create({
     fontWeight: "600",
     lineHeight: 20,
     textAlign: "center",
+  },
+  modalOverlay: {
+    flex: 1,
+    backgroundColor: "rgba(0,0,0,0.72)",
+    justifyContent: "center",
+    paddingHorizontal: 20,
+  },
+  actionMenuCard: {
+    backgroundColor: Colors.card,
+    borderRadius: 24,
+    padding: 20,
+    borderWidth: 1,
+    borderColor: Colors.border,
+  },
+  actionMenuTitle: {
+    color: Colors.text,
+    fontSize: 22,
+    fontWeight: "900",
+    marginBottom: 6,
+  },
+  actionMenuSubtitle: {
+    color: Colors.textMuted,
+    fontSize: 13,
+    fontWeight: "700",
+    lineHeight: 19,
+    marginBottom: 12,
+  },
+  actionMenuRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    backgroundColor: Colors.surface,
+    borderRadius: 17,
+    paddingVertical: 14,
+    paddingHorizontal: 14,
+    borderWidth: 1,
+    borderColor: Colors.border,
+    marginTop: 10,
+  },
+  actionMenuIconCircle: {
+    width: 40,
+    height: 40,
+    borderRadius: 14,
+    alignItems: "center",
+    justifyContent: "center",
+    marginRight: 12,
+    backgroundColor: Colors.accentSoft,
+  },
+  actionMenuDeleteIcon: {
+    backgroundColor: Colors.dangerSoft,
+  },
+  actionMenuTextBlock: {
+    flex: 1,
+    minWidth: 0,
+  },
+  actionMenuRowTitle: {
+    color: Colors.text,
+    fontSize: 15,
+    fontWeight: "900",
+  },
+  actionMenuDeleteText: {
+    color: Colors.danger,
+  },
+  actionMenuRowSubtitle: {
+    color: Colors.textMuted,
+    fontSize: 12,
+    fontWeight: "700",
+    lineHeight: 17,
+    marginTop: 3,
+  },
+  actionMenuCancelButton: {
+    alignItems: "center",
+    justifyContent: "center",
+    backgroundColor: Colors.surface,
+    borderRadius: 999,
+    paddingVertical: 14,
+    borderWidth: 1,
+    borderColor: Colors.border,
+    marginTop: 14,
+  },
+  actionMenuCancelText: {
+    color: Colors.text,
+    fontSize: 14,
+    fontWeight: "900",
+  },
+  editEndModal: {
+    backgroundColor: Colors.card,
+    borderRadius: 24,
+    padding: 20,
+    borderWidth: 1,
+    borderColor: Colors.border,
+  },
+  editEndTitle: {
+    color: Colors.text,
+    fontSize: 22,
+    fontWeight: "900",
+    marginBottom: 6,
+  },
+  editEndSubtitle: {
+    color: Colors.textMuted,
+    fontSize: 13,
+    fontWeight: "700",
+    lineHeight: 19,
+    marginBottom: 16,
+  },
+  editEndInfoBox: {
+    backgroundColor: Colors.surface,
+    borderRadius: 16,
+    padding: 13,
+    marginBottom: 16,
+    borderWidth: 1,
+    borderColor: Colors.border,
+  },
+  editEndInfoLabel: {
+    color: Colors.textMuted,
+    fontSize: 11,
+    fontWeight: "900",
+    textTransform: "uppercase",
+    letterSpacing: 0.6,
+    marginBottom: 4,
+  },
+  editEndInfoValue: {
+    color: Colors.text,
+    fontSize: 14,
+    fontWeight: "800",
+  },
+  inputLabel: {
+    color: Colors.textMuted,
+    fontSize: 12,
+    fontWeight: "900",
+    marginBottom: 8,
+    textTransform: "uppercase",
+    letterSpacing: 0.5,
+  },
+  editInput: {
+    backgroundColor: Colors.surface,
+    borderColor: Colors.border,
+    borderWidth: 1,
+    borderRadius: 14,
+    color: Colors.text,
+    fontSize: 15,
+    fontWeight: "800",
+    paddingHorizontal: 14,
+    paddingVertical: 12,
+  },
+  saveEndButton: {
+    backgroundColor: Colors.accent,
+    borderRadius: 999,
+    alignItems: "center",
+    paddingVertical: 14,
+    marginTop: 18,
+  },
+  saveEndButtonText: {
+    color: Colors.background,
+    fontSize: 15,
+    fontWeight: "900",
+  },
+  closeEndButton: {
+    backgroundColor: Colors.surface,
+    borderRadius: 999,
+    alignItems: "center",
+    paddingVertical: 13,
+    marginTop: 10,
+    borderWidth: 1,
+    borderColor: Colors.border,
+  },
+  closeEndButtonText: {
+    color: Colors.text,
+    fontSize: 14,
+    fontWeight: "900",
   },
   clearFiltersButton: {
     marginTop: 18,

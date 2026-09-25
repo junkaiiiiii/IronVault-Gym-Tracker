@@ -1,10 +1,17 @@
 import React from "react";
-import { Modal, View, Text, TouchableOpacity, StyleSheet } from "react-native";
+import {
+  InteractionManager,
+  Modal,
+  View,
+  Text,
+  TouchableOpacity,
+  StyleSheet,
+} from "react-native";
 import { Colors, Radius, Spacing } from "../theme";
 
 interface AlertButton {
   text: string;
-  onPress?: () => void;
+  onPress?: () => unknown;
   style?: "default" | "cancel" | "destructive";
 }
 
@@ -26,6 +33,16 @@ export default function CustomAlert({
   // If there are 3 buttons (like the Leave Workout menu), stack them vertically.
   // If 1 or 2 buttons, put them side-by-side.
   const isStacked = buttons.length > 2;
+  const runAfterAlertCloses = (action?: () => unknown) => {
+    onClose();
+    if (!action) return;
+
+    setTimeout(() => {
+      InteractionManager.runAfterInteractions(() => {
+        action();
+      });
+    }, 120);
+  };
 
   return (
     <Modal visible={visible} transparent animationType="fade">
@@ -60,10 +77,7 @@ export default function CustomAlert({
                     },
                     isCancel && { backgroundColor: Colors.elevated },
                   ]}
-                  onPress={() => {
-                    if (btn.onPress) btn.onPress();
-                    onClose();
-                  }}
+                  onPress={() => runAfterAlertCloses(btn.onPress)}
                 >
                   <Text
                     numberOfLines={1}

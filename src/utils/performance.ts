@@ -1,3 +1,8 @@
+import {
+  cleanExerciseNameForAttachments,
+  getExerciseAttachmentForStorage,
+} from "./helpers";
+
 export type WorkoutPRType =
   | "BEST_WEIGHT"
   | "BEST_E1RM"
@@ -9,6 +14,7 @@ export type WorkoutPRRecord = {
   exerciseName: string;
   displayName: string;
   variant?: string | null;
+  attachment?: string | null;
   type: WorkoutPRType;
   label: string;
   weight: number;
@@ -89,14 +95,26 @@ const getVariant = (exercise: any) => {
   return String(variant);
 };
 
-const getExerciseKey = (exercise: any) =>
-  `${normalizeName(exercise?.name)}::${getVariant(exercise)}`;
+const getAttachment = (exercise: any) =>
+  getExerciseAttachmentForStorage(exercise) || "None";
 
-const formatDisplayName = (exercise: any) => {
-  const name = exercise?.name || "Exercise";
+export const getExercisePerformanceKey = (exercise: any) =>
+  `${normalizeName(cleanExerciseNameForAttachments(exercise))}::${getVariant(
+    exercise,
+  )}::${getAttachment(exercise)}`;
+
+export const formatExercisePerformanceName = (exercise: any) => {
+  const name = cleanExerciseNameForAttachments(exercise) || "Exercise";
   const variant = getVariant(exercise);
-  return !variant || variant === "Normal" ? name : `${name} · ${variant}`;
+  const attachment = getExerciseAttachmentForStorage(exercise);
+  const parts = [name];
+  if (variant && variant !== "Normal") parts.push(variant);
+  if (attachment) parts.push(attachment);
+  return parts.join(" · ");
 };
+
+const getExerciseKey = getExercisePerformanceKey;
+const formatDisplayName = formatExercisePerformanceName;
 
 const getCompletedWorkingSets = (exercise: any) => {
   const sets = Array.isArray(exercise?.sets) ? exercise.sets : [];
@@ -115,9 +133,10 @@ const makeSetRecord = (exercise: any, set: any, workout?: any) => {
   const setVolume = calculateSetVolume(set, !!exercise?.is_unilateral);
 
   return {
-    exerciseName: exercise.name,
+    exerciseName: cleanExerciseNameForAttachments(exercise),
     displayName: formatDisplayName(exercise),
     variant: getVariant(exercise),
+    attachment: getExerciseAttachmentForStorage(exercise) || null,
     weight,
     reps: reps.bestSide,
     repsLabel: reps.label,
@@ -203,6 +222,7 @@ const buildPR = ({
     exerciseName: record.exerciseName,
     displayName: record.displayName,
     variant: record.variant,
+    attachment: record.attachment || null,
     type,
     label,
     weight: record.weight,
@@ -242,7 +262,10 @@ export const detectWorkoutPRs = (
     const previousBestE1RM = maxBy(previous, (item) => item.estimated1RM);
     const previousBestVolumeSet = maxBy(previous, (item) => item.setVolume);
 
-    const bestWeightRecord = bestRecordBy(currentRecords, (item) => item.weight);
+    const bestWeightRecord = bestRecordBy(
+      currentRecords,
+      (item) => item.weight,
+    );
     const bestE1RMRecord = bestRecordBy(
       currentRecords,
       (item) => item.estimated1RM,
@@ -290,13 +313,21 @@ export const detectWorkoutPRs = (
     >();
 
     currentRecords
-      .filter((record) => CANONICAL_REP_PR_TARGETS.includes(record.reps))
-      .map((record) => {
+      .filter((record: any) => CANONICAL_REP_PR_TARGETS.includes(record.reps))
+      .map((record: any) => {
         const previousRepBest = bestWeightForRep(previous, record.reps);
         return { record, previousRepBest };
       })
-      .filter(({ record, previousRepBest }) => record.weight > previousRepBest)
-      .forEach((candidate) => {
+      .filter(
+        ({
+          record,
+          previousRepBest,
+        }: {
+          record: any;
+          previousRepBest: number;
+        }) => record.weight > previousRepBest,
+      )
+      .forEach((candidate: { record: any; previousRepBest: number }) => {
         const existing = repCandidatesByTarget.get(candidate.record.reps);
         if (!existing) {
           repCandidatesByTarget.set(candidate.record.reps, candidate);
@@ -346,7 +377,9 @@ const prDisplayPriority: Record<WorkoutPRType, number> = {
 };
 
 const getPRExerciseGroupKey = (record: WorkoutPRRecord) =>
-  `${normalizeName(record?.exerciseName)}::${record?.variant || "Normal"}`;
+  `${normalizeName(record?.exerciseName)}::${record?.variant || "Normal"}::${
+    record?.attachment || "None"
+  }`;
 
 const comparePRDisplayPriority = (a: WorkoutPRRecord, b: WorkoutPRRecord) => {
   const priorityDiff = prDisplayPriority[a.type] - prDisplayPriority[b.type];
@@ -395,7 +428,6 @@ export const getTopPRPerExercise = (
     : displayRecords;
 };
 
-
 export type WorkoutPRGroup = {
   key: string;
   exerciseName: string;
@@ -422,18 +454,18 @@ export const getGroupedWorkoutPRs = (
       const first = sortedRecords[0];
       return {
         key,
-        exerciseName: first?.exerciseName || 'Exercise',
-        displayName: first?.displayName || first?.exerciseName || 'Exercise',
+        exerciseName: first?.exerciseName || "Exercise",
+        displayName: first?.displayName || first?.exerciseName || "Exercise",
         records: sortedRecords,
       };
     })
     .sort((a, b) => a.exerciseName.localeCompare(b.exerciseName));
 
-  return typeof limit === 'number' ? groups.slice(0, limit) : groups;
+  return typeof limit === "number" ? groups.slice(0, limit) : groups;
 };
 
 export const formatPRSummaryLabel = (record: WorkoutPRRecord) =>
-  record.label.replace(/^New /, 'New ');
+  record.label.replace(/^New /, "New ");
 
 export const getUniquePRExerciseCount = (
   prs: WorkoutPRRecord[] = [],
@@ -445,19 +477,18 @@ export const getUniquePRExerciseCount = (
   return exerciseKeys.size;
 };
 
-export const getWorkoutPRDisplayCount = (
-  prs: WorkoutPRRecord[] = [],
-): number => getTopPRPerExercise(prs).length;
+export const getWorkoutPRDisplayCount = (prs: WorkoutPRRecord[] = []): number =>
+  getTopPRPerExercise(prs).length;
 
 export const formatPRValue = (record: WorkoutPRRecord) => {
   const unit = record.unit || "kg";
   if (record.type === "BEST_E1RM") {
-    return `${record.value.toFixed(1)} ${unit}`;
+    return `${record.value.toFixed(2)} ${unit}`;
   }
   if (record.type === "BEST_VOLUME_SET") {
     return `${Math.round(record.value)} ${unit} vol`;
   }
-  return `${Number.isInteger(record.weight) ? record.weight.toFixed(0) : record.weight.toFixed(1)} ${unit} × ${record.repsLabel}`;
+  return `${Number.isInteger(record.weight) ? record.weight.toFixed(0) : record.weight.toFixed(2)} ${unit} × ${record.repsLabel}`;
 };
 
 const getWorkoutSortTimestamp = (workout: any): number => {
@@ -493,7 +524,10 @@ export const buildHistoricalWorkoutPRMap = (
     // Prefer the current PR rules for historical display so older saved raw PR arrays
     // do not keep over-counting every set-level achievement. Fall back to saved PRs
     // only when this workout cannot be recomputed for some reason.
-    const prs = computedPrs.length > 0 || existingPrs.length === 0 ? computedPrs : existingPrs;
+    const prs =
+      computedPrs.length > 0 || existingPrs.length === 0
+        ? computedPrs
+        : existingPrs;
     prMap[String(workout.id)] = prs;
     previousWorkouts.push(workout);
   });

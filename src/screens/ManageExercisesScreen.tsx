@@ -21,28 +21,50 @@ import { Ionicons } from "@expo/vector-icons";
 import * as Haptics from "expo-haptics";
 import { auth } from "../config/firebaseConfig";
 import { styles } from "../constants/globalStyles";
-import { Colors, Spacing, Radius, Layout, Typography } from "../theme";
-import { ActionCard } from "../components/ActionCard";
+import { Colors, Radius } from "../theme";
 import { INITIAL_EXERCISES, MUSCLE_GROUPS } from "../constants/data";
 import {
   prepareSections,
   calculate1RM,
+  cleanExerciseNameForAttachments,
   fetchGitHubExercises,
   normalizeExerciseImageUrl,
   getExerciseVariationOptions,
-  formatExerciseDisplayName,
   isMachineBrandApplicable,
+  normalizeExerciseMuscleGroup,
+  getActiveBuiltInExercises,
+  filterAndRankExercisesBySearch,
+  getExerciseAttachmentForSave,
+  getExerciseAttachmentForStorage,
+  getExerciseAttachmentOptions,
+  NO_ATTACHMENT_OPTION_LABEL,
+  normalizeExerciseAttachment,
+  normalizeExerciseForAttachmentStorage,
+  shouldAllowNoAttachmentOption,
 } from "../utils/helpers";
 import {
+  clearConfigValuesDeletedLocally,
+  markConfigValuesDeletedLocally,
+  safeJsonParse,
+  pushWorkoutListToCloud,
   syncFavoriteExercisesToCloud,
   syncPersonalExercisesToCloud,
+  saveTemplatesLocallyAndToCloud,
+  markConfigItemsDeletedLocally,
 } from "../utils/firebaseSync";
 import CustomAlert from "../components/CustomAlert";
+import { LIMITS, cleanLimitedText, limitText } from "../constants/limits";
+import BlockingOverlay from "../components/BlockingOverlay";
+import { formatRpeValue, parseRpeValue } from "../utils/rpe";
+
+const NO_ATTACHMENT_FILTER = "__no_attachment__";
 
 export default function ManageExercisesScreen({ navigation }: any) {
   const [globalExercises, setGlobalExercises] = useState<any[]>([]);
   const [personalExercises, setPersonalExercises] = useState<any[]>([]);
-  const [favoriteExerciseNames, setFavoriteExerciseNames] = useState<string[]>([]);
+  const [favoriteExerciseNames, setFavoriteExerciseNames] = useState<string[]>(
+    [],
+  );
   const [libraryView, setLibraryView] = useState<
     "All" | "Favorites" | "Recent" | "Custom"
   >("All");
@@ -77,7 +99,6 @@ export default function ManageExercisesScreen({ navigation }: any) {
   const reminderRef = useRef<TextInput>(null);
   const sectionListRef = useRef<SectionList<any>>(null);
   const [isHighlighting, setIsHighlighting] = useState(false);
-  const [isScrolled, setIsScrolled] = useState(false);
 
   const [infoAlert, setInfoAlert] = useState({
     visible: false,
@@ -87,6 +108,8 @@ export default function ManageExercisesScreen({ navigation }: any) {
   const [deleteAlertVisible, setDeleteAlertVisible] = useState(false);
   const [imageErrors, setImageErrors] = useState<Record<string, boolean>>({});
   const [detailVariantFilter, setDetailVariantFilter] = useState<string>("All");
+  const [detailAttachmentFilter, setDetailAttachmentFilter] =
+    useState<string>("All");
   const [detailChartMode, setDetailChartMode] = useState<
     "Strength" | "Volume" | "Best Set"
   >("Strength");
@@ -97,8 +120,29 @@ export default function ManageExercisesScreen({ navigation }: any) {
     exercise: null as any,
     isOverride: false,
   });
+  const [exerciseBlockingMessage, setExerciseBlockingMessage] = useState("");
+  const exerciseBlockingRef = useRef(false);
 
   const uid = auth.currentUser?.uid;
+  const isExerciseBlocking = exerciseBlockingMessage.length > 0;
+
+  const runExerciseBlockingAction = async (
+    message: string,
+    action: () => Promise<void> | void,
+  ) => {
+    if (exerciseBlockingRef.current) return;
+
+    exerciseBlockingRef.current = true;
+    setExerciseBlockingMessage(message);
+    try {
+      await action();
+    } catch (error) {
+      console.error("Exercise action failed:", error);
+    } finally {
+      exerciseBlockingRef.current = false;
+      setExerciseBlockingMessage("");
+    }
+  };
 
   const getSavedGymId = (gym: any) => {
     return String(gym?.id ?? gym?.gymId ?? gym?.value ?? "");
@@ -112,9 +156,8 @@ export default function ManageExercisesScreen({ navigation }: any) {
     if (!uid) return;
     try {
       const savedGyms = await AsyncStorage.getItem(`@user_gyms_${uid}`);
-    const savedFavorites = await AsyncStorage.getItem(`@favorite_exercises_${uid}`);
       if (savedGyms) {
-        const parsed = JSON.parse(savedGyms);
+        const parsed = safeJsonParse(savedGyms, []);
         if (Array.isArray(parsed)) setGyms(parsed);
       } else {
         setGyms([]);
@@ -138,7 +181,180 @@ export default function ManageExercisesScreen({ navigation }: any) {
 
   const getExerciseKey = (exercise: any) => String(exercise?.name || "").trim();
 
-  const getExerciseMatchKey = (exercise: any) => normalizeExerciseName(exercise?.name);
+  const getExerciseMatchKey = (exercise: any) =>
+    normalizeExerciseName(exercise?.name);
+
+  const getExerciseIdentityKeys = (exercise: any) => {
+    const keys = new Set<string>();
+    const id = String(exercise?.id || "").trim();
+    const name = normalizeExerciseName(exercise?.name);
+    const rawImage = String(exercise?.image || "").trim();
+    const image = normalizeExerciseImageUrl(rawImage).toLowerCase();
+    if (id) keys.add(`id:${id}`);
+    if (name) keys.add(`name:${name}`);
+    if (image) keys.add(`image:${image}`);
+    return Array.from(keys);
+  };
+
+  const LEGACY_IMPORTED_CUSTOM_NAMES = new Set([
+    "cable hammer curls - rope attachment",
+    "calf raise",
+    "lying leg curls",
+    "lying leg curl",
+    "machine jm press",
+    "quad extension",
+    "single arm reverse pec deck",
+    "single arm rope hammer curl",
+    "squat",
+    "standing biceps cable curl",
+    "straight bar cable crunches",
+    "straight bar forearm curl",
+    "tricep overhead extension",
+    "tricep press machine",
+    "triceps overhead extension with rope",
+    "triceps pushdown",
+  ]);
+
+  const looksLikeBuiltInExercise = (exercise: any) => {
+    const id = String(exercise?.id || "")
+      .trim()
+      .toLowerCase();
+    const name = getExerciseMatchKey(exercise);
+    const image = normalizeExerciseImageUrl(
+      exercise?.image || "",
+    ).toLowerCase();
+
+    return (
+      LEGACY_IMPORTED_CUSTOM_NAMES.has(name) ||
+      /^ex-/.test(id) ||
+      id.startsWith("gh_") ||
+      image.includes("githubusercontent.com/junkaiiiiii/ironvault-exercises") ||
+      image.includes("/ironvault-exercises/main/images/") ||
+      image.includes("githubusercontent.com/yuhonas/free-exercise-db") ||
+      image.includes("/yuhonas/free-exercise-db/") ||
+      image.includes("free-exercise-db")
+    );
+  };
+
+  const createCustomExerciseRecord = (exercise: any) => {
+    const normalizedExercise = normalizeExerciseForAttachmentStorage(exercise);
+    const attachmentOptions = getExerciseAttachmentOptions(normalizedExercise);
+    return {
+      ...normalizedExercise,
+      name: cleanLimitedText(
+        normalizedExercise?.name || "Custom Exercise",
+        LIMITS.nameChars,
+      ),
+      reminder: limitText(
+        normalizedExercise?.reminder || "",
+        LIMITS.cueChars,
+      ),
+      muscle: normalizeExerciseMuscleGroup(normalizedExercise?.muscle),
+      attachment: getExerciseAttachmentForSave(normalizedExercise),
+      attachmentOptions:
+        attachmentOptions.length > 0 ? attachmentOptions : undefined,
+      supportsAttachments: attachmentOptions.length > 0 ? true : undefined,
+      id:
+        normalizedExercise?.id && !looksLikeBuiltInExercise(normalizedExercise)
+          ? normalizedExercise.id
+          : `custom_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+      is_custom: true,
+      source: "custom",
+      createdByUser: true,
+      createdAt: normalizedExercise?.createdAt || Date.now(),
+    };
+  };
+
+  const looksLikeAppCreatedCustomExercise = (exercise: any) => {
+    if (!exercise || exercise.is_custom !== true) return false;
+
+    const name = getExerciseMatchKey(exercise);
+    if (!name || LEGACY_IMPORTED_CUSTOM_NAMES.has(name)) return false;
+
+    const image = normalizeExerciseImageUrl(exercise?.image || "").trim();
+    const equipment = String(exercise?.equipment || "").trim();
+    const hasLegacyLibraryFields =
+      !!image ||
+      !!equipment ||
+      exercise?.instructions !== undefined ||
+      exercise?.description !== undefined ||
+      exercise?.level !== undefined ||
+      exercise?.force !== undefined ||
+      exercise?.mechanic !== undefined ||
+      exercise?.category !== undefined ||
+      exercise?.secondaryMuscles !== undefined;
+
+    if (hasLegacyLibraryFields) return false;
+
+    const id = String(exercise?.id || "")
+      .trim()
+      .toLowerCase();
+    const hasCustomIdentity =
+      id.startsWith("custom_") ||
+      id.startsWith("iv_custom_") ||
+      exercise.createdByUser === true;
+
+    const hasCustomFormFields =
+      exercise?.reminder !== undefined ||
+      exercise?.is_unilateral !== undefined ||
+      exercise?.supportsVariants !== undefined ||
+      exercise?.variationOptions !== undefined;
+
+    return hasCustomIdentity && hasCustomFormFields;
+  };
+
+  const cleanStoredCustomExercises = (
+    exercises: any[],
+    referenceExercises: any[] = globalExercises,
+  ) => {
+    const references = [...INITIAL_EXERCISES, ...referenceExercises];
+    const builtInIdentityKeys = new Set<string>();
+    const builtInNameKeys = new Set<string>();
+
+    references.forEach((exercise) => {
+      getExerciseIdentityKeys(exercise).forEach((identityKey) =>
+        builtInIdentityKeys.add(identityKey),
+      );
+      const nameKey = getExerciseMatchKey(exercise);
+      if (nameKey) builtInNameKeys.add(nameKey);
+    });
+
+    const customByName = new Map<string, any>();
+
+    (Array.isArray(exercises) ? exercises : []).forEach((exercise) => {
+      if (!exercise || exercise.is_custom !== true) return;
+
+      const nameKey = getExerciseMatchKey(exercise);
+      if (!nameKey) return;
+
+      const matchesBuiltInByIdentity = getExerciseIdentityKeys(exercise).some(
+        (identityKey) => builtInIdentityKeys.has(identityKey),
+      );
+      const matchesBuiltInByName = builtInNameKeys.has(nameKey);
+      const matchesBuiltInByShape = looksLikeBuiltInExercise(exercise);
+      const appCreatedCustom = looksLikeAppCreatedCustomExercise(exercise);
+
+      if (
+        matchesBuiltInByIdentity ||
+        matchesBuiltInByName ||
+        matchesBuiltInByShape ||
+        !appCreatedCustom
+      ) {
+        return;
+      }
+
+      customByName.set(nameKey, {
+        ...exercise,
+        is_custom: true,
+        source: "custom",
+        createdByUser: true,
+      });
+    });
+
+    return Array.from(customByName.values()).sort((a, b) =>
+      String(a.name || "").localeCompare(String(b.name || "")),
+    );
+  };
 
   const getFavoriteMatchKey = (value: any) => normalizeExerciseName(value);
 
@@ -166,12 +382,111 @@ export default function ManageExercisesScreen({ navigation }: any) {
   const saveFavoriteExerciseNames = async (nextFavorites: string[]) => {
     if (!uid) return;
     const cleaned = cleanFavoriteExerciseNames(nextFavorites);
+    const nextKeys = new Set(cleaned.map(getFavoriteMatchKey));
+    const currentKeys = new Set(favoriteExerciseNames.map(getFavoriteMatchKey));
+    const removedFavorites = favoriteExerciseNames.filter(
+      (name) => !nextKeys.has(getFavoriteMatchKey(name)),
+    );
+    const restoredFavorites = cleaned.filter(
+      (name) => !currentKeys.has(getFavoriteMatchKey(name)),
+    );
+
     setFavoriteExerciseNames(cleaned);
+    if (removedFavorites.length > 0) {
+      await markConfigValuesDeletedLocally(
+        "favorite_exercises",
+        removedFavorites,
+        uid,
+      );
+    }
+    if (restoredFavorites.length > 0) {
+      await clearConfigValuesDeletedLocally(
+        "favorite_exercises",
+        restoredFavorites,
+        uid,
+      );
+    }
     await AsyncStorage.setItem(
       `@favorite_exercises_${uid}`,
       JSON.stringify(cleaned),
     );
-    await syncFavoriteExercisesToCloud(cleaned);
+    syncFavoriteExercisesToCloud(cleaned).catch((error) =>
+      console.log("Favorite exercise cloud sync delayed:", error),
+    );
+  };
+
+  const transferFavoriteExerciseName = async (
+    oldName: string,
+    newName: string,
+  ) => {
+    const oldKey = getFavoriteMatchKey(oldName);
+    const nextDisplayName = String(newName || "").trim();
+    if (!oldKey || !nextDisplayName) return;
+
+    const wasFavorite = favoriteExerciseNames.some(
+      (name) => getFavoriteMatchKey(name) === oldKey,
+    );
+    if (!wasFavorite) return;
+
+    await saveFavoriteExerciseNames([
+      ...favoriteExerciseNames.filter(
+        (name) => getFavoriteMatchKey(name) !== oldKey,
+      ),
+      nextDisplayName,
+    ]);
+  };
+
+  const deleteCustomExercise = (exercise: any) => {
+    if (!exercise) {
+      setDeleteAlertVisible(false);
+      setIsMenuVisible(false);
+      setMenuExercise(null);
+      return;
+    }
+
+    const exerciseKey = getExerciseMatchKey(exercise);
+    if (!exerciseKey) {
+      setDeleteAlertVisible(false);
+      setIsMenuVisible(false);
+      setMenuExercise(null);
+      return;
+    }
+
+    const nextPersonalExercises = cleanStoredCustomExercises(
+      personalExercises.filter(
+        (item) => getExerciseMatchKey(item) !== exerciseKey,
+      ),
+    );
+    const nextFavoriteExercises = cleanFavoriteExerciseNames(
+      favoriteExerciseNames.filter(
+        (name) => getFavoriteMatchKey(name) !== exerciseKey,
+      ),
+    );
+
+    Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Heavy);
+    setDeleteAlertVisible(false);
+    setIsMenuVisible(false);
+    setIsDetailVisible(false);
+    setSelectedEx(null);
+    setMenuExercise(null);
+    setPersonalExercises(nextPersonalExercises);
+    setFavoriteExerciseNames(nextFavoriteExercises);
+
+    Promise.resolve()
+      .then(async () => {
+        if (uid) {
+          await markConfigItemsDeletedLocally(
+            "personal_exercises",
+            [exercise],
+            uid,
+          );
+        }
+        await savePersonalExercises(nextPersonalExercises);
+        await saveFavoriteExerciseNames(nextFavoriteExercises);
+      })
+      .catch((error) => {
+        console.log("Custom exercise delete persistence delayed:", error);
+      });
   };
 
   const toggleFavoriteExercise = async (exercise: any) => {
@@ -195,9 +510,14 @@ export default function ManageExercisesScreen({ navigation }: any) {
     setIsFetchingAPI(true);
 
     // 1. Load instantly from cache for a fast UI
+    let loadedGlobalExercises: any[] = [];
     const cachedGlobal = await AsyncStorage.getItem("@github_global_exercises");
     if (cachedGlobal) {
-      setGlobalExercises(JSON.parse(cachedGlobal));
+      const parsedCachedGlobal = safeJsonParse(cachedGlobal, []);
+      loadedGlobalExercises = Array.isArray(parsedCachedGlobal)
+        ? parsedCachedGlobal
+        : [];
+      setGlobalExercises(loadedGlobalExercises);
       setIsFetchingAPI(false); // Turn off loading spinner immediately
     }
 
@@ -205,41 +525,69 @@ export default function ManageExercisesScreen({ navigation }: any) {
     try {
       const fetchedData = await fetchGitHubExercises();
       if (fetchedData && fetchedData.length > 0) {
+        loadedGlobalExercises = fetchedData;
         setGlobalExercises(fetchedData); // Instantly updates UI if there's a new exercise
         await AsyncStorage.setItem(
           "@github_global_exercises",
           JSON.stringify(fetchedData),
         );
       } else if (!cachedGlobal) {
+        loadedGlobalExercises = INITIAL_EXERCISES;
         setGlobalExercises(INITIAL_EXERCISES);
       }
     } catch (error) {
       console.log("Silent background sync failed, relying on cache.");
-      if (!cachedGlobal) setGlobalExercises(INITIAL_EXERCISES);
+      if (!cachedGlobal) {
+        loadedGlobalExercises = INITIAL_EXERCISES;
+        setGlobalExercises(INITIAL_EXERCISES);
+      }
     } finally {
       setIsFetchingAPI(false);
     }
 
     const ex = await AsyncStorage.getItem(`@user_exercises_${uid}`);
     if (ex) {
-      const parsedAll = JSON.parse(ex);
-      setPersonalExercises(parsedAll.filter((e: any) => e.is_custom === true));
+      const parsedAll = safeJsonParse(ex, []);
+      const cleanedCustomExercises = cleanStoredCustomExercises(
+        parsedAll,
+        loadedGlobalExercises,
+      );
+      setPersonalExercises(cleanedCustomExercises);
+      if (
+        Array.isArray(parsedAll) &&
+        JSON.stringify(parsedAll) !== JSON.stringify(cleanedCustomExercises)
+      ) {
+        await AsyncStorage.setItem(
+          `@user_exercises_${uid}`,
+          JSON.stringify(cleanedCustomExercises),
+        );
+        syncPersonalExercisesToCloud(cleanedCustomExercises).catch((error) =>
+          console.log("Cleaned custom exercises cloud sync delayed:", error),
+        );
+      }
+    } else {
+      setPersonalExercises([]);
     }
 
     const hi = await AsyncStorage.getItem(`@workout_history_${uid}`);
     const m = await AsyncStorage.getItem(`@user_metric_${uid}`);
     const savedGyms = await AsyncStorage.getItem(`@user_gyms_${uid}`);
-    const savedFavorites = await AsyncStorage.getItem(`@favorite_exercises_${uid}`);
-    if (hi) setHistory(JSON.parse(hi).filter((w: any) => w && w.id));
+    const savedFavorites = await AsyncStorage.getItem(
+      `@favorite_exercises_${uid}`,
+    );
+    if (hi) {
+      const parsedHistory = safeJsonParse<any[]>(hi, []);
+      setHistory(parsedHistory.filter((w: any) => w && w.id));
+    }
     if (m) setMetric(m);
     if (savedGyms) {
-      const parsedGyms = JSON.parse(savedGyms);
+      const parsedGyms = safeJsonParse(savedGyms, []);
       setGyms(Array.isArray(parsedGyms) ? parsedGyms : []);
     } else {
       setGyms([]);
     }
     if (savedFavorites) {
-      const parsedFavorites = JSON.parse(savedFavorites);
+      const parsedFavorites = safeJsonParse(savedFavorites, []);
       setFavoriteExerciseNames(
         Array.isArray(parsedFavorites)
           ? cleanFavoriteExerciseNames(parsedFavorites.map(String))
@@ -277,12 +625,18 @@ export default function ManageExercisesScreen({ navigation }: any) {
 
   const savePersonalExercises = async (updatedPersonal: any[]) => {
     if (!uid) return;
-    setPersonalExercises(updatedPersonal);
+    const cleanedPersonalExercises = cleanStoredCustomExercises(
+      updatedPersonal,
+      globalExercises,
+    );
+    setPersonalExercises(cleanedPersonalExercises);
     await AsyncStorage.setItem(
       `@user_exercises_${uid}`,
-      JSON.stringify([...globalExercises, ...updatedPersonal]),
+      JSON.stringify(cleanedPersonalExercises),
     );
-    await syncPersonalExercisesToCloud(updatedPersonal);
+    syncPersonalExercisesToCloud(cleanedPersonalExercises).catch((error) =>
+      console.log("Custom exercise cloud sync delayed:", error),
+    );
   };
 
   const parseWorkoutDate = (value: any) => {
@@ -306,38 +660,43 @@ export default function ManageExercisesScreen({ navigation }: any) {
   };
 
   const getExerciseCardStats = (exerciseName: string) => {
+    const targetName = cleanExerciseNameForAttachments(exerciseName);
     let heaviestWeight = -1;
     let maxRepsAtHeaviest = -1;
     let completedSessions = 0;
     let lastDate: any = null;
 
     history.forEach((w) => {
-      const found = w.fullWorkoutData?.find(
-        (ex: any) => ex && ex.name === exerciseName,
+      const matchingExercises = (w.fullWorkoutData || []).filter(
+        (ex: any) =>
+          ex && cleanExerciseNameForAttachments(ex) === targetName,
       );
-      if (!found?.sets) return;
+      if (matchingExercises.length === 0) return;
 
       let hasCompletedSet = false;
-      found.sets.forEach((set: any) => {
-        if (set.completed && !set.isWarmup) {
-          const wVal = parseFloat(set.weight);
-          const rVal = found.is_unilateral
-            ? Math.max(
-                parseInt(set.repsL || "0", 10),
-                parseInt(set.repsR || "0", 10),
-              )
-            : parseInt(set.reps || "0", 10);
+      matchingExercises.forEach((found: any) => {
+        if (!Array.isArray(found?.sets)) return;
+        found.sets.forEach((set: any) => {
+          if (set.completed && !set.isWarmup) {
+            const wVal = parseFloat(set.weight);
+            const rVal = found.is_unilateral
+              ? Math.max(
+                  parseInt(set.repsL || "0", 10),
+                  parseInt(set.repsR || "0", 10),
+                )
+              : parseInt(set.reps || "0", 10);
 
-          if (Number.isFinite(wVal) && wVal > 0 && rVal > 0) {
-            hasCompletedSet = true;
-            if (wVal > heaviestWeight) {
-              heaviestWeight = wVal;
-              maxRepsAtHeaviest = rVal;
-            } else if (wVal === heaviestWeight && rVal > maxRepsAtHeaviest) {
-              maxRepsAtHeaviest = rVal;
+            if (Number.isFinite(wVal) && wVal > 0 && rVal > 0) {
+              hasCompletedSet = true;
+              if (wVal > heaviestWeight) {
+                heaviestWeight = wVal;
+                maxRepsAtHeaviest = rVal;
+              } else if (wVal === heaviestWeight && rVal > maxRepsAtHeaviest) {
+                maxRepsAtHeaviest = rVal;
+              }
             }
           }
-        }
+        });
       });
 
       if (hasCompletedSet) {
@@ -365,30 +724,49 @@ export default function ManageExercisesScreen({ navigation }: any) {
     };
   };
 
-  const getPRString = (exerciseName: string) => {
-    const stats = getExerciseCardStats(exerciseName);
-    return stats.hasHistory ? stats.bestText : "No history yet";
-  };
+  const builtInReferenceExercises = useMemo(() => {
+    const byKey = new Map<string, any>();
+
+    getActiveBuiltInExercises(globalExercises).forEach((exercise) => {
+      const key = getExerciseMatchKey(exercise);
+      if (!key) return;
+      byKey.set(key, exercise);
+    });
+
+    return Array.from(byKey.values());
+  }, [globalExercises]);
 
   const unifiedExercises = useMemo(() => {
     const byName = new Map<string, any>();
+    const builtInLookup = new Map<string, any>();
 
-    globalExercises.forEach((exercise) => {
+    builtInReferenceExercises.forEach((exercise) => {
       const key = getExerciseMatchKey(exercise);
-      if (key) byName.set(key, { ...exercise, is_custom: false, source: "builtin" });
+      if (!key) return;
+
+      const builtinExercise = {
+        ...exercise,
+        is_custom: false,
+        source: "builtin",
+      };
+      byName.set(key, builtinExercise);
+      getExerciseIdentityKeys(exercise).forEach((identityKey) => {
+        builtInLookup.set(identityKey, builtinExercise);
+      });
     });
 
     personalExercises.forEach((exercise) => {
       const key = getExerciseMatchKey(exercise);
       if (!key) return;
 
-      const matchingBuiltin = byName.get(key);
+      const matchingBuiltin =
+        getExerciseIdentityKeys(exercise)
+          .map((identityKey) => builtInLookup.get(identityKey))
+          .find(Boolean) || byName.get(key);
+
       if (matchingBuiltin) {
-        // Older versions let users copy Global exercises into Personal Library.
-        // In the unified library, those should fold back into the built-in row,
-        // not appear as duplicated Custom exercises.
-        byName.set(key, {
-          ...exercise,
+        const builtinKey = getExerciseMatchKey(matchingBuiltin);
+        byName.set(builtinKey || key, {
           ...matchingBuiltin,
           is_custom: false,
           source: "builtin",
@@ -397,20 +775,27 @@ export default function ManageExercisesScreen({ navigation }: any) {
         return;
       }
 
+      if (looksLikeBuiltInExercise(exercise)) return;
+
       byName.set(key, { ...exercise, is_custom: true, source: "custom" });
     });
 
     return Array.from(byName.values()).sort((a, b) =>
       String(a.name || "").localeCompare(String(b.name || "")),
     );
-  }, [globalExercises, personalExercises]);
+  }, [builtInReferenceExercises, personalExercises]);
+
+  const trueCustomExercises = useMemo(() => {
+    return cleanStoredCustomExercises(personalExercises);
+  }, [personalExercises, globalExercises]);
 
   const recentExerciseNames = useMemo(() => {
     const seen = new Set<string>();
     return [...history]
       .sort(
         (a, b) =>
-          parseWorkoutDate(b.date).getTime() - parseWorkoutDate(a.date).getTime(),
+          parseWorkoutDate(b.date).getTime() -
+          parseWorkoutDate(a.date).getTime(),
       )
       .flatMap((workout) => workout.fullWorkoutData || [])
       .map((exercise: any) => String(exercise?.name || "").trim())
@@ -424,7 +809,10 @@ export default function ManageExercisesScreen({ navigation }: any) {
   const displayedExercises = useMemo(() => {
     if (libraryView === "Favorites") {
       const recentOrder = new Map<string, number>(
-        recentExerciseNames.map((name, index) => [getFavoriteMatchKey(name), index]),
+        recentExerciseNames.map((name, index) => [
+          getFavoriteMatchKey(name),
+          index,
+        ]),
       );
       return unifiedExercises
         .filter((exercise) => isExerciseFavorite(exercise))
@@ -439,7 +827,10 @@ export default function ManageExercisesScreen({ navigation }: any) {
     }
     if (libraryView === "Recent") {
       const order = new Map<string, number>(
-        recentExerciseNames.map((name, index) => [getFavoriteMatchKey(name), index]),
+        recentExerciseNames.map((name, index) => [
+          getFavoriteMatchKey(name),
+          index,
+        ]),
       );
       return unifiedExercises
         .filter((exercise) => order.has(getExerciseMatchKey(exercise)))
@@ -450,33 +841,49 @@ export default function ManageExercisesScreen({ navigation }: any) {
         );
     }
     if (libraryView === "Custom") {
-      return unifiedExercises.filter((exercise) => exercise.is_custom === true);
+      return trueCustomExercises;
     }
     return unifiedExercises;
   }, [
     favoriteExerciseNames,
     libraryView,
     recentExerciseNames,
+    trueCustomExercises,
     unifiedExercises,
   ]);
 
   const searchedExercises = useMemo(() => {
-    if (!searchQuery.trim()) return displayedExercises;
-    const searchTerms = searchQuery
-      .toLowerCase()
-      .split(" ")
-      .filter((term) => term.length > 0);
-    return displayedExercises.filter((ex) => {
-      const searchableString =
-        `${ex.name} ${ex.equipment || ""} ${ex.muscle || ""}`.toLowerCase();
-      return searchTerms.every((term) => searchableString.includes(term));
-    });
-  }, [displayedExercises, searchQuery]);
+    let filtered = displayedExercises;
+    if (activeFilter !== "All") {
+      filtered = filtered.filter(
+        (ex) => ex && normalizeExerciseMuscleGroup(ex.muscle) === activeFilter,
+      );
+    }
+    if (searchQuery.trim()) {
+      filtered = filterAndRankExercisesBySearch(filtered, searchQuery);
+    }
+    return filtered;
+  }, [displayedExercises, activeFilter, searchQuery]);
 
   const sections = useMemo(
-    () => prepareSections(searchedExercises, activeFilter),
-    [searchedExercises, activeFilter],
+    () => prepareSections(searchedExercises, "All"),
+    [searchedExercises],
   );
+
+  const hasSearchQuery = searchQuery.trim().length > 0;
+  const hasActiveFilter = activeFilter !== "All";
+  const resultCountLabel = `${searchedExercises.length} ${
+    searchedExercises.length === 1 ? "exercise" : "exercises"
+  }${hasActiveFilter ? ` in ${activeFilter}` : ""}`;
+  const libraryContextLabel = hasSearchQuery
+    ? "Best name matches appear first"
+    : libraryView === "Favorites"
+      ? "Your starred exercises"
+      : libraryView === "Recent"
+        ? "Recently logged exercises"
+        : libraryView === "Custom"
+          ? "Exercises you created"
+          : "Browse, filter, or search your library";
 
   const formatShortDate = (value: any) => {
     const date = parseWorkoutDate(value);
@@ -566,66 +973,89 @@ export default function ManageExercisesScreen({ navigation }: any) {
     if (!selectedEx) return [];
 
     return history
-      .map((workout) => {
-        const found = workout.fullWorkoutData?.find(
-          (exercise: any) => exercise && exercise.name === selectedEx.name,
-        );
-        if (!found?.sets) return null;
+      .flatMap((workout) => {
+        const selectedName = cleanExerciseNameForAttachments(selectedEx);
+        const exercises = Array.isArray(workout.fullWorkoutData)
+          ? workout.fullWorkoutData
+          : [];
 
-        const isUnilateral = !!found.is_unilateral;
-        const workingSets = found.sets.filter((set: any) =>
-          isCompletedWorkingSet(set, isUnilateral),
-        );
-        if (workingSets.length === 0) return null;
+        return exercises
+          .map((found: any, exerciseIndex: number) => {
+            if (
+              !found ||
+              cleanExerciseNameForAttachments(found) !== selectedName
+            ) {
+              return null;
+            }
+            const attachment = getExerciseAttachmentForStorage(found);
+            if (!Array.isArray(found.sets)) return null;
 
-        const bestSet = workingSets.reduce((best: any, current: any) => {
-          const currentRM = getEstimatedOneRepMax(current, isUnilateral);
-          const bestRM = best ? getEstimatedOneRepMax(best, isUnilateral) : -1;
-          return currentRM > bestRM ? current : best;
-        }, null);
+            const isUnilateral = !!found.is_unilateral;
+            const workingSets = found.sets.filter((set: any) =>
+              isCompletedWorkingSet(set, isUnilateral),
+            );
+            if (workingSets.length === 0) return null;
 
-        const bestWeightSet = workingSets.reduce((best: any, current: any) => {
-          if (!best) return current;
-          const currentWeight = getWeight(current);
-          const bestWeight = getWeight(best);
-          if (currentWeight > bestWeight) return current;
-          if (currentWeight === bestWeight) {
-            return getReps(current, isUnilateral).bestSide >
-              getReps(best, isUnilateral).bestSide
-              ? current
-              : best;
-          }
-          return best;
-        }, null);
+            const bestSet = workingSets.reduce((best: any, current: any) => {
+              const currentRM = getEstimatedOneRepMax(current, isUnilateral);
+              const bestRM = best
+                ? getEstimatedOneRepMax(best, isUnilateral)
+                : -1;
+              return currentRM > bestRM ? current : best;
+            }, null);
 
-        const sessionVolume = workingSets.reduce(
-          (sum: number, set: any) => sum + getSetVolume(set, isUnilateral),
-          0,
-        );
-        const brandApplies = isMachineBrandApplicable(found || selectedEx);
-        const equipmentTag = brandApplies
-          ? found.equipmentTag || found.brand || found.machineBrand || null
-          : null;
-        const exerciseVariant = found.exerciseVariant || "Normal";
-        const gymName = getGymName(workout);
+            const bestWeightSet = workingSets.reduce(
+              (best: any, current: any) => {
+                if (!best) return current;
+                const currentWeight = getWeight(current);
+                const bestWeight = getWeight(best);
+                if (currentWeight > bestWeight) return current;
+                if (currentWeight === bestWeight) {
+                  return getReps(current, isUnilateral).bestSide >
+                    getReps(best, isUnilateral).bestSide
+                    ? current
+                    : best;
+                }
+                return best;
+              },
+              null,
+            );
 
-        return {
-          id: workout.id,
-          date: workout.startedAt || workout.date,
-          parsedDate: parseWorkoutDate(workout.startedAt || workout.date),
-          workoutName: workout.workoutName || "Workout",
-          gymId: getGymFilterId(workout),
-          gymName,
-          equipmentTag,
-          exerciseVariant,
-          remark: found.remark || "",
-          isUnilateral,
-          sets: workingSets,
-          bestSet,
-          bestWeightSet,
-          bestOneRM: getEstimatedOneRepMax(bestSet, isUnilateral),
-          sessionVolume,
-        };
+            const sessionVolume = workingSets.reduce(
+              (sum: number, set: any) => sum + getSetVolume(set, isUnilateral),
+              0,
+            );
+            const brandApplies = isMachineBrandApplicable(found || selectedEx);
+            const equipmentTag = brandApplies
+              ? found.equipmentTag || found.brand || found.machineBrand || null
+              : null;
+            const exerciseVariant = found.exerciseVariant || "Normal";
+            const gymName = getGymName(workout);
+
+            return {
+              id: `${workout.id || workout.startedAt || workout.date || "workout"}-${exerciseIndex}`,
+              workoutId: workout.id,
+              date: workout.startedAt || workout.date,
+              parsedDate: parseWorkoutDate(workout.startedAt || workout.date),
+              workoutName: workout.workoutName || "Workout",
+              gymId: getGymFilterId(workout),
+              gymName,
+              equipmentTag,
+              exerciseVariant,
+              attachment,
+              attachmentFilterValue:
+                normalizeExerciseAttachment(attachment) ||
+                NO_ATTACHMENT_FILTER,
+              remark: found.remark || "",
+              isUnilateral,
+              sets: workingSets,
+              bestSet,
+              bestWeightSet,
+              bestOneRM: getEstimatedOneRepMax(bestSet, isUnilateral),
+              sessionVolume,
+            };
+          })
+          .filter(Boolean);
       })
       .filter(Boolean)
       .sort(
@@ -700,6 +1130,53 @@ export default function ManageExercisesScreen({ navigation }: any) {
     return Array.from(seen).filter(Boolean);
   }, [selectedEx, allExerciseSessions]);
 
+  const detailAttachmentOptions = useMemo(() => {
+    const byValue = new Map<string, string>();
+    const configured = selectedEx ? getExerciseAttachmentOptions(selectedEx) : [];
+    const hasAttachmentHistory = allExerciseSessions.some((session: any) =>
+      normalizeExerciseAttachment(session.attachment),
+    );
+
+    const allowsNoAttachment =
+      selectedEx && shouldAllowNoAttachmentOption(selectedEx);
+
+    if (configured.length === 0 && !hasAttachmentHistory && !allowsNoAttachment) {
+      return [];
+    }
+
+    const addAttachment = (attachment: any) => {
+      const normalized = normalizeExerciseAttachment(attachment);
+      if (normalized) {
+        byValue.set(normalized, normalized);
+        return;
+      }
+      byValue.set(NO_ATTACHMENT_FILTER, NO_ATTACHMENT_OPTION_LABEL);
+    };
+
+    if (allowsNoAttachment) {
+      addAttachment("");
+    }
+    configured.forEach(addAttachment);
+    allExerciseSessions.forEach((session: any) => {
+      addAttachment(session.attachment);
+    });
+
+    return Array.from(byValue.entries()).map(([value, label]) => ({
+      value,
+      label,
+    }));
+  }, [selectedEx, allExerciseSessions]);
+
+  useEffect(() => {
+    if (detailAttachmentFilter === "All") return;
+    const hasSelectedAttachment = detailAttachmentOptions.some(
+      (attachment) => attachment.value === detailAttachmentFilter,
+    );
+    if (!hasSelectedAttachment) {
+      setDetailAttachmentFilter("All");
+    }
+  }, [detailAttachmentFilter, detailAttachmentOptions]);
+
   const filteredExerciseSessions = useMemo(() => {
     const now = Date.now();
     const rangeDays =
@@ -734,6 +1211,12 @@ export default function ManageExercisesScreen({ navigation }: any) {
       ) {
         return false;
       }
+      if (
+        detailAttachmentFilter !== "All" &&
+        session.attachmentFilterValue !== detailAttachmentFilter
+      ) {
+        return false;
+      }
       return true;
     });
   }, [
@@ -742,6 +1225,7 @@ export default function ManageExercisesScreen({ navigation }: any) {
     detailGymFilter,
     detailBrandFilter,
     detailVariantFilter,
+    detailAttachmentFilter,
     detailBrandApplicable,
   ]);
 
@@ -799,7 +1283,10 @@ export default function ManageExercisesScreen({ navigation }: any) {
     const bestSetVolumeItem = allSets.reduce((best: any, item: any) => {
       if (!best) return item;
       if (item.volume > best.volume) return item;
-      if (item.volume === best.volume && getWeight(item.set) > getWeight(best.set)) {
+      if (
+        item.volume === best.volume &&
+        getWeight(item.set) > getWeight(best.set)
+      ) {
         return item;
       }
       return best;
@@ -950,13 +1437,7 @@ export default function ManageExercisesScreen({ navigation }: any) {
           {
             text: "Delete",
             style: "destructive",
-            onPress: () => {
-              Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Heavy);
-              savePersonalExercises(
-                personalExercises.filter((e) => e.name !== menuExercise?.name),
-              );
-              setDeleteAlertVisible(false);
-            },
+            onPress: () => deleteCustomExercise(menuExercise),
           },
         ]}
         onClose={() => setDeleteAlertVisible(false)}
@@ -978,29 +1459,46 @@ export default function ManageExercisesScreen({ navigation }: any) {
           {
             text: addAlert.isOverride ? "Replace" : "Save",
             style: "default",
-            onPress: () => {
-              if (addAlert.exercise) {
-                Haptics.notificationAsync(
-                  Haptics.NotificationFeedbackType.Success,
-                );
-                let updatedPersonal = [...personalExercises];
+            onPress: () =>
+              runExerciseBlockingAction(
+                addAlert.isOverride
+                  ? "Replacing exercise..."
+                  : "Saving exercise...",
+                async () => {
+                  if (addAlert.exercise) {
+                    Haptics.notificationAsync(
+                      Haptics.NotificationFeedbackType.Success,
+                    );
+                    let updatedPersonal = [...personalExercises];
 
-                // If overriding, clean out the old version first
-                if (addAlert.isOverride) {
-                  updatedPersonal = updatedPersonal.filter(
-                    (e) => e.name !== addAlert.exercise.name,
-                  );
-                }
+                    // If overriding, clean out the old version first
+                    if (addAlert.isOverride) {
+                      updatedPersonal = updatedPersonal.filter(
+                        (e) => e.name !== addAlert.exercise.name,
+                      );
+                    } else if (
+                      updatedPersonal.length >= LIMITS.customExercisesPerUser
+                    ) {
+                      setInfoAlert({
+                        visible: true,
+                        title: "Custom Exercise Limit Reached",
+                        message: "You can save up to 100 custom exercises.",
+                      });
+                      return;
+                    }
 
-                updatedPersonal.push({ ...addAlert.exercise, is_custom: true });
-                savePersonalExercises(updatedPersonal);
-              }
-              setAddAlert({
-                visible: false,
-                exercise: null,
-                isOverride: false,
-              });
-            },
+                    updatedPersonal.push(
+                      createCustomExerciseRecord(addAlert.exercise),
+                    );
+                    await savePersonalExercises(updatedPersonal);
+                  }
+                  setAddAlert({
+                    visible: false,
+                    exercise: null,
+                    isOverride: false,
+                  });
+                },
+              ),
           },
         ]}
         onClose={() =>
@@ -1023,9 +1521,13 @@ export default function ManageExercisesScreen({ navigation }: any) {
                 setTimeout(() => {
                   setEditingExName(menuExercise.name);
                   setEditingMode("details");
-                  setNewName(menuExercise.name);
-                  setNewMuscle(menuExercise.muscle);
-                  setNewReminder(menuExercise.reminder || "");
+                  setNewName(limitText(menuExercise.name, LIMITS.nameChars));
+                  setNewMuscle(
+                    normalizeExerciseMuscleGroup(menuExercise.muscle),
+                  );
+                  setNewReminder(
+                    limitText(menuExercise.reminder || "", LIMITS.cueChars),
+                  );
                   setNewIsUnilateral(menuExercise.is_unilateral || false);
                   setNewSupportsVariants(
                     getExerciseVariationOptions(menuExercise).length > 0,
@@ -1043,9 +1545,13 @@ export default function ManageExercisesScreen({ navigation }: any) {
                 setTimeout(() => {
                   setEditingExName(menuExercise.name);
                   setEditingMode("reminder");
-                  setNewName(menuExercise.name);
-                  setNewMuscle(menuExercise.muscle);
-                  setNewReminder(menuExercise.reminder || "");
+                  setNewName(limitText(menuExercise.name, LIMITS.nameChars));
+                  setNewMuscle(
+                    normalizeExerciseMuscleGroup(menuExercise.muscle),
+                  );
+                  setNewReminder(
+                    limitText(menuExercise.reminder || "", LIMITS.cueChars),
+                  );
                   setNewIsUnilateral(menuExercise.is_unilateral || false);
                   setNewSupportsVariants(
                     getExerciseVariationOptions(menuExercise).length > 0,
@@ -1130,7 +1636,10 @@ export default function ManageExercisesScreen({ navigation }: any) {
                   ref={inputRef}
                   style={localStyles.createInput}
                   value={newName}
-                  onChangeText={setNewName}
+                  onChangeText={(value) =>
+                    setNewName(limitText(value, LIMITS.nameChars))
+                  }
+                  maxLength={LIMITS.nameChars}
                   placeholder="Exercise name"
                   placeholderTextColor={Colors.textSubtle}
                   selectionColor={Colors.accent}
@@ -1139,9 +1648,15 @@ export default function ManageExercisesScreen({ navigation }: any) {
               {(editingMode === "new" || editingMode === "reminder") && (
                 <TextInput
                   ref={reminderRef}
-                  style={[localStyles.createInput, localStyles.createInputMultiline]}
+                  style={[
+                    localStyles.createInput,
+                    localStyles.createInputMultiline,
+                  ]}
                   value={newReminder}
-                  onChangeText={setNewReminder}
+                  onChangeText={(value) =>
+                    setNewReminder(limitText(value, LIMITS.cueChars))
+                  }
+                  maxLength={LIMITS.cueChars}
                   placeholder="Training cue (optional)"
                   placeholderTextColor={Colors.textSubtle}
                   selectionColor={Colors.accent}
@@ -1158,7 +1673,9 @@ export default function ManageExercisesScreen({ navigation }: any) {
 
               {(editingMode === "new" || editingMode === "details") && (
                 <>
-                  <Text style={localStyles.createSectionLabel}>Exercise Type</Text>
+                  <Text style={localStyles.createSectionLabel}>
+                    Exercise Type
+                  </Text>
                   <View style={localStyles.createChipWrap}>
                     <TouchableOpacity
                       style={[
@@ -1196,7 +1713,9 @@ export default function ManageExercisesScreen({ navigation }: any) {
                     </TouchableOpacity>
                   </View>
 
-                  <Text style={[localStyles.createSectionLabel, { marginTop: 10 }]}>
+                  <Text
+                    style={[localStyles.createSectionLabel, { marginTop: 10 }]}
+                  >
                     Exercise Variants
                   </Text>
                   <Text style={localStyles.variantHelpText}>
@@ -1215,7 +1734,8 @@ export default function ManageExercisesScreen({ navigation }: any) {
                       <Text
                         style={[
                           localStyles.createChipText,
-                          !newSupportsVariants && localStyles.createChipTextActive,
+                          !newSupportsVariants &&
+                            localStyles.createChipTextActive,
                         ]}
                       >
                         Off
@@ -1232,7 +1752,8 @@ export default function ManageExercisesScreen({ navigation }: any) {
                       <Text
                         style={[
                           localStyles.createChipText,
-                          newSupportsVariants && localStyles.createChipTextActive,
+                          newSupportsVariants &&
+                            localStyles.createChipTextActive,
                         ]}
                       >
                         Normal / Paused / Tempo
@@ -1240,7 +1761,9 @@ export default function ManageExercisesScreen({ navigation }: any) {
                     </TouchableOpacity>
                   </View>
 
-                  <Text style={[localStyles.createSectionLabel, { marginTop: 10 }]}>
+                  <Text
+                    style={[localStyles.createSectionLabel, { marginTop: 10 }]}
+                  >
                     Muscle Group
                   </Text>
                   <View style={localStyles.createChipWrap}>
@@ -1279,25 +1802,45 @@ export default function ManageExercisesScreen({ navigation }: any) {
               <TouchableOpacity
                 style={[
                   localStyles.createSaveButton,
-                  editingMode !== "reminder" && !newName.trim() &&
+                  ((editingMode !== "reminder" && !newName.trim()) ||
+                    isExerciseBlocking) &&
                     localStyles.createSaveButtonDisabled,
                 ]}
-                disabled={editingMode !== "reminder" && !newName.trim()}
+                disabled={
+                  (editingMode !== "reminder" && !newName.trim()) ||
+                  isExerciseBlocking
+                }
                 onPress={async () => {
-                  if (editingMode !== "reminder" && !newName.trim()) return;
-                  if (!uid) return;
-                  Haptics.notificationAsync(
-                    Haptics.NotificationFeedbackType.Success,
+                  if (exerciseBlockingRef.current) return;
+                  exerciseBlockingRef.current = true;
+                  setExerciseBlockingMessage(
+                    editingMode === "new"
+                      ? "Saving exercise..."
+                      : "Saving changes...",
                   );
+                  try {
+                    const finalName = cleanLimitedText(
+                      newName,
+                      LIMITS.nameChars,
+                    );
+                    const finalReminder = cleanLimitedText(
+                      newReminder,
+                      LIMITS.cueChars,
+                    );
+                    if (editingMode !== "reminder" && !finalName) return;
+                    if (!uid) return;
+                    Haptics.notificationAsync(
+                      Haptics.NotificationFeedbackType.Success,
+                    );
 
                   if (editingExName) {
                     const updatedPersonal = personalExercises.map((e) =>
                       e.name === editingExName
                         ? {
                             ...e,
-                            name: newName.trim(),
-                            muscle: newMuscle,
-                            reminder: newReminder.trim(),
+                            name: finalName,
+                            muscle: normalizeExerciseMuscleGroup(newMuscle),
+                            reminder: finalReminder,
                             is_unilateral: newIsUnilateral,
                             supportsVariants: newSupportsVariants,
                             variationOptions: newSupportsVariants
@@ -1306,51 +1849,58 @@ export default function ManageExercisesScreen({ navigation }: any) {
                           }
                         : e,
                     );
-                    savePersonalExercises(updatedPersonal);
+                    await savePersonalExercises(updatedPersonal);
+                    await transferFavoriteExerciseName(
+                      editingExName,
+                      finalName,
+                    );
 
                     if (editingMode === "details") {
                       const tmplRaw = await AsyncStorage.getItem(
                         `@workout_templates_${uid}`,
                       );
                       if (tmplRaw) {
-                        const tmpls = JSON.parse(tmplRaw).map((t: any) => ({
+                        const tmpls = safeJsonParse<any[]>(tmplRaw, []).map((t: any) => ({
                           ...t,
-                          exercises: t.exercises.map((ex: any) =>
+                          exercises: Array.isArray(t.exercises) ? t.exercises.map((ex: any) =>
                             ex.name === editingExName
                               ? {
                                   ...ex,
-                                  name: newName.trim(),
+                                  name: finalName,
                                   is_unilateral: newIsUnilateral,
                                 }
                               : ex,
-                          ),
+                          ) : [],
                         }));
-                        await AsyncStorage.setItem(
-                          `@workout_templates_${uid}`,
-                          JSON.stringify(tmpls),
-                        );
+                        await saveTemplatesLocallyAndToCloud(tmpls, uid);
                       }
                       const histRaw = await AsyncStorage.getItem(
                         `@workout_history_${uid}`,
                       );
                       if (histRaw) {
-                        const hist = JSON.parse(histRaw).map((w: any) => ({
+                        const hist = safeJsonParse<any[]>(histRaw, []).map((w: any) => ({
                           ...w,
-                          fullWorkoutData: w.fullWorkoutData.map((ex: any) =>
+                          fullWorkoutData: Array.isArray(w.fullWorkoutData) ? w.fullWorkoutData.map((ex: any) =>
                             ex.name === editingExName
                               ? {
                                   ...ex,
-                                  name: newName.trim(),
+                                  name: finalName,
                                   is_unilateral: newIsUnilateral,
                                 }
                               : ex,
-                          ),
+                          ) : [],
                         }));
                         await AsyncStorage.setItem(
                           `@workout_history_${uid}`,
                           JSON.stringify(hist),
                         );
                         setHistory(hist);
+                        pushWorkoutListToCloud(hist).catch((error) => {
+                          console.log(
+                            "Cloud workout history refresh delayed after custom exercise edit.",
+                            error,
+                          );
+                        });
                       }
 
                       const activeSessionRaw = await AsyncStorage.getItem(
@@ -1358,14 +1908,14 @@ export default function ManageExercisesScreen({ navigation }: any) {
                       );
                       if (activeSessionRaw) {
                         try {
-                          const activeSession = JSON.parse(activeSessionRaw);
-                          if (Array.isArray(activeSession.exercises)) {
+                          const activeSession = safeJsonParse<any>(activeSessionRaw, null);
+                          if (activeSession && Array.isArray(activeSession.exercises)) {
                             activeSession.exercises =
                               activeSession.exercises.map((ex: any) => {
                                 if (ex.name !== editingExName) return ex;
                                 const updated = {
                                   ...ex,
-                                  name: newName.trim(),
+                                  name: finalName,
                                   is_unilateral: newIsUnilateral,
                                 };
                                 if (newIsUnilateral && !ex.is_unilateral) {
@@ -1401,19 +1951,28 @@ export default function ManageExercisesScreen({ navigation }: any) {
                       }
                     }
                   } else {
-                    savePersonalExercises([
+                    if (
+                      personalExercises.length >= LIMITS.customExercisesPerUser
+                    ) {
+                      setInfoAlert({
+                        visible: true,
+                        title: "Custom Exercise Limit Reached",
+                        message: "You can save up to 100 custom exercises.",
+                      });
+                      return;
+                    }
+                    await savePersonalExercises([
                       ...personalExercises,
-                      {
-                        name: newName.trim(),
-                        muscle: newMuscle,
-                        reminder: newReminder.trim(),
+                      createCustomExerciseRecord({
+                        name: finalName,
+                        muscle: normalizeExerciseMuscleGroup(newMuscle),
+                        reminder: finalReminder,
                         is_unilateral: newIsUnilateral,
                         supportsVariants: newSupportsVariants,
                         variationOptions: newSupportsVariants
                           ? ["Normal", "Paused", "Tempo"]
                           : undefined,
-                        is_custom: true,
-                      },
+                      }),
                     ]);
                   }
                   setIsExModalVisible(false);
@@ -1421,6 +1980,12 @@ export default function ManageExercisesScreen({ navigation }: any) {
                   setNewReminder("");
                   setNewIsUnilateral(false);
                   setNewSupportsVariants(false);
+                  } catch (error) {
+                    console.error("Custom exercise save failed:", error);
+                  } finally {
+                    exerciseBlockingRef.current = false;
+                    setExerciseBlockingMessage("");
+                  }
                 }}
               >
                 <Text style={localStyles.createSaveText}>
@@ -1436,10 +2001,7 @@ export default function ManageExercisesScreen({ navigation }: any) {
         visible={isDetailVisible}
         animationType="slide"
         presentationStyle="pageSheet"
-        onDismiss={() => {
-          setIsDetailVisible(false);
-          setIsScrolled(false);
-        }}
+        onDismiss={() => setIsDetailVisible(false)}
         onRequestClose={() => setIsDetailVisible(false)}
       >
         <View style={localStyles.detailScreen}>
@@ -1469,7 +2031,8 @@ export default function ManageExercisesScreen({ navigation }: any) {
 
               <View style={{ flex: 1, paddingRight: 12 }}>
                 <Text style={localStyles.detailEyebrow}>
-                  {selectedEx?.muscle || "Exercise"}
+                  {normalizeExerciseMuscleGroup(selectedEx?.muscle) ||
+                    "Exercise"}
                 </Text>
                 <Text style={localStyles.detailTitle} numberOfLines={2}>
                   {selectedEx?.name}
@@ -1626,6 +2189,60 @@ export default function ManageExercisesScreen({ navigation }: any) {
                     </ScrollView>
                   )}
 
+                  {detailAttachmentOptions.length > 0 && (
+                    <ScrollView
+                      horizontal
+                      showsHorizontalScrollIndicator={false}
+                      contentContainerStyle={[
+                        localStyles.detailFilterRow,
+                        { paddingTop: 8 },
+                      ]}
+                    >
+                      <TouchableOpacity
+                        style={[
+                          localStyles.smallFilterChip,
+                          detailAttachmentFilter === "All" &&
+                            localStyles.smallFilterChipActive,
+                        ]}
+                        onPress={() => setDetailAttachmentFilter("All")}
+                      >
+                        <Text
+                          style={[
+                            localStyles.smallFilterText,
+                            detailAttachmentFilter === "All" &&
+                              localStyles.smallFilterTextActive,
+                          ]}
+                        >
+                          All Attachments
+                        </Text>
+                      </TouchableOpacity>
+                      {detailAttachmentOptions.map((attachment) => (
+                        <TouchableOpacity
+                          key={attachment.value}
+                          style={[
+                            localStyles.smallFilterChip,
+                            detailAttachmentFilter === attachment.value &&
+                              localStyles.smallFilterChipActive,
+                          ]}
+                          onPress={() =>
+                            setDetailAttachmentFilter(attachment.value)
+                          }
+                        >
+                          <Text
+                            style={[
+                              localStyles.smallFilterText,
+                              detailAttachmentFilter === attachment.value &&
+                                localStyles.smallFilterTextActive,
+                            ]}
+                            numberOfLines={1}
+                          >
+                            {attachment.label}
+                          </Text>
+                        </TouchableOpacity>
+                      ))}
+                    </ScrollView>
+                  )}
+
                   {detailBrandApplicable && detailBrandOptions.length > 0 && (
                     <ScrollView
                       horizontal
@@ -1701,7 +2318,9 @@ export default function ManageExercisesScreen({ navigation }: any) {
                   style={localStyles.primaryDetailButton}
                   onPress={() => {
                     setIsDetailVisible(false);
-                    navigation.navigate("Workout");
+                    navigation.navigate("Workout", {
+                      initialExercise: selectedEx,
+                    });
                   }}
                 >
                   <Ionicons name="play" size={16} color={Colors.background} />
@@ -1736,18 +2355,23 @@ export default function ManageExercisesScreen({ navigation }: any) {
                   No data for this filter
                 </Text>
                 <Text style={localStyles.noStatsBody}>
-                  {detailBrandApplicable
-                    ? "Try changing the time range, gym, or machine brand filter to view more performances for this exercise."
-                    : "Try changing the time range or gym filter to view more performances for this exercise."}
+                  {detailAttachmentOptions.length > 0 && detailBrandApplicable
+                    ? "Try changing the time range, gym, attachment, or machine brand filter to view more performances for this exercise."
+                    : detailAttachmentOptions.length > 0
+                      ? "Try changing the time range, gym, or attachment filter to view more performances for this exercise."
+                      : detailBrandApplicable
+                        ? "Try changing the time range, gym, or machine brand filter to view more performances for this exercise."
+                        : "Try changing the time range or gym filter to view more performances for this exercise."}
                 </Text>
                 <TouchableOpacity
                   style={localStyles.secondaryDetailButton}
                   onPress={() => {
-                    setDetailRange("All");
-                    setDetailGymFilter("All");
-                    setDetailBrandFilter("All");
-                  }}
-                >
+                  setDetailRange("All");
+                  setDetailGymFilter("All");
+                  setDetailBrandFilter("All");
+                  setDetailAttachmentFilter("All");
+                }}
+              >
                   <Text style={localStyles.secondaryDetailButtonText}>
                     Clear Filters
                   </Text>
@@ -2012,7 +2636,9 @@ export default function ManageExercisesScreen({ navigation }: any) {
                 <View style={localStyles.recordsCard}>
                   <View style={localStyles.cardHeaderRowCompact}>
                     <View style={{ flex: 1, paddingRight: 12 }}>
-                      <Text style={localStyles.cardTitle}>Personal Records</Text>
+                      <Text style={localStyles.cardTitle}>
+                        Personal Records
+                      </Text>
                       <Text style={localStyles.cardSubtitle}>
                         Clean records for this exercise and filter
                       </Text>
@@ -2026,8 +2652,13 @@ export default function ManageExercisesScreen({ navigation }: any) {
 
                   <View style={localStyles.recordsList}>
                     <View style={localStyles.recordRow}>
-                      <Text style={localStyles.recordRowLabel}>Heaviest Set</Text>
-                      <Text style={localStyles.recordRowValue} numberOfLines={1}>
+                      <Text style={localStyles.recordRowLabel}>
+                        Heaviest Set
+                      </Text>
+                      <Text
+                        style={localStyles.recordRowValue}
+                        numberOfLines={1}
+                      >
                         {exerciseStats.bestWeightItem
                           ? formatSetSummary(
                               exerciseStats.bestWeightItem.set,
@@ -2037,8 +2668,13 @@ export default function ManageExercisesScreen({ navigation }: any) {
                       </Text>
                     </View>
                     <View style={localStyles.recordRow}>
-                      <Text style={localStyles.recordRowLabel}>Best 1RM Estimate</Text>
-                      <Text style={localStyles.recordRowValue} numberOfLines={1}>
+                      <Text style={localStyles.recordRowLabel}>
+                        Best 1RM Estimate
+                      </Text>
+                      <Text
+                        style={localStyles.recordRowValue}
+                        numberOfLines={1}
+                      >
                         {exerciseStats.maxOneRM
                           ? `${formatNumber(exerciseStats.maxOneRM, 1)}${metric}`
                           : "--"}
@@ -2046,20 +2682,30 @@ export default function ManageExercisesScreen({ navigation }: any) {
                     </View>
                     {!!exerciseStats.bestVolumeSession && (
                       <View style={localStyles.recordRow}>
-                        <Text style={localStyles.recordRowLabel}>Best Volume Session</Text>
-                        <Text style={localStyles.recordRowValue} numberOfLines={1}>
+                        <Text style={localStyles.recordRowLabel}>
+                          Best Volume Session
+                        </Text>
+                        <Text
+                          style={localStyles.recordRowValue}
+                          numberOfLines={1}
+                        >
                           {formatNumber(
                             exerciseStats.bestVolumeSession.sessionVolume,
                             0,
-                          )} {metric}
+                          )}{" "}
+                          {metric}
                         </Text>
                       </View>
                     )}
                   </View>
 
-                  {exerciseStats.repPRs.filter((record: any) => record.target !== 1).length > 0 && (
+                  {exerciseStats.repPRs.filter(
+                    (record: any) => record.target !== 1,
+                  ).length > 0 && (
                     <View style={localStyles.repRecordsBlock}>
-                      <Text style={localStyles.repRecordsTitle}>Rep Records</Text>
+                      <Text style={localStyles.repRecordsTitle}>
+                        Rep Records
+                      </Text>
                       <View style={localStyles.repRecordsGrid}>
                         {exerciseStats.repPRs
                           .filter((record: any) => record.target !== 1)
@@ -2076,7 +2722,10 @@ export default function ManageExercisesScreen({ navigation }: any) {
                                 style={localStyles.repRecordValue}
                                 numberOfLines={1}
                               >
-                                {formatSetSummary(record.set, record.isUnilateral)}
+                                {formatSetSummary(
+                                  record.set,
+                                  record.isUnilateral,
+                                )}
                               </Text>
                             </View>
                           ))}
@@ -2084,7 +2733,6 @@ export default function ManageExercisesScreen({ navigation }: any) {
                     </View>
                   )}
                 </View>
-
 
                 <View style={localStyles.recentSectionHeader}>
                   <Text style={localStyles.cardTitle}>Recent Performances</Text>
@@ -2114,6 +2762,7 @@ export default function ManageExercisesScreen({ navigation }: any) {
                             session.exerciseVariant !== "Normal"
                               ? session.exerciseVariant
                               : null,
+                            session.attachment,
                             session.gymName,
                             session.equipmentTag,
                           ]
@@ -2139,6 +2788,9 @@ export default function ManageExercisesScreen({ navigation }: any) {
                           </Text>
                           <Text style={localStyles.setValue}>
                             {formatSetSummary(set, session.isUnilateral)}
+                            {parseRpeValue(set.rpe) !== null
+                              ? ` · RPE ${formatRpeValue(set.rpe)}`
+                              : ""}
                           </Text>
                         </View>
                       ))}
@@ -2220,10 +2872,22 @@ export default function ManageExercisesScreen({ navigation }: any) {
             style={localStyles.createCustomExerciseCard}
             activeOpacity={0.84}
             onPress={() => {
+              if (personalExercises.length >= LIMITS.customExercisesPerUser) {
+                setInfoAlert({
+                  visible: true,
+                  title: "Custom Exercise Limit Reached",
+                  message: "You can save up to 100 custom exercises.",
+                });
+                return;
+              }
               setEditingExName(null);
               setEditingMode("new");
               setNewName("");
-              setNewMuscle(activeFilter === "All" ? "Chest" : activeFilter);
+              setNewMuscle(
+                activeFilter === "All"
+                  ? "Chest"
+                  : normalizeExerciseMuscleGroup(activeFilter),
+              );
               setNewIsUnilateral(false);
               setNewReminder("");
               setNewSupportsVariants(false);
@@ -2234,9 +2898,15 @@ export default function ManageExercisesScreen({ navigation }: any) {
               <Ionicons name="add" size={22} color={Colors.accent} />
             </View>
             <View style={{ flex: 1 }}>
-              <Text style={localStyles.createCustomExerciseKicker}>CUSTOM EXERCISE</Text>
-              <Text style={localStyles.createCustomExerciseTitle}>Create Custom Exercise</Text>
-              <Text style={localStyles.createCustomExerciseSub}>Add a movement that is not in the library</Text>
+              <Text style={localStyles.createCustomExerciseKicker}>
+                CUSTOM EXERCISE
+              </Text>
+              <Text style={localStyles.createCustomExerciseTitle}>
+                Create Custom Exercise
+              </Text>
+              <Text style={localStyles.createCustomExerciseSub}>
+                Add a movement that is not in the library
+              </Text>
             </View>
           </TouchableOpacity>
         )}
@@ -2260,10 +2930,9 @@ export default function ManageExercisesScreen({ navigation }: any) {
           </View>
           <View style={localStyles.libraryStatCard}>
             <Text style={localStyles.libraryStatValue}>
-              {Math.max(
-                0,
-                displayedExercises.filter((ex: any) => ex.is_custom === true).length,
-              )}
+              {libraryView === "Custom"
+                ? searchedExercises.length
+                : trueCustomExercises.length}
             </Text>
             <Text style={localStyles.libraryStatLabel}>Custom</Text>
           </View>
@@ -2303,6 +2972,29 @@ export default function ManageExercisesScreen({ navigation }: any) {
         />
       </View>
 
+      <View style={localStyles.resultSummaryRow}>
+        <View style={localStyles.resultSummaryTextBlock}>
+          <Text style={localStyles.resultSummaryTitle}>{resultCountLabel}</Text>
+          <Text style={localStyles.resultSummarySub} numberOfLines={1}>
+            {libraryContextLabel}
+          </Text>
+        </View>
+        {hasActiveFilter && (
+          <TouchableOpacity
+            style={localStyles.clearFilterPill}
+            activeOpacity={0.84}
+            onPress={async () => {
+              if (!uid) return;
+              Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
+              setActiveFilter("All");
+              await AsyncStorage.setItem(`@last_search_filter_${uid}`, "All");
+            }}
+          >
+            <Text style={localStyles.clearFilterText}>Clear filter</Text>
+          </TouchableOpacity>
+        )}
+      </View>
+
       {isFetchingAPI && globalExercises.length === 0 ? (
         <View
           style={{ flex: 1, justifyContent: "center", alignItems: "center" }}
@@ -2340,6 +3032,7 @@ export default function ManageExercisesScreen({ navigation }: any) {
               setDetailRange("90D");
               setDetailGymFilter("All");
               setDetailBrandFilter("All");
+              setDetailAttachmentFilter("All");
               setIsDetailVisible(true);
             };
 
@@ -2378,9 +3071,11 @@ export default function ManageExercisesScreen({ navigation }: any) {
                   </View>
                 )}
 
-                <View style={localStyles.exerciseTextBlock}>
+                <View style={localStyles.exerciseContent}>
                   <Text style={localStyles.exerciseKicker}>
-                    {formatLibraryLabel(item.muscle)}{isCustomExercise ? " · Custom" : ""}
+                    {formatLibraryLabel(
+                      normalizeExerciseMuscleGroup(item.muscle),
+                    )}
                   </Text>
                   <Text style={localStyles.exerciseTitle} numberOfLines={1}>
                     {item.name}
@@ -2388,30 +3083,27 @@ export default function ManageExercisesScreen({ navigation }: any) {
                   <Text
                     style={[
                       localStyles.exerciseBestText,
-                      !cardStats.hasHistory &&
-                        localStyles.exerciseNoHistoryText,
+                      !cardStats.hasHistory && localStyles.exerciseNoHistoryText,
                     ]}
                     numberOfLines={1}
                   >
                     {cardStats.bestText}
                   </Text>
-                  <Text style={localStyles.exerciseMetaText} numberOfLines={1}>
-                    {cardStats.sessionText}
-                  </Text>
                 </View>
 
-                <View style={localStyles.exerciseActionsRow}>
-                  <TouchableOpacity
-                    style={localStyles.exerciseActionButton}
-                    onPress={() => toggleFavoriteExercise(item)}
-                  >
-                    <Ionicons
-                      name={isFavorite ? "star" : "star-outline"}
-                      size={22}
-                      color={isFavorite ? Colors.accent : Colors.textMuted}
-                    />
-                  </TouchableOpacity>
-                </View>
+                <TouchableOpacity
+                  style={localStyles.exerciseActionButton}
+                  onPress={(event) => {
+                    event.stopPropagation();
+                    toggleFavoriteExercise(item);
+                  }}
+                >
+                  <Ionicons
+                    name={isFavorite ? "star" : "star-outline"}
+                    size={24}
+                    color={isFavorite ? Colors.accent : Colors.textMuted}
+                  />
+                </TouchableOpacity>
               </TouchableOpacity>
             );
           }}
@@ -2433,27 +3125,36 @@ export default function ManageExercisesScreen({ navigation }: any) {
                 />
               </View>
               <Text style={localStyles.libraryEmptyTitle}>
-                {libraryView === "Custom"
-                  ? "No custom exercises yet"
-                  : libraryView === "Favorites"
-                    ? "No favorites yet"
-                    : libraryView === "Recent"
-                      ? "No recent exercises yet"
-                      : "No exercises found"}
+                {hasSearchQuery || hasActiveFilter
+                  ? "No matching exercises"
+                  : libraryView === "Custom"
+                    ? "No custom exercises yet"
+                    : libraryView === "Favorites"
+                      ? "No favorites yet"
+                      : libraryView === "Recent"
+                        ? "No recent exercises yet"
+                        : "No exercises found"}
               </Text>
               <Text style={localStyles.libraryEmptyText}>
-                {libraryView === "Custom"
-                  ? "Create your own exercise when it does not exist in the library."
-                  : libraryView === "Favorites"
-                    ? "Tap the star on exercises you use often to keep them here."
-                    : libraryView === "Recent"
-                      ? "Exercises will appear here after you log them in a workout."
-                      : "Try a different search term or category filter."}
+                {hasSearchQuery || hasActiveFilter
+                  ? `Try a shorter search${hasSearchQuery ? ` like "${searchQuery.trim().split(/\s+/)[0]}"` : ""}${hasActiveFilter ? ", or clear the muscle filter" : ""}.`
+                  : libraryView === "Custom"
+                    ? "Create your own exercise when it does not exist in the library."
+                    : libraryView === "Favorites"
+                      ? "Tap the star on exercises you use often to keep them here."
+                      : libraryView === "Recent"
+                        ? "Exercises will appear here after you log them in a workout."
+                        : "Try a different search term or category filter."}
               </Text>
             </View>
           }
         />
       )}
+
+      <BlockingOverlay
+        visible={isExerciseBlocking}
+        message={exerciseBlockingMessage}
+      />
     </View>
   );
 }
@@ -2544,9 +3245,13 @@ const localStyles = StyleSheet.create({
     fontSize: 12,
     fontWeight: "900",
     letterSpacing: 0.9,
-    marginBottom: 4,
+    marginBottom: 3,
   },
-  createCustomExerciseTitle: { color: Colors.text, fontSize: 20, fontWeight: "900" },
+  createCustomExerciseTitle: {
+    color: Colors.text,
+    fontSize: 20,
+    fontWeight: "900",
+  },
   createCustomExerciseSub: {
     color: Colors.textMuted,
     fontSize: 13,
@@ -3390,7 +4095,41 @@ const localStyles = StyleSheet.create({
     textTransform: "uppercase",
     marginTop: 4,
   },
-  filterBar: { paddingBottom: 12 },
+  filterBar: { paddingBottom: 8 },
+  resultSummaryRow: {
+    minHeight: 50,
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+    gap: 12,
+    paddingHorizontal: 20,
+    paddingBottom: 12,
+  },
+  resultSummaryTextBlock: { flex: 1, minWidth: 0 },
+  resultSummaryTitle: {
+    color: Colors.text,
+    fontSize: 15,
+    fontWeight: "900",
+  },
+  resultSummarySub: {
+    color: Colors.textMuted,
+    fontSize: 12,
+    fontWeight: "700",
+    marginTop: 3,
+  },
+  clearFilterPill: {
+    paddingHorizontal: 12,
+    paddingVertical: 8,
+    borderRadius: 999,
+    backgroundColor: Colors.card,
+    borderWidth: 1,
+    borderColor: Colors.border,
+  },
+  clearFilterText: {
+    color: Colors.textMuted,
+    fontSize: 12,
+    fontWeight: "900",
+  },
   filterChip: {
     paddingHorizontal: 18,
     paddingVertical: 10,
@@ -3404,46 +4143,89 @@ const localStyles = StyleSheet.create({
   filterChipText: { color: Colors.textMuted, fontSize: 14, fontWeight: "900" },
   filterChipTextActive: { color: Colors.background },
   exerciseCard: {
+    height: 94,
     flexDirection: "row",
     alignItems: "center",
     backgroundColor: Colors.card,
-    borderRadius: 24,
-    padding: 14,
-    marginBottom: 14,
+    borderRadius: 22,
+    paddingHorizontal: 14,
+    paddingVertical: 12,
+    marginBottom: 12,
     borderWidth: 1,
     borderColor: Colors.border,
   },
   exerciseImage: {
-    width: 64,
-    height: 64,
+    width: 56,
+    height: 56,
     borderRadius: 16,
     backgroundColor: Colors.text,
     marginRight: 14,
   },
   exerciseImageFallback: {
-    width: 64,
-    height: 64,
+    width: 56,
+    height: 56,
     borderRadius: 16,
     backgroundColor: Colors.border,
     alignItems: "center",
     justifyContent: "center",
     marginRight: 14,
   },
-  exerciseTextBlock: { flex: 1, minWidth: 0 },
+  exerciseContent: {
+    flex: 1,
+    minWidth: 0,
+    justifyContent: "center",
+  },
+  exerciseTextBlock: { minWidth: 0 },
   exerciseKicker: {
     color: Colors.accent,
-    fontSize: 12,
+    fontSize: 11,
     fontWeight: "900",
     letterSpacing: 0.8,
     textTransform: "uppercase",
     marginBottom: 4,
   },
-  exerciseTitle: { color: Colors.text, fontSize: 20, fontWeight: "900" },
+  exerciseTitleRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 8,
+    minWidth: 0,
+  },
+  exerciseTitle: {
+    color: Colors.text,
+    fontSize: 20,
+    fontWeight: "900",
+    minWidth: 0,
+  },
+  sourceBadge: {
+    paddingHorizontal: 8,
+    paddingVertical: 4,
+    borderRadius: 999,
+    backgroundColor: Colors.cardAlt,
+    borderWidth: 1,
+    borderColor: Colors.border,
+  },
+  sourceBadgeCustom: {
+    backgroundColor: "rgba(50, 215, 75, 0.1)",
+    borderColor: "rgba(50, 215, 75, 0.28)",
+  },
+  sourceBadgeText: {
+    color: Colors.textMuted,
+    fontSize: 10,
+    fontWeight: "900",
+  },
+  sourceBadgeTextCustom: { color: Colors.accent },
   exerciseBestText: {
     color: "#D1D1D6",
-    fontSize: 14,
+    fontSize: 12,
     fontWeight: "800",
     marginTop: 5,
+  },
+  exerciseTapHint: {
+    color: Colors.textSubtle,
+    fontSize: 12,
+    fontWeight: "800",
+    flex: 1,
+    minWidth: 0,
   },
   exerciseNoHistoryText: { color: Colors.textMuted },
   exerciseMetaText: {
@@ -3452,6 +4234,12 @@ const localStyles = StyleSheet.create({
     fontWeight: "800",
     marginTop: 3,
   },
+  exerciseBottomRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+    gap: 10,
+  },
   exerciseActionsRow: {
     flexDirection: "row",
     alignItems: "center",
@@ -3459,12 +4247,31 @@ const localStyles = StyleSheet.create({
     marginLeft: 8,
   },
   exerciseActionButton: {
-    minWidth: 44,
-    height: 44,
-    borderRadius: 22,
+    width: 42,
+    height: 42,
+    borderRadius: 21,
     alignItems: "center",
     justifyContent: "center",
+    backgroundColor: "transparent",
+    borderWidth: 0,
+    borderColor: "transparent",
     marginLeft: 10,
+  },
+  exerciseDetailsButton: {
+    minWidth: 82,
+    height: 40,
+    borderRadius: 999,
+    alignItems: "center",
+    justifyContent: "center",
+    backgroundColor: "rgba(50,215,75,0.14)",
+    borderWidth: 1,
+    borderColor: "rgba(50,215,75,0.32)",
+    paddingHorizontal: 14,
+  },
+  exerciseDetailsButtonText: {
+    color: Colors.accent,
+    fontSize: 13,
+    fontWeight: "900",
   },
   exerciseAddButton: {
     paddingHorizontal: 14,

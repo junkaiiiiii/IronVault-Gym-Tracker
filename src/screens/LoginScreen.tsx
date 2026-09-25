@@ -18,6 +18,9 @@ import * as Google from "expo-auth-session/providers/google";
 import * as AppleAuthentication from "expo-apple-authentication";
 import { Ionicons } from "@expo/vector-icons";
 import AsyncStorage from "@react-native-async-storage/async-storage";
+import LegalDocument from "../components/LegalDocument";
+import { LEGAL_DOCUMENTS } from "../constants/legal";
+import { recordLegalAcceptance } from "../utils/legalAcceptance";
 
 import { auth, db } from "../config/firebaseConfig";
 import {
@@ -42,6 +45,8 @@ import {
   getAdditionalUserInfo,
   OAuthProvider,
 } from "firebase/auth";
+
+const normalizeUsername = (value: any) => String(value || "").trim().toLowerCase();
 
 WebBrowser.maybeCompleteAuthSession();
 
@@ -75,15 +80,25 @@ export default function LoginScreen() {
       if (userSnap.exists()) {
         const data = userSnap.data();
 
-        let fetchedUsername = data.username;
+        let fetchedUsername = normalizeUsername(data.usernameLower || data.username);
         if (!fetchedUsername) {
           const q = query(collection(db, "usernames"), where("uid", "==", uid));
           const qSnap = await getDocs(q);
           if (!qSnap.empty) {
-            fetchedUsername = qSnap.docs[0].data().display_name;
+            const reservation = qSnap.docs[0];
+            const reservationData = reservation.data();
+            fetchedUsername = normalizeUsername(
+              reservationData.usernameLower ||
+                reservationData.username ||
+                reservationData.display_name ||
+                reservation.id,
+            );
             await setDoc(
               userRef,
-              { username: fetchedUsername },
+              {
+                username: fetchedUsername,
+                usernameLower: fetchedUsername,
+              },
               { merge: true },
             );
           }
@@ -111,6 +126,11 @@ export default function LoginScreen() {
             `@auto_check_enabled_${uid}`,
             data.autoCheckEnabled.toString(),
           );
+        if (data.rpeTrackingEnabled !== undefined)
+          await AsyncStorage.setItem(
+            `@rpe_tracking_enabled_${uid}`,
+            data.rpeTrackingEnabled.toString(),
+          );
         if (data.plateCalcEnabled !== undefined)
           await AsyncStorage.setItem(
             `@plate_calc_enabled_${uid}`,
@@ -122,17 +142,18 @@ export default function LoginScreen() {
         await setDoc(
           userRef,
           {
-            metric: "LBS",
+            metric: "KG",
             restTime: 90,
             restTimerEnabled: true,
             autoCheckEnabled: false,
+            rpeTrackingEnabled: false,
             plateCalcEnabled: true,
             createdAt: Date.now(),
           },
           { merge: true },
         );
 
-        await AsyncStorage.setItem(`@user_metric_${uid}`, "LBS");
+        await AsyncStorage.setItem(`@user_metric_${uid}`, "KG");
         await AsyncStorage.setItem(`@rest_time_${uid}`, "90");
       }
     } catch (error) {
@@ -160,6 +181,7 @@ export default function LoginScreen() {
           const uid = userCredential.user.uid;
 
           await syncUserSettingsFromCloud(uid);
+          await recordLegalAcceptance(uid);
 
           const additionalInfo = getAdditionalUserInfo(userCredential);
           if (!additionalInfo?.isNewUser) {
@@ -260,6 +282,7 @@ export default function LoginScreen() {
         }
 
         await syncUserSettingsFromCloud(user.uid);
+        await recordLegalAcceptance(user.uid);
 
         await AsyncStorage.setItem(`@has_completed_setup_${user.uid}`, "true");
         await AsyncStorage.setItem(`@has_completed_setup`, "true");
@@ -271,6 +294,7 @@ export default function LoginScreen() {
         );
         const user = userCredential.user;
 
+        await recordLegalAcceptance(user.uid);
         await sendEmailVerification(user);
 
         Alert.alert(
@@ -343,6 +367,7 @@ export default function LoginScreen() {
         const uid = userCredential.user.uid;
 
         await syncUserSettingsFromCloud(uid);
+        await recordLegalAcceptance(uid);
 
         const additionalInfo = getAdditionalUserInfo(userCredential);
         if (!additionalInfo?.isNewUser) {
@@ -406,57 +431,19 @@ export default function LoginScreen() {
           style={[styles.modalContainer, { backgroundColor: theme.modalBg }]}
         >
           <View style={styles.modalHeader}>
-            <Text style={styles.modalTitle}>Terms of Service</Text>
+            <Text style={styles.modalTitle}>
+              {LEGAL_DOCUMENTS.terms.title}
+            </Text>
             <TouchableOpacity onPress={() => setIsTermsVisible(false)}>
               <Text style={styles.modalCloseText}>Done</Text>
             </TouchableOpacity>
           </View>
           <ScrollView contentContainerStyle={styles.modalScrollContent}>
-            <Text style={styles.legalText}>
-              <Text style={styles.legalBold}>Last Updated: May 2026</Text>
-              {"\n\n"}
-              <Text style={styles.legalBold}>1. Acceptance of Terms</Text>
-              {"\n"}
-              By creating an account or using IronVault, you agree to these
-              Terms of Service and the Privacy Policy.{"\n\n"}
-              <Text style={styles.legalBold}>2. Fitness and Medical Disclaimer</Text>
-              {"\n"}
-              IronVault is a workout logging and training organisation tool. It
-              does not provide medical advice, diagnosis, treatment, coaching,
-              or emergency assistance. Always consult a qualified healthcare or
-              fitness professional before beginning or changing an exercise
-              program. Weightlifting and physical exercise involve risk, and you
-              are responsible for training safely, using proper equipment, and
-              stopping if you feel pain, dizziness, or unsafe symptoms.{"\n\n"}
-              <Text style={styles.legalBold}>3. User Responsibility</Text>
-              {"\n"}
-              You are responsible for the workouts, exercises, weights, notes,
-              custom exercises, gyms, machine brands, templates, and other
-              information you create or enter in IronVault. You agree not to use
-              the app to abuse, disrupt, reverse engineer, or attempt to breach
-              any service, account, or database.{"\n\n"}
-              <Text style={styles.legalBold}>4. Sync, Backup, and Data Loss</Text>
-              {"\n"}
-              IronVault provides cloud sync and export/import tools to help keep
-              your data available. You are encouraged to keep backups. While we
-              work to maintain reliability, no sync or storage system can be
-              guaranteed to be error-free.{"\n\n"}
-              <Text style={styles.legalBold}>5. Account Deletion</Text>
-              {"\n"}
-              You may request or initiate deletion of your account and
-              associated app data from within the app where supported. Some
-              deletion or backup operations may take time to complete.{"\n\n"}
-              <Text style={styles.legalBold}>6. Limitation of Liability</Text>
-              {"\n"}
-              To the maximum extent permitted by law, IronVault and its
-              creator(s) are not liable for direct, indirect, incidental, or
-              consequential damages, including physical injury, lost progress,
-              or data loss, resulting from use of the app.{"\n\n"}
-              <Text style={styles.legalBold}>7. Changes to Terms</Text>
-              {"\n"}
-              These terms may be updated as IronVault changes. Continued use of
-              the app after updates means you accept the revised terms.
-            </Text>
+            <LegalDocument
+              type="terms"
+              textStyle={styles.legalText}
+              headingStyle={styles.legalBold}
+            />
           </ScrollView>
         </View>
       </Modal>
@@ -470,72 +457,19 @@ export default function LoginScreen() {
           style={[styles.modalContainer, { backgroundColor: theme.modalBg }]}
         >
           <View style={styles.modalHeader}>
-            <Text style={styles.modalTitle}>Privacy Policy</Text>
+            <Text style={styles.modalTitle}>
+              {LEGAL_DOCUMENTS.privacy.title}
+            </Text>
             <TouchableOpacity onPress={() => setIsPrivacyVisible(false)}>
               <Text style={styles.modalCloseText}>Done</Text>
             </TouchableOpacity>
           </View>
           <ScrollView contentContainerStyle={styles.modalScrollContent}>
-            <Text style={styles.legalText}>
-              <Text style={styles.legalBold}>Last Updated: May 2026</Text>
-              {"\n\n"}
-              <Text style={styles.legalBold}>1. Information We Collect</Text>
-              {"\n"}
-              IronVault collects the information needed to provide workout
-              tracking, app personalisation, sync, and backup features:
-              {"\n"}• Account information: email address, authentication
-              identifiers, and username/display name.
-              {"\n"}• Workout and fitness data: workouts, exercises, sets,
-              reps, weights, duration, volume, workout history, records, and
-              progress/statistics generated from your logs.
-              {"\n"}• Training organisation data: templates, folders, split
-              days, rest days, favorite exercises, recent exercises, and custom
-              exercises.
-              {"\n"}• Gym and equipment data: gym names, machine brands,
-              machine brand defaults, exercise variants, and gym-specific
-              history filters.
-              {"\n"}• App preferences: KG/LBS, default rest timer, auto-check
-              sets, plate calculator settings, setup/onboarding preferences,
-              and sync/backup settings.{"\n\n"}
-              <Text style={styles.legalBold}>2. How We Use Information</Text>
-              {"\n"}
-              Your information is used to create your account, save and sync
-              workouts, personalise the Home screen, manage templates and
-              exercise libraries, calculate statistics, filter history, support
-              backup/import/export, and maintain app reliability. We do not sell
-              your personal information or workout data to third-party data
-              brokers.{"\n\n"}
-              <Text style={styles.legalBold}>3. Third-Party Services</Text>
-              {"\n"}
-              IronVault uses Google Firebase for authentication, database
-              hosting, and cloud sync. Email/password and social sign-in data
-              are handled through Firebase authentication services. IronVault
-              may also include open-source exercise data provided under public
-              or permissive licences.{"\n\n"}
-              <Text style={styles.legalBold}>4. Sync, Export, and Import</Text>
-              {"\n"}
-              Sync and backup features may store or restore workouts,
-              templates, folders, exercises, favorites, gyms, machine brands,
-              and settings. Exported backup files are created for your own use;
-              you are responsible for storing those files safely.{"\n\n"}
-              <Text style={styles.legalBold}>5. Your Rights and Choices</Text>
-              {"\n"}
-              You can manage many app settings inside IronVault. You may export
-              data, import backups, sign out, or request/initiate account and
-              data deletion where supported. Deleting your account is intended
-              to remove associated app data from IronVault systems, subject to
-              technical, legal, and backup limitations.{"\n\n"}
-              <Text style={styles.legalBold}>6. Data Security</Text>
-              {"\n"}
-              We use Firebase and reasonable technical safeguards to protect
-              data, but no internet-connected service can guarantee absolute
-              security.{"\n\n"}
-              <Text style={styles.legalBold}>7. Contact</Text>
-              {"\n"}
-              For privacy, support, or account deletion questions, contact the
-              app support address listed on IronVault’s App Store or Google Play
-              listing.
-            </Text>
+            <LegalDocument
+              type="privacy"
+              textStyle={styles.legalText}
+              headingStyle={styles.legalBold}
+            />
           </ScrollView>
         </View>
       </Modal>
@@ -554,9 +488,6 @@ export default function LoginScreen() {
             </Text>
             <Text style={[styles.subText, { color: theme.textSecondary }]}>
               {isLoginMode ? "Welcome back." : "Start your journey."}
-            </Text>
-            <Text style={styles.disclaimerText}>
-              Workout logging only. IronVault does not provide medical advice.
             </Text>
           </View>
 
@@ -756,6 +687,10 @@ export default function LoginScreen() {
                 </Text>
               </Text>
             </TouchableOpacity>
+
+            <Text style={styles.disclaimerText}>
+              Workout tracking only. Not medical advice.
+            </Text>
           </View>
         </ScrollView>
       </KeyboardAvoidingView>
@@ -781,10 +716,11 @@ const styles = StyleSheet.create({
   subText: { fontSize: 18, fontWeight: "500" },
   disclaimerText: {
     color: "#8E8E93",
-    fontSize: 13,
-    lineHeight: 18,
-    fontWeight: "600",
-    marginTop: 12,
+    fontSize: 11,
+    lineHeight: 16,
+    fontWeight: "500",
+    marginTop: 18,
+    textAlign: "center",
   },
   inputContainer: { marginBottom: 20 },
   input: { fontSize: 18, paddingVertical: 12, borderBottomWidth: 1 },

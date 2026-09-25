@@ -65,7 +65,7 @@ const guideTopics: GuideTopic[] = [
     accent: Colors.green,
     readTime: "4 min",
     summary:
-      "Home tells you what to do next: resume an active workout, start today’s split session, see completed-today status, review this week, and check training momentum.",
+      "Home lets you resume training, start a free workout, follow today’s split, view completed sessions, and check weekly momentum.",
     sections: [
       {
         title: "What Home is for",
@@ -79,8 +79,9 @@ const guideTopics: GuideTopic[] = [
         cards: [
           ["Workout in Progress", "If a live or paused workout exists, Home prioritizes Resume Workout and hides new-start actions."],
           ["Today’s Training", "If your active split has a scheduled template today, Home shows the workout and lets you start it."],
-          ["Rest Day", "If your split day is rest, Home keeps Start Empty Workout available without pretending there is a scheduled session."],
-          ["Completed Today", "After finishing today’s split workout, Home shows View History and Start Extra Workout."],
+          ["Free Training", "Start Workout is always the simple path for sessions that do not need a saved plan."],
+          ["Rest Day", "If your split day is rest, Home still keeps Start Workout available for extra casual sessions."],
+          ["Completed Today", "After finishing today’s split workout, Home shows View History and Start Another Workout."],
         ],
       },
       {
@@ -106,7 +107,7 @@ const guideTopics: GuideTopic[] = [
       {
         title: "Starting workouts",
         bullets: [
-          "Home starts today’s scheduled split workout or an empty workout.",
+          "Home can start today’s scheduled split workout, or you can tap Start Workout to log freely with no plan.",
           "Templates starts a saved workout structure.",
           "Search/Add Exercise uses the unified library with All, Favorites, Recent, and Custom views.",
           "A gym is required before starting so history, machine brands, and filters stay accurate.",
@@ -116,14 +117,14 @@ const guideTopics: GuideTopic[] = [
         title: "Logging sets",
         body: [
           "Enter weight and reps, then complete the set. Completed working sets are used for history, volume, exercise stats, PRs, and charts.",
-          "Warm-up sets are excluded from working-set totals and do not trigger the rest timer.",
+          "Warm-up sets are excluded from working-set totals. You can enable a separate warm-up rest timer from Workout > More.",
           "Auto Check Sets can mark sets complete automatically after valid weight and reps are entered.",
         ],
       },
       {
         title: "Workout tools",
         cards: [
-          ["Rest Timer", "When enabled, the timer starts after completed working sets, including auto-completed sets."],
+          ["Rest Timer", "When enabled, the timer starts after completed working sets. More also lets you enable a shorter warm-up rest timer."],
           ["Exercise Remarks", "Add notes to a movement for that session. Remarks clear when replacing an exercise."],
           ["View History", "Open exercise-specific history with gym and machine brand filters without leaving the workout."],
           ["Replace Exercise", "Swap a movement while keeping the set rows. This is useful when equipment is taken."],
@@ -154,13 +155,13 @@ const guideTopics: GuideTopic[] = [
     accent: Colors.green,
     readTime: "7 min",
     summary:
-      "Templates store repeatable workouts. Folders can become training splits with D1–D9 cycles, rest days, and Home suggestions.",
+      "Templates are optional repeatable workouts. Folders can become training splits with D1–D9 cycles, rest days, and Home suggestions.",
     sections: [
       {
         title: "Core idea",
         body: [
-          "Create templates for workouts you repeat often. Add templates into folders to organize them into a training block or split.",
-          "Set a folder as your active split so Home knows what to suggest each day.",
+          "Templates are optional. Create them for workouts you repeat often, not for every casual session.",
+          "Add templates into folders to organize them into a training block or split, then set a folder as your active split so Home knows what to suggest each day.",
         ],
       },
       {
@@ -183,9 +184,10 @@ const guideTopics: GuideTopic[] = [
       {
         title: "When a template workout changes",
         table: [
-          ["Keep Session Only", "Save the workout history but leave the original template unchanged."],
-          ["Save as New Template", "Create a new template from the changed workout after naming it."],
-          ["Update Original", "Overwrite the original template structure with the changed workout."],
+          ["Don't Update", "Save the workout history and leave that template exercise unchanged."],
+          ["Gym Swap", "Use a swapped exercise only for the current gym when more than one gym is saved."],
+          ["Add / Remove / Update", "Apply that specific exercise change to the template, then confirm all choices together."],
+          ["Other Gym Swaps", "Updating a base exercise keeps swaps saved for other gyms."],
         ],
       },
     ],
@@ -350,7 +352,7 @@ const guideTopics: GuideTopic[] = [
         cards: [
           ["Training Summary", "Workouts, sets, total volume, and training time."],
           ["Progress Trend", "Charted volume and performance over time."],
-          ["Comparison", "Changes compared with the previous matching period."],
+          ["Comparison", "Tap periods and compare against another week or month using the same elapsed window where needed."],
         ],
       },
       {
@@ -473,7 +475,7 @@ const guideTopics: GuideTopic[] = [
       {
         title: "Recommended habits",
         bullets: [
-          "Create a primary split so Home can show Today’s Training and Training Momentum.",
+          "Start with free workouts if you are new. Create a primary split only when you already follow a repeatable routine.",
           "Favorite frequently used exercises to add them faster.",
           "Create custom exercises only when a movement is not already in the library.",
           "Use gym and machine brand filters when comparing machine-based lifts.",
@@ -621,42 +623,31 @@ function GuideHome({ onOpenTopic }: { onOpenTopic: (id: string) => void }) {
             color={Colors.green}
           />
         </View>
-        <Text style={styles.heroTitle}>Learn IronVault properly.</Text>
+        <Text style={styles.heroTitle}>Start simple. Build structure later.</Text>
         <Text style={styles.heroText}>
-          A full guide for setup, workouts, splits, supersets, stats, PRs,
-          machine brands, and backups.
+          Use IronVault casually first: add your gym, start a workout, log sets,
+          and save repeatable sessions as templates when you need them.
         </Text>
         <View style={styles.heroMetaRow}>
-          <Pill label="10 topics" />
-          <Pill label="New user friendly" />
-          <Pill label="Full manual" />
+          <Pill label={`${guideTopics.length} topics`} />
+          <Pill label="Quick start" />
+          <Pill label="Templates optional" />
         </View>
       </View>
 
       <View style={styles.quickPathCard}>
         <View style={styles.quickPathHeader}>
-          <Text style={styles.sectionEyebrow}>Recommended first setup</Text>
+          <Text style={styles.sectionEyebrow}>Quick start workflow</Text>
           <Text style={styles.quickPathHint}>Start here</Text>
         </View>
 
         {[
-          [
-            "Settings",
-            "Choose units, rest timer, gyms, and default machine brands.",
-          ],
-          ["Templates", "Create reusable workouts for your routine."],
-          [
-            "Split Folder",
-            "Organise templates into D1–D9 training days and rest days.",
-          ],
-          [
-            "Active Split",
-            "Choose which split appears on Home as Today’s Training.",
-          ],
-          [
-            "Sync",
-            "Back up workouts, templates, folders, exercises, gyms, and settings.",
-          ],
+          ["Add your gym", "A gym is required so workouts, machine brands, and history stay organised."],
+          ["Start Workout", "Use Home → Start Workout. You do not need a template or split first."],
+          ["Add exercises", "Search your library, favorites, recent movements, or custom exercises."],
+          ["Log working sets", "Enter weight and reps, then complete each working set as you train."],
+          ["Finish workout", "Review the summary, save the session, and edit the end time later if needed."],
+          ["Save as template", "Only save repeatable workouts as templates. Casual one-off sessions can stay as history."],
         ].map(([label, description], index, arr) => (
           <View key={label}>
             <View style={styles.setupListRow}>
@@ -671,6 +662,16 @@ function GuideHome({ onOpenTopic }: { onOpenTopic: (id: string) => void }) {
             {index < arr.length - 1 && <View style={styles.setupListDivider} />}
           </View>
         ))}
+      </View>
+
+      <View style={styles.guideCalloutCard}>
+        <Ionicons name="information-circle-outline" size={20} color={Colors.green} />
+        <View style={styles.guideCalloutTextBlock}>
+          <Text style={styles.guideCalloutTitle}>Templates are optional.</Text>
+          <Text style={styles.guideCalloutText}>
+            Start freely first. Create templates, splits, supersets, and gym-specific swaps only when you repeat the same training often.
+          </Text>
+        </View>
       </View>
 
       <Text style={styles.sectionHeader}>Guide topics</Text>
@@ -1076,7 +1077,33 @@ const styles = StyleSheet.create({
     borderWidth: 1,
     borderColor: Colors.border,
     padding: 16,
+    marginBottom: 14,
+  },
+  guideCalloutCard: {
+    flexDirection: "row",
+    alignItems: "flex-start",
+    gap: 12,
+    backgroundColor: Colors.greenSoft,
+    borderRadius: 22,
+    borderWidth: 1,
+    borderColor: Colors.greenBorder,
+    padding: 16,
     marginBottom: 24,
+  },
+  guideCalloutTextBlock: {
+    flex: 1,
+  },
+  guideCalloutTitle: {
+    color: Colors.text,
+    fontSize: 15,
+    fontWeight: "900",
+    marginBottom: 4,
+  },
+  guideCalloutText: {
+    color: Colors.muted,
+    fontSize: 13,
+    lineHeight: 19,
+    fontWeight: "700",
   },
   sectionEyebrow: {
     color: Colors.muted,

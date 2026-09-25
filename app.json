@@ -3,7 +3,7 @@
     "name": "IronVault",
     "slug": "ironvault",
     "scheme": "com.on333.ironvault",
-    "version": "1.0.0",
+    "version": "1.0.2",
     "orientation": "portrait",
     "icon": "./assets/icon.png",
     "userInterfaceStyle": "dark",
@@ -14,27 +14,71 @@
       "backgroundColor": "#000000"
     },
     "ios": {
-      "supportsTablet": true,
+      "supportsTablet": false,
       "bundleIdentifier": "com.on333.ironvault",
-      "buildNumber": "20",
+      "buildNumber": "47",
+      "usesAppleSignIn": true,
       "infoPlist": {
         "CFBundleURLTypes": [
           {
             "CFBundleURLSchemes": [
               "com.googleusercontent.apps.1077182608968-bsuekmvophah31fvpmoah14m8n360ho2"
             ]
-          },
-          {
-            "CFBundleURLSchemes": [
-              "com.googleusercontent.apps.1077182608968-bsuekmvophah31fvpmoah14m8n360ho2"
-            ]
           }
         ],
-        "ITSAppUsesNonExemptEncryption": false
+        "CFBundleDocumentTypes": [
+          {
+            "CFBundleTypeName": "IronVault Template",
+            "CFBundleTypeRole": "Editor",
+            "LSHandlerRank": "Owner",
+            "LSItemContentTypes": ["com.on333.ironvault.template"]
+          }
+        ],
+        "ITSAppUsesNonExemptEncryption": false,
+        "LSSupportsOpeningDocumentsInPlace": false,
+        "NSPhotoLibraryAddUsageDescription": "Allow IronVault to save workout summary images to your photo library.",
+        "NSPhotoLibraryUsageDescription": "Allow IronVault to save workout summary images and backups you choose.",
+        "UTExportedTypeDeclarations": [
+          {
+            "UTTypeIdentifier": "com.on333.ironvault.template",
+            "UTTypeDescription": "IronVault Template",
+            "UTTypeConformsTo": ["public.json", "public.data"],
+            "UTTypeTagSpecification": {
+              "public.filename-extension": ["ironvault-template"],
+              "public.mime-type": ["application/vnd.ironvault.template"]
+            }
+          }
+        ]
       }
     },
     "android": {
       "package": "com.on333.ironvault",
+      "intentFilters": [
+        {
+          "action": "VIEW",
+          "category": ["DEFAULT", "BROWSABLE"],
+          "data": [
+            {
+              "scheme": "file",
+              "mimeType": "application/vnd.ironvault.template"
+            },
+            {
+              "scheme": "content",
+              "mimeType": "application/vnd.ironvault.template"
+            },
+            {
+              "scheme": "file",
+              "mimeType": "*/*",
+              "pathSuffix": ".ironvault-template"
+            },
+            {
+              "scheme": "content",
+              "mimeType": "*/*",
+              "pathSuffix": ".ironvault-template"
+            }
+          ]
+        }
+      ],
       "adaptiveIcon": {
         "foregroundImage": "./assets/adaptive-icon.png",
         "backgroundColor": "#000000"
@@ -47,7 +91,16 @@
     },
     "plugins": [
       "expo-web-browser",
-      "expo-font"
+      "expo-font",
+      "expo-apple-authentication",
+      [
+        "expo-media-library",
+        {
+          "photosPermission": "Allow IronVault to access workout summary images you choose.",
+          "savePhotosPermission": "Allow IronVault to save workout summary images to your photo library.",
+          "isAccessMediaLocationEnabled": false
+        }
+      ]
     ],
     "extra": {
       "eas": {

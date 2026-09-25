@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState } from "react";
+import React, { useEffect, useMemo, useRef, useState } from "react";
 import {
   View,
   Text,
@@ -19,24 +19,39 @@ import * as Haptics from "expo-haptics";
 import { Ionicons } from "@expo/vector-icons";
 import { auth } from "../config/firebaseConfig";
 import { styles } from "../constants/globalStyles";
-import { Colors, Spacing, Radius, Layout, Typography } from "../theme";
+import { Colors } from "../theme";
 import { INITIAL_EXERCISES, MUSCLE_GROUPS } from "../constants/data";
 import {
   prepareSections,
   fetchGitHubExercises,
   normalizeExerciseImageUrl,
   getExerciseVariationOptions,
+  calculate1RM,
+  isMachineBrandApplicable,
+  normalizeExerciseMuscleGroup,
+  getActiveBuiltInExercises,
+  filterAndRankExercisesBySearch,
+  getExerciseAttachmentForSave,
+  getExerciseAttachmentOptions,
+  normalizeExerciseForAttachmentStorage,
 } from "../utils/helpers";
 import {
+  clearConfigValuesDeletedLocally,
+  markConfigValuesDeletedLocally,
+  safeJsonParse,
   syncFavoriteExercisesToCloud,
   syncPersonalExercisesToCloud,
 } from "../utils/firebaseSync";
 import CustomAlert from "../components/CustomAlert";
+import { LIMITS, cleanLimitedText, limitText } from "../constants/limits";
+import BlockingOverlay from "../components/BlockingOverlay";
 
 export default function SearchScreen({ navigation, route }: any) {
   const [globalExercises, setGlobalExercises] = useState<any[]>([]);
   const [personalExercises, setPersonalExercises] = useState<any[]>([]);
-  const [favoriteExerciseNames, setFavoriteExerciseNames] = useState<string[]>([]);
+  const [favoriteExerciseNames, setFavoriteExerciseNames] = useState<string[]>(
+    [],
+  );
   const [history, setHistory] = useState<any[]>([]);
   const [libraryView, setLibraryView] = useState<
     "All" | "Favorites" | "Recent" | "Custom"
@@ -52,76 +67,165 @@ export default function SearchScreen({ navigation, route }: any) {
   const [newReminder, setNewReminder] = useState("");
   const [newIsUnilateral, setNewIsUnilateral] = useState(false);
   const [newSupportsVariants, setNewSupportsVariants] = useState(false);
+  const [editingCustomExercise, setEditingCustomExercise] = useState<any>(null);
 
   const [searchAlert, setSearchAlert] = useState({
     visible: false,
     exercise: null as any,
   });
+  const [infoAlert, setInfoAlert] = useState({
+    visible: false,
+    title: "",
+    message: "",
+  });
+  const [selectedDetailExercise, setSelectedDetailExercise] =
+    useState<any>(null);
+  const [isDetailVisible, setIsDetailVisible] = useState(false);
+  const [multiSelectedExercises, setMultiSelectedExercises] = useState<any[]>(
+    [],
+  );
+  const [searchBlockingMessage, setSearchBlockingMessage] = useState("");
+  const searchBlockingRef = useRef(false);
+
+  const isSearchBlocking = searchBlockingMessage.length > 0;
+
+  const runSearchBlockingAction = async (
+    message: string,
+    action: () => Promise<void> | void,
+  ) => {
+    if (searchBlockingRef.current) return;
+
+    searchBlockingRef.current = true;
+    setSearchBlockingMessage(message);
+    try {
+      await action();
+    } catch (error) {
+      console.error("Search action failed:", error);
+    } finally {
+      searchBlockingRef.current = false;
+      setSearchBlockingMessage("");
+    }
+  };
 
   const uid = auth.currentUser?.uid;
   const existingExercises: string[] = route.params?.existingExercises || [];
+  const isReplaceMode = route.params?.mode === "replace";
+  const isGymSwapMode = route.params?.mode === "gymSwap";
+  const allowMultiSelect =
+    route.params?.multiSelect === true && !isReplaceMode && !isGymSwapMode;
+  const isExercisePickerFlow =
+    !!route.params?.onSelect ||
+    !!route.params?.onSelectMany ||
+    allowMultiSelect ||
+    isReplaceMode ||
+    isGymSwapMode;
+  const selectionContext =
+    route.params?.selectionContext ||
+    (isExercisePickerFlow ? "workout" : "library");
+  const maxSelectable = Math.max(
+    0,
+    Number(
+      route.params?.maxSelectable ??
+        Math.max(0, LIMITS.exercisesPerWorkout - existingExercises.length),
+    ),
+  );
+  const primaryActionLabel = isGymSwapMode
+    ? "Use"
+    : isReplaceMode
+      ? "Replace"
+      : "Add";
+  const shouldResetFilterForPicker = isExercisePickerFlow;
+  const shouldPersistSearchFilter = !shouldResetFilterForPicker;
 
   useEffect(() => {
     const loadData = async () => {
       if (!uid) return;
       setIsFetchingAPI(true);
 
+      let loadedGlobalExercises: any[] = [];
       const cachedGlobal = await AsyncStorage.getItem(
         "@github_global_exercises",
       );
       if (cachedGlobal) {
-        setGlobalExercises(JSON.parse(cachedGlobal));
+        const parsedCachedGlobal = safeJsonParse(cachedGlobal, []);
+        loadedGlobalExercises = Array.isArray(parsedCachedGlobal)
+          ? parsedCachedGlobal
+          : [];
+        setGlobalExercises(loadedGlobalExercises);
         setIsFetchingAPI(false);
       }
 
       try {
         const fetchedData = await fetchGitHubExercises();
         if (fetchedData && fetchedData.length > 0) {
+          loadedGlobalExercises = fetchedData;
           setGlobalExercises(fetchedData);
           await AsyncStorage.setItem(
             "@github_global_exercises",
             JSON.stringify(fetchedData),
           );
         } else if (!cachedGlobal) {
+          loadedGlobalExercises = INITIAL_EXERCISES;
           setGlobalExercises(INITIAL_EXERCISES);
         }
       } catch (error) {
         console.log("Silent background sync failed, relying on cache.");
-        if (!cachedGlobal) setGlobalExercises(INITIAL_EXERCISES);
+        if (!cachedGlobal) {
+          loadedGlobalExercises = INITIAL_EXERCISES;
+          setGlobalExercises(INITIAL_EXERCISES);
+        }
       } finally {
         setIsFetchingAPI(false);
       }
 
       const saved = await AsyncStorage.getItem(`@user_exercises_${uid}`);
       if (saved) {
-        const parsedAll = JSON.parse(saved);
-        setPersonalExercises(
-          parsedAll.filter((e: any) => e.is_custom === true),
+        const parsedAll = safeJsonParse(saved, []);
+        const cleanedCustomExercises = cleanStoredCustomExercises(
+          parsedAll,
+          loadedGlobalExercises,
         );
+        setPersonalExercises(cleanedCustomExercises);
+        if (
+          Array.isArray(parsedAll) &&
+          JSON.stringify(parsedAll) !== JSON.stringify(cleanedCustomExercises)
+        ) {
+          await AsyncStorage.setItem(
+            `@user_exercises_${uid}`,
+            JSON.stringify(cleanedCustomExercises),
+          );
+          syncPersonalExercisesToCloud(cleanedCustomExercises).catch((error) =>
+            console.log("Cleaned custom exercises cloud sync delayed:", error),
+          );
+        }
+      } else {
+        setPersonalExercises([]);
       }
 
       const savedFavorites = await AsyncStorage.getItem(
         `@favorite_exercises_${uid}`,
       );
-      const savedHistory = await AsyncStorage.getItem(`@workout_history_${uid}`);
+      const savedHistory = await AsyncStorage.getItem(
+        `@workout_history_${uid}`,
+      );
       const savedFilter = await AsyncStorage.getItem(
         `@last_search_filter_${uid}`,
       );
       if (savedFavorites) {
-        const parsedFavorites = JSON.parse(savedFavorites);
+        const parsedFavorites = safeJsonParse(savedFavorites, []);
         setFavoriteExerciseNames(
           Array.isArray(parsedFavorites) ? parsedFavorites.map(String) : [],
         );
       }
       if (savedHistory) {
-        const parsedHistory = JSON.parse(savedHistory);
+        const parsedHistory = safeJsonParse(savedHistory, []);
         setHistory(Array.isArray(parsedHistory) ? parsedHistory : []);
       }
-      if (savedFilter) setActiveFilter(savedFilter);
+      setActiveFilter(shouldResetFilterForPicker ? "All" : savedFilter || "All");
     };
 
     loadData();
-  }, [uid]);
+  }, [shouldResetFilterForPicker, uid]);
 
   const normalizeExerciseName = (value: any) =>
     String(value || "")
@@ -137,31 +241,267 @@ export default function SearchScreen({ navigation, route }: any) {
 
   const getExerciseKey = (exercise: any) => String(exercise?.name || "").trim();
 
-  const getExerciseMatchKey = (exercise: any) => normalizeExerciseName(exercise?.name);
+  const getExerciseMatchKey = (exercise: any) =>
+    normalizeExerciseName(exercise?.name);
 
-  const isExerciseFavorite = (exercise: any) =>
-    favoriteExerciseNames.includes(getExerciseKey(exercise));
+  const normalizeExistingExerciseName = (value: any) =>
+    normalizeExerciseName(value);
+
+  const isExistingExercise = (exercise: any) => {
+    const key = getExerciseMatchKey(exercise);
+    return existingExercises.some(
+      (name) => normalizeExistingExerciseName(name) === key,
+    );
+  };
+
+  const isMultiSelectedExercise = (exercise: any) => {
+    const key = getExerciseMatchKey(exercise);
+    return multiSelectedExercises.some(
+      (selectedExercise) => getExerciseMatchKey(selectedExercise) === key,
+    );
+  };
+
+  const getNormalizedSelectedExercise = (exercise: any) => ({
+    ...exercise,
+    muscle: normalizeExerciseMuscleGroup(exercise?.muscle),
+  });
+
+  const getExerciseIdentityKeys = (exercise: any) => {
+    const keys = new Set<string>();
+    const id = String(exercise?.id || "").trim();
+    const name = normalizeExerciseName(exercise?.name);
+    const rawImage = String(exercise?.image || "").trim();
+    const image = normalizeExerciseImageUrl(rawImage).toLowerCase();
+    if (id) keys.add(`id:${id}`);
+    if (name) keys.add(`name:${name}`);
+    if (image) keys.add(`image:${image}`);
+    return Array.from(keys);
+  };
+
+  const LEGACY_IMPORTED_CUSTOM_NAMES = new Set([
+    "cable hammer curls - rope attachment",
+    "calf raise",
+    "lying leg curls",
+    "lying leg curl",
+    "machine jm press",
+    "quad extension",
+    "single arm reverse pec deck",
+    "single arm rope hammer curl",
+    "squat",
+    "standing biceps cable curl",
+    "straight bar cable crunches",
+    "straight bar forearm curl",
+    "tricep overhead extension",
+    "tricep press machine",
+    "triceps overhead extension with rope",
+    "triceps pushdown",
+  ]);
+
+  const looksLikeBuiltInExercise = (exercise: any) => {
+    const id = String(exercise?.id || "")
+      .trim()
+      .toLowerCase();
+    const name = getExerciseMatchKey(exercise);
+    const image = normalizeExerciseImageUrl(
+      exercise?.image || "",
+    ).toLowerCase();
+
+    return (
+      LEGACY_IMPORTED_CUSTOM_NAMES.has(name) ||
+      /^ex-/.test(id) ||
+      id.startsWith("gh_") ||
+      image.includes("githubusercontent.com/junkaiiiiii/ironvault-exercises") ||
+      image.includes("/ironvault-exercises/main/images/") ||
+      image.includes("githubusercontent.com/yuhonas/free-exercise-db") ||
+      image.includes("/yuhonas/free-exercise-db/") ||
+      image.includes("free-exercise-db")
+    );
+  };
+
+  const createCustomExerciseRecord = (exercise: any) => {
+    const normalizedExercise = normalizeExerciseForAttachmentStorage(exercise);
+    const attachmentOptions = getExerciseAttachmentOptions(normalizedExercise);
+    return {
+      ...normalizedExercise,
+      name: cleanLimitedText(
+        normalizedExercise?.name || "Custom Exercise",
+        LIMITS.nameChars,
+      ),
+      reminder: limitText(
+        normalizedExercise?.reminder || "",
+        LIMITS.cueChars,
+      ),
+      muscle: normalizeExerciseMuscleGroup(normalizedExercise?.muscle),
+      attachment: getExerciseAttachmentForSave(normalizedExercise),
+      attachmentOptions:
+        attachmentOptions.length > 0 ? attachmentOptions : undefined,
+      supportsAttachments: attachmentOptions.length > 0 ? true : undefined,
+      id:
+        normalizedExercise?.id && !looksLikeBuiltInExercise(normalizedExercise)
+          ? normalizedExercise.id
+          : `custom_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+      is_custom: true,
+      source: "custom",
+      createdByUser: true,
+      createdAt: normalizedExercise?.createdAt || Date.now(),
+    };
+  };
+
+  const looksLikeAppCreatedCustomExercise = (exercise: any) => {
+    if (!exercise || exercise.is_custom !== true) return false;
+
+    const name = getExerciseMatchKey(exercise);
+    if (!name || LEGACY_IMPORTED_CUSTOM_NAMES.has(name)) return false;
+
+    const image = normalizeExerciseImageUrl(exercise?.image || "").trim();
+    const equipment = String(exercise?.equipment || "").trim();
+    const hasLegacyLibraryFields =
+      !!image ||
+      !!equipment ||
+      exercise?.instructions !== undefined ||
+      exercise?.description !== undefined ||
+      exercise?.level !== undefined ||
+      exercise?.force !== undefined ||
+      exercise?.mechanic !== undefined ||
+      exercise?.category !== undefined ||
+      exercise?.secondaryMuscles !== undefined;
+
+    if (hasLegacyLibraryFields) return false;
+
+    const id = String(exercise?.id || "")
+      .trim()
+      .toLowerCase();
+    const hasCustomIdentity =
+      id.startsWith("custom_") ||
+      id.startsWith("iv_custom_") ||
+      exercise.createdByUser === true;
+
+    const hasCustomFormFields =
+      exercise?.reminder !== undefined ||
+      exercise?.is_unilateral !== undefined ||
+      exercise?.supportsVariants !== undefined ||
+      exercise?.variationOptions !== undefined;
+
+    return hasCustomIdentity && hasCustomFormFields;
+  };
+
+  const cleanStoredCustomExercises = (
+    exercises: any[],
+    referenceExercises: any[] = globalExercises,
+  ) => {
+    const references = [...INITIAL_EXERCISES, ...referenceExercises];
+    const builtInIdentityKeys = new Set<string>();
+    const builtInNameKeys = new Set<string>();
+
+    references.forEach((exercise) => {
+      getExerciseIdentityKeys(exercise).forEach((identityKey) =>
+        builtInIdentityKeys.add(identityKey),
+      );
+      const nameKey = getExerciseMatchKey(exercise);
+      if (nameKey) builtInNameKeys.add(nameKey);
+    });
+
+    const customByName = new Map<string, any>();
+
+    (Array.isArray(exercises) ? exercises : []).forEach((exercise) => {
+      if (!exercise || exercise.is_custom !== true) return;
+
+      const nameKey = getExerciseMatchKey(exercise);
+      if (!nameKey) return;
+
+      const matchesBuiltInByIdentity = getExerciseIdentityKeys(exercise).some(
+        (identityKey) => builtInIdentityKeys.has(identityKey),
+      );
+      const matchesBuiltInByName = builtInNameKeys.has(nameKey);
+      const matchesBuiltInByShape = looksLikeBuiltInExercise(exercise);
+      const appCreatedCustom = looksLikeAppCreatedCustomExercise(exercise);
+
+      if (
+        matchesBuiltInByIdentity ||
+        matchesBuiltInByName ||
+        matchesBuiltInByShape ||
+        !appCreatedCustom
+      ) {
+        return;
+      }
+
+      customByName.set(nameKey, {
+        ...exercise,
+        is_custom: true,
+        source: "custom",
+        createdByUser: true,
+      });
+    });
+
+    return Array.from(customByName.values()).sort((a, b) =>
+      String(a.name || "").localeCompare(String(b.name || "")),
+    );
+  };
+
+  const getFavoriteMatchKey = (value: any) => normalizeExerciseName(value);
+
+  const isExerciseFavorite = (exercise: any) => {
+    const key = getExerciseMatchKey(exercise);
+    return favoriteExerciseNames.some(
+      (name) => getFavoriteMatchKey(name) === key,
+    );
+  };
 
   const saveFavoriteExerciseNames = async (nextFavorites: string[]) => {
     if (!uid) return;
-    const cleaned = Array.from(
-      new Set(nextFavorites.map((name) => String(name).trim()).filter(Boolean)),
+    const byKey = new Map<string, string>();
+    nextFavorites.forEach((name) => {
+      const displayName = String(name || "").trim();
+      const key = getFavoriteMatchKey(displayName);
+      if (displayName && key && !byKey.has(key)) byKey.set(key, displayName);
+    });
+    const cleaned = Array.from(byKey.values());
+    const nextKeys = new Set(cleaned.map(getFavoriteMatchKey));
+    const currentKeys = new Set(favoriteExerciseNames.map(getFavoriteMatchKey));
+    const removedFavorites = favoriteExerciseNames.filter(
+      (name) => !nextKeys.has(getFavoriteMatchKey(name)),
     );
+    const restoredFavorites = cleaned.filter(
+      (name) => !currentKeys.has(getFavoriteMatchKey(name)),
+    );
+
     setFavoriteExerciseNames(cleaned);
+    if (removedFavorites.length > 0) {
+      await markConfigValuesDeletedLocally(
+        "favorite_exercises",
+        removedFavorites,
+        uid,
+      );
+    }
+    if (restoredFavorites.length > 0) {
+      await clearConfigValuesDeletedLocally(
+        "favorite_exercises",
+        restoredFavorites,
+        uid,
+      );
+    }
     await AsyncStorage.setItem(
       `@favorite_exercises_${uid}`,
       JSON.stringify(cleaned),
     );
-    await syncFavoriteExercisesToCloud(cleaned);
+    syncFavoriteExercisesToCloud(cleaned).catch((error) =>
+      console.log("Favorite exercise cloud sync delayed:", error),
+    );
   };
 
   const toggleFavoriteExercise = async (exercise: any) => {
-    const key = getExerciseKey(exercise);
-    if (!key) return;
+    const key = getExerciseMatchKey(exercise);
+    const displayName = getExerciseKey(exercise);
+    if (!key || !displayName) return;
     Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
-    const nextFavorites = favoriteExerciseNames.includes(key)
-      ? favoriteExerciseNames.filter((name) => name !== key)
-      : [...favoriteExerciseNames, key];
+    const isFavorite = favoriteExerciseNames.some(
+      (name) => getFavoriteMatchKey(name) === key,
+    );
+    const nextFavorites = isFavorite
+      ? favoriteExerciseNames.filter(
+          (name) => getFavoriteMatchKey(name) !== key,
+        )
+      : [...favoriteExerciseNames, displayName];
     await saveFavoriteExerciseNames(nextFavorites);
   };
 
@@ -172,61 +512,349 @@ export default function SearchScreen({ navigation, route }: any) {
     return Number.isNaN(parsed.getTime()) ? new Date(0) : parsed;
   };
 
-  const handleExerciseSelection = async (selectedEx: any) => {
-    if (!uid) return;
-    Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
-    route.params.onSelect(selectedEx);
-    navigation.goBack();
+  const getCompletedSetsForExercise = (exercise: any) =>
+    exercise?.sets?.filter((set: any) => set?.completed && !set?.isWarmup) ||
+    [];
+
+  const getRepsForSet = (exercise: any, set: any) => {
+    if (exercise?.is_unilateral) {
+      return Math.max(Number(set?.repsL || 0), Number(set?.repsR || 0));
+    }
+    return Number(set?.reps || 0);
   };
 
-  const saveCustomExercise = async () => {
-    const trimmed = newName.trim();
-    if (!uid || !trimmed) return;
+  const getSearchExerciseStats = (exercise: any) => {
+    const target = getExerciseMatchKey(exercise);
+    const performances: any[] = [];
 
-    const created = {
-      name: trimmed,
-      muscle: newMuscle,
-      reminder: newReminder.trim(),
-      is_unilateral: newIsUnilateral,
-      supportsVariants: newSupportsVariants,
-      is_custom: true,
+    history.forEach((workout) => {
+      const timestamp =
+        Number(workout?.startedAt) ||
+        Number(workout?.id) ||
+        parseWorkoutDate(workout?.date).getTime();
+
+      (workout?.fullWorkoutData || []).forEach((loggedExercise: any) => {
+        if (getExerciseMatchKey(loggedExercise) !== target) return;
+
+        const completedSets = getCompletedSetsForExercise(loggedExercise);
+        if (!completedSets.length) return;
+
+        let bestSet: any = null;
+        let bestScore = -1;
+        let volume = 0;
+
+        completedSets.forEach((set: any) => {
+          const weight = Number(set?.weight || 0);
+          const reps = getRepsForSet(loggedExercise, set);
+          volume += weight * reps;
+          const score = weight * 1000 + reps;
+          if (score > bestScore) {
+            bestScore = score;
+            bestSet = set;
+          }
+        });
+
+        performances.push({
+          workoutName: workout?.workoutName || "Workout",
+          date: timestamp,
+          bestSet,
+          volume,
+          setCount: completedSets.length,
+          isKg: workout?.isKg !== false,
+          isUnilateral: !!loggedExercise?.is_unilateral,
+        });
+      });
+    });
+
+    const sorted = performances.sort((a, b) => b.date - a.date);
+    const latest = sorted[0] || null;
+    let allTimeBest: any = null;
+    let bestScore = -1;
+    let maxEstimatedOneRM = 0;
+
+    sorted.forEach((item) => {
+      if (!item.bestSet) return;
+      const weight = Number(item.bestSet?.weight || 0);
+      const reps = item.isUnilateral
+        ? Math.max(
+            Number(item.bestSet?.repsL || 0),
+            Number(item.bestSet?.repsR || 0),
+          )
+        : Number(item.bestSet?.reps || 0);
+      const score = weight * 1000 + reps;
+      if (score > bestScore) {
+        bestScore = score;
+        allTimeBest = item;
+      }
+      maxEstimatedOneRM = Math.max(
+        maxEstimatedOneRM,
+        calculate1RM(String(weight), String(reps)),
+      );
+    });
+
+    return {
+      performances: sorted,
+      latest,
+      allTimeBest,
+      maxEstimatedOneRM,
+      sessions: sorted.length,
+      sets: sorted.reduce((sum, item) => sum + item.setCount, 0),
     };
+  };
 
-    const updatedPersonal = [...personalExercises, created];
-    setPersonalExercises(updatedPersonal);
-    await AsyncStorage.setItem(
-      `@user_exercises_${uid}`,
-      JSON.stringify([...globalExercises, ...updatedPersonal]),
-    );
-    await syncPersonalExercisesToCloud(updatedPersonal);
-    setIsAddVisible(false);
+  const formatDetailDate = (timestamp: number) => {
+    if (!timestamp) return "No date";
+    return new Date(timestamp).toLocaleDateString(undefined, {
+      day: "numeric",
+      month: "short",
+      year: "numeric",
+    });
+  };
+
+  const formatDetailBestSet = (item: any) => {
+    if (!item?.bestSet) return "No sets";
+    const unit = item.isKg ? "kg" : "lbs";
+    if (item.isUnilateral) {
+      return `${item.bestSet.weight}${unit} × ${item.bestSet.repsL || 0}/${item.bestSet.repsR || 0}`;
+    }
+    return `${item.bestSet.weight}${unit} × ${item.bestSet.reps || 0}`;
+  };
+
+  const openExerciseDetail = (exercise: any) => {
+    Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
+    setSelectedDetailExercise(exercise);
+    setIsDetailVisible(true);
+  };
+
+  const closeExerciseDetail = () => {
+    setIsDetailVisible(false);
+    setSelectedDetailExercise(null);
+  };
+
+  const openEditCustomExercise = (exercise: any) => {
+    if (!exercise?.is_custom) return;
+    Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
+    setEditingCustomExercise(exercise);
+    setNewName(limitText(exercise?.name || "", LIMITS.nameChars));
+    setNewMuscle(normalizeExerciseMuscleGroup(exercise?.muscle));
+    setNewReminder(limitText(exercise?.reminder || "", LIMITS.cueChars));
+    setNewIsUnilateral(!!exercise?.is_unilateral);
+    setNewSupportsVariants(getExerciseVariationOptions(exercise).length > 0);
+    setIsDetailVisible(false);
+    setIsAddVisible(true);
+  };
+
+  const resetCustomExerciseForm = () => {
+    setEditingCustomExercise(null);
     setNewName("");
     setNewReminder("");
     setNewIsUnilateral(false);
     setNewSupportsVariants(false);
-    route.params.onSelect(created);
+  };
+
+  const toggleMultiSelectedExercise = (exercise: any) => {
+    if (!allowMultiSelect) return;
+
+    if (isExistingExercise(exercise)) {
+      setInfoAlert({
+        visible: true,
+        title: "Already Added",
+        message: `This exercise is already in the ${selectionContext}.`,
+      });
+      return;
+    }
+
+    const key = getExerciseMatchKey(exercise);
+    const alreadySelected = isMultiSelectedExercise(exercise);
+    if (alreadySelected) {
+      setMultiSelectedExercises((current) =>
+        current.filter((item) => getExerciseMatchKey(item) !== key),
+      );
+      Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
+      return;
+    }
+
+    if (multiSelectedExercises.length >= maxSelectable) {
+      setInfoAlert({
+        visible: true,
+        title: "Exercise Limit Reached",
+        message: `You can add ${maxSelectable} more exercise${maxSelectable === 1 ? "" : "s"} to this ${selectionContext}.`,
+      });
+      return;
+    }
+
+    setMultiSelectedExercises((current) => [
+      ...current,
+      getNormalizedSelectedExercise(exercise),
+    ]);
+    Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
+  };
+
+  const submitMultiSelectedExercises = () => {
+    if (!allowMultiSelect || multiSelectedExercises.length === 0) return;
+    Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
+    if (route.params?.onSelectMany) {
+      route.params.onSelectMany(multiSelectedExercises);
+    } else {
+      multiSelectedExercises.forEach((exercise) => {
+        route.params.onSelect(exercise);
+      });
+    }
     navigation.goBack();
   };
 
+  const handleExerciseSelection = async (selectedEx: any) => {
+    if (!uid) return;
+    if (allowMultiSelect) {
+      toggleMultiSelectedExercise(selectedEx);
+      setIsDetailVisible(false);
+      return;
+    }
+
+    Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
+    route.params.onSelect(getNormalizedSelectedExercise(selectedEx));
+    navigation.goBack();
+  };
+
+  const saveCustomExercise = async () => {
+    if (searchBlockingRef.current) return;
+    const trimmed = cleanLimitedText(newName, LIMITS.nameChars);
+    const finalReminder = cleanLimitedText(newReminder, LIMITS.cueChars);
+    if (!uid || !trimmed) return;
+
+    searchBlockingRef.current = true;
+    setSearchBlockingMessage(
+      editingCustomExercise ? "Saving changes..." : "Saving exercise...",
+    );
+
+    try {
+      if (editingCustomExercise) {
+        const updated = {
+          ...editingCustomExercise,
+          name: trimmed,
+          muscle: normalizeExerciseMuscleGroup(newMuscle),
+          reminder: finalReminder,
+          is_unilateral: newIsUnilateral,
+          supportsVariants: newSupportsVariants,
+          variationOptions: newSupportsVariants
+            ? ["Normal", "Paused", "Tempo"]
+            : undefined,
+          updatedAt: Date.now(),
+        };
+
+        const editingId = String(editingCustomExercise?.id || "");
+        const editingName = getExerciseMatchKey(editingCustomExercise);
+        const updatedPersonal = cleanStoredCustomExercises(
+          personalExercises.map((exercise) => {
+            const sameId =
+              editingId && String(exercise?.id || "") === editingId;
+            const sameName = getExerciseMatchKey(exercise) === editingName;
+            return sameId || sameName ? updated : exercise;
+          }),
+          globalExercises,
+        );
+
+        setPersonalExercises(updatedPersonal);
+        await AsyncStorage.setItem(
+          `@user_exercises_${uid}`,
+          JSON.stringify(updatedPersonal),
+        );
+        syncPersonalExercisesToCloud(updatedPersonal).catch((error) =>
+          console.log("Custom exercise cloud sync delayed:", error),
+        );
+        setSelectedDetailExercise(updated);
+        setIsAddVisible(false);
+        resetCustomExerciseForm();
+        Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
+        return;
+      }
+
+      if (personalExercises.length >= LIMITS.customExercisesPerUser) {
+        setInfoAlert({
+          visible: true,
+          title: "Custom Exercise Limit Reached",
+          message: "You can save up to 100 custom exercises.",
+        });
+        return;
+      }
+
+      const created = createCustomExerciseRecord({
+        name: trimmed,
+        muscle: normalizeExerciseMuscleGroup(newMuscle),
+        reminder: finalReminder,
+        is_unilateral: newIsUnilateral,
+        supportsVariants: newSupportsVariants,
+        variationOptions: newSupportsVariants
+          ? ["Normal", "Paused", "Tempo"]
+          : undefined,
+      });
+
+      const updatedPersonal = cleanStoredCustomExercises(
+        [...personalExercises, created],
+        globalExercises,
+      );
+      setPersonalExercises(updatedPersonal);
+      await AsyncStorage.setItem(
+        `@user_exercises_${uid}`,
+        JSON.stringify(updatedPersonal),
+      );
+      syncPersonalExercisesToCloud(updatedPersonal).catch((error) =>
+        console.log("Custom exercise cloud sync delayed:", error),
+      );
+      setIsAddVisible(false);
+      resetCustomExerciseForm();
+      handleExerciseSelection(created);
+    } catch (error) {
+      console.error("Custom exercise save failed:", error);
+    } finally {
+      searchBlockingRef.current = false;
+      setSearchBlockingMessage("");
+    }
+  };
+
+  const builtInReferenceExercises = useMemo(() => {
+    const byKey = new Map<string, any>();
+
+    getActiveBuiltInExercises(globalExercises).forEach((exercise) => {
+      const key = getExerciseMatchKey(exercise);
+      if (!key) return;
+      byKey.set(key, exercise);
+    });
+
+    return Array.from(byKey.values());
+  }, [globalExercises]);
+
   const unifiedExercises = useMemo(() => {
     const byName = new Map<string, any>();
+    const builtInLookup = new Map<string, any>();
 
-    globalExercises.forEach((exercise) => {
+    builtInReferenceExercises.forEach((exercise) => {
       const key = getExerciseMatchKey(exercise);
-      if (key) byName.set(key, { ...exercise, is_custom: false, source: "builtin" });
+      if (!key) return;
+
+      const builtinExercise = {
+        ...exercise,
+        is_custom: false,
+        source: "builtin",
+      };
+      byName.set(key, builtinExercise);
+      getExerciseIdentityKeys(exercise).forEach((identityKey) => {
+        builtInLookup.set(identityKey, builtinExercise);
+      });
     });
 
     personalExercises.forEach((exercise) => {
       const key = getExerciseMatchKey(exercise);
       if (!key) return;
 
-      const matchingBuiltin = byName.get(key);
+      const matchingBuiltin =
+        getExerciseIdentityKeys(exercise)
+          .map((identityKey) => builtInLookup.get(identityKey))
+          .find(Boolean) || byName.get(key);
+
       if (matchingBuiltin) {
-        // Older versions let users copy Global exercises into Personal Library.
-        // In the unified library, those should fold back into the built-in row,
-        // not appear as duplicated Custom exercises.
-        byName.set(key, {
-          ...exercise,
+        const builtinKey = getExerciseMatchKey(matchingBuiltin);
+        byName.set(builtinKey || key, {
           ...matchingBuiltin,
           is_custom: false,
           source: "builtin",
@@ -235,20 +863,27 @@ export default function SearchScreen({ navigation, route }: any) {
         return;
       }
 
+      if (looksLikeBuiltInExercise(exercise)) return;
+
       byName.set(key, { ...exercise, is_custom: true, source: "custom" });
     });
 
     return Array.from(byName.values()).sort((a, b) =>
       String(a.name || "").localeCompare(String(b.name || "")),
     );
-  }, [globalExercises, personalExercises]);
+  }, [builtInReferenceExercises, personalExercises]);
+
+  const trueCustomExercises = useMemo(() => {
+    return cleanStoredCustomExercises(personalExercises);
+  }, [personalExercises, globalExercises]);
 
   const recentExerciseNames = useMemo(() => {
     const seen = new Set<string>();
     return [...history]
       .sort(
         (a, b) =>
-          parseWorkoutDate(b.date).getTime() - parseWorkoutDate(a.date).getTime(),
+          parseWorkoutDate(b.date).getTime() -
+          parseWorkoutDate(a.date).getTime(),
       )
       .flatMap((workout) => workout.fullWorkoutData || [])
       .map((exercise: any) => String(exercise?.name || "").trim())
@@ -261,38 +896,46 @@ export default function SearchScreen({ navigation, route }: any) {
 
   const displayedExercises = useMemo(() => {
     if (libraryView === "Favorites") {
-      return unifiedExercises.filter((exercise) => isExerciseFavorite(exercise));
+      return unifiedExercises.filter((exercise) =>
+        isExerciseFavorite(exercise),
+      );
     }
     if (libraryView === "Recent") {
       const order = new Map<string, number>(
-        recentExerciseNames.map((name, index) => [name, index]),
+        recentExerciseNames.map((name, index) => [
+          getFavoriteMatchKey(name),
+          index,
+        ]),
       );
       return unifiedExercises
-        .filter((exercise) => order.has(getExerciseKey(exercise)))
+        .filter((exercise) => order.has(getExerciseMatchKey(exercise)))
         .sort(
           (a, b) =>
-            (order.get(getExerciseKey(a)) ?? 9999) -
-            (order.get(getExerciseKey(b)) ?? 9999),
+            (order.get(getExerciseMatchKey(a)) ?? 9999) -
+            (order.get(getExerciseMatchKey(b)) ?? 9999),
         );
     }
     if (libraryView === "Custom") {
-      return unifiedExercises.filter((exercise) => exercise.is_custom === true);
+      return trueCustomExercises;
     }
     return unifiedExercises;
-  }, [favoriteExerciseNames, libraryView, recentExerciseNames, unifiedExercises]);
+  }, [
+    favoriteExerciseNames,
+    libraryView,
+    recentExerciseNames,
+    trueCustomExercises,
+    unifiedExercises,
+  ]);
 
   const searchedExercises = useMemo(() => {
     let filtered = displayedExercises;
     if (activeFilter !== "All") {
-      filtered = filtered.filter((ex) => ex && ex.muscle === activeFilter);
+      filtered = filtered.filter(
+        (ex) => ex && normalizeExerciseMuscleGroup(ex.muscle) === activeFilter,
+      );
     }
     if (searchQuery.trim()) {
-      const terms = searchQuery.toLowerCase().split(" ").filter(Boolean);
-      filtered = filtered.filter((ex) => {
-        const searchable =
-          `${ex?.name || ""} ${ex?.equipment || ""} ${ex?.muscle || ""}`.toLowerCase();
-        return terms.every((term) => searchable.includes(term));
-      });
+      filtered = filterAndRankExercisesBySearch(filtered, searchQuery);
     }
     return filtered;
   }, [displayedExercises, activeFilter, searchQuery]);
@@ -303,9 +946,36 @@ export default function SearchScreen({ navigation, route }: any) {
   );
 
   const selectedCount = existingExercises.length;
+  const hasSearchQuery = searchQuery.trim().length > 0;
+  const hasActiveFilter = activeFilter !== "All";
+  const resultCountLabel = `${searchedExercises.length} ${
+    searchedExercises.length === 1 ? "exercise" : "exercises"
+  }${hasActiveFilter ? ` in ${activeFilter}` : ""}`;
+  const modeContextLabel = isGymSwapMode
+    ? "Choose the exercise to use for this gym swap"
+    : isReplaceMode
+      ? "Choose one exercise to replace the current movement"
+      : allowMultiSelect
+        ? multiSelectedExercises.length > 0
+          ? `${multiSelectedExercises.length} selected`
+          : selectedCount > 0
+            ? `${selectedCount} already in this ${selectionContext}`
+            : "Select exercises, then add them together"
+      : selectedCount > 0
+        ? `${selectedCount} already in this workout`
+        : hasSearchQuery
+          ? "Best name matches appear first"
+          : "Tap a card for details, or use + to insert quickly";
 
   return (
     <View style={localStyles.screen}>
+      <CustomAlert
+        visible={infoAlert.visible}
+        title={infoAlert.title}
+        message={infoAlert.message}
+        buttons={[{ text: "OK" }]}
+        onClose={() => setInfoAlert((prev) => ({ ...prev, visible: false }))}
+      />
       <CustomAlert
         visible={searchAlert.visible}
         title="Create Custom Exercise?"
@@ -314,23 +984,44 @@ export default function SearchScreen({ navigation, route }: any) {
           { text: "Cancel", style: "cancel" },
           {
             text: "Add",
-            onPress: async () => {
-              if (searchAlert.exercise && uid) {
-                const exerciseToAdd = {
-                  ...searchAlert.exercise,
-                  is_custom: true,
-                };
-                const updatedPersonal = [...personalExercises, exerciseToAdd];
-                setPersonalExercises(updatedPersonal);
-                await AsyncStorage.setItem(
-                  `@user_exercises_${uid}`,
-                  JSON.stringify([...globalExercises, ...updatedPersonal]),
-                );
-                await syncPersonalExercisesToCloud(updatedPersonal);
-                route.params.onSelect(exerciseToAdd);
-                navigation.goBack();
-              }
-            },
+            onPress: () =>
+              runSearchBlockingAction("Saving exercise...", async () => {
+                if (searchAlert.exercise && uid) {
+                  if (
+                    personalExercises.length >= LIMITS.customExercisesPerUser
+                  ) {
+                    setInfoAlert({
+                      visible: true,
+                      title: "Custom Exercise Limit Reached",
+                      message: "You can save up to 100 custom exercises.",
+                    });
+                    return;
+                  }
+                  const exerciseToAdd = createCustomExerciseRecord({
+                    name: searchAlert.exercise.name,
+                    muscle: normalizeExerciseMuscleGroup(
+                      searchAlert.exercise.muscle,
+                    ),
+                    reminder: "",
+                    is_unilateral: false,
+                    supportsVariants: false,
+                  });
+                  const updatedPersonal = cleanStoredCustomExercises(
+                    [...personalExercises, exerciseToAdd],
+                    globalExercises,
+                  );
+                  setPersonalExercises(updatedPersonal);
+                  await AsyncStorage.setItem(
+                    `@user_exercises_${uid}`,
+                    JSON.stringify(updatedPersonal),
+                  );
+                  syncPersonalExercisesToCloud(updatedPersonal).catch((error) =>
+                    console.log("Custom exercise cloud sync delayed:", error),
+                  );
+                  setSearchAlert((prev) => ({ ...prev, visible: false }));
+                  handleExerciseSelection(exerciseToAdd);
+                }
+              }),
           },
         ]}
         onClose={() => setSearchAlert((prev) => ({ ...prev, visible: false }))}
@@ -348,7 +1039,15 @@ export default function SearchScreen({ navigation, route }: any) {
             </Text>
           </TouchableOpacity>
           <View style={styles.headerTitleContainer}>
-            <Text style={styles.headerTitleStatic}>Add Exercise</Text>
+            <Text style={styles.headerTitleStatic}>
+              {isGymSwapMode
+                ? "Choose Exercise"
+                : isReplaceMode
+                  ? "Replace Exercise"
+                  : allowMultiSelect
+                    ? "Select Exercises"
+                  : "Add Exercise"}
+            </Text>
           </View>
           <View style={styles.headerRightActionGroup} />
         </View>
@@ -362,7 +1061,10 @@ export default function SearchScreen({ navigation, route }: any) {
           <TouchableOpacity
             style={localStyles.createModalBackdrop}
             activeOpacity={1}
-            onPress={() => setIsAddVisible(false)}
+            onPress={() => {
+              setIsAddVisible(false);
+              resetCustomExerciseForm();
+            }}
           />
 
           <View style={localStyles.createModalCard}>
@@ -370,10 +1072,12 @@ export default function SearchScreen({ navigation, route }: any) {
             <View style={localStyles.createModalHeader}>
               <View>
                 <Text style={localStyles.createModalTitle}>
-                  Create Exercise
+                  {editingCustomExercise ? "Edit Exercise" : "Create Exercise"}
                 </Text>
                 <Text style={localStyles.createModalSubtitle}>
-                  Add a custom movement to your exercise library.
+                  {editingCustomExercise
+                    ? "Update this custom movement across your exercise library."
+                    : "Add a custom movement to your exercise library."}
                 </Text>
               </View>
             </View>
@@ -387,7 +1091,10 @@ export default function SearchScreen({ navigation, route }: any) {
               <TextInput
                 style={localStyles.createInput}
                 value={newName}
-                onChangeText={setNewName}
+                onChangeText={(value) =>
+                  setNewName(limitText(value, LIMITS.nameChars))
+                }
+                maxLength={LIMITS.nameChars}
                 placeholder="Exercise name"
                 placeholderTextColor={Colors.textSubtle}
                 selectionColor={Colors.accent}
@@ -399,7 +1106,10 @@ export default function SearchScreen({ navigation, route }: any) {
                   localStyles.createInputMultiline,
                 ]}
                 value={newReminder}
-                onChangeText={setNewReminder}
+                onChangeText={(value) =>
+                  setNewReminder(limitText(value, LIMITS.cueChars))
+                }
+                maxLength={LIMITS.cueChars}
                 placeholder="Training cue (optional)"
                 placeholderTextColor={Colors.textSubtle}
                 selectionColor={Colors.accent}
@@ -506,23 +1216,236 @@ export default function SearchScreen({ navigation, route }: any) {
             <View style={localStyles.createModalFooter}>
               <TouchableOpacity
                 style={localStyles.createCancelButton}
-                onPress={() => setIsAddVisible(false)}
+                onPress={() => {
+                  setIsAddVisible(false);
+                  resetCustomExerciseForm();
+                }}
               >
                 <Text style={localStyles.createCancelText}>Cancel</Text>
               </TouchableOpacity>
               <TouchableOpacity
                 style={[
                   localStyles.createSaveButton,
-                  !newName.trim() && localStyles.createSaveButtonDisabled,
+                  (!newName.trim() || isSearchBlocking) &&
+                    localStyles.createSaveButtonDisabled,
                 ]}
-                disabled={!newName.trim()}
+                disabled={!newName.trim() || isSearchBlocking}
                 onPress={saveCustomExercise}
               >
-                <Text style={localStyles.createSaveText}>Save Exercise</Text>
+                <Text style={localStyles.createSaveText}>
+                  {editingCustomExercise ? "Save Changes" : "Save Exercise"}
+                </Text>
               </TouchableOpacity>
             </View>
           </View>
         </KeyboardAvoidingView>
+      </Modal>
+
+      <Modal visible={isDetailVisible} transparent animationType="slide">
+        <View style={localStyles.detailModalOverlay}>
+          <TouchableOpacity
+            style={localStyles.detailModalBackdrop}
+            activeOpacity={1}
+            onPress={closeExerciseDetail}
+          />
+          <View style={localStyles.detailModalCard}>
+            <View style={localStyles.detailModalHandle} />
+            <View style={localStyles.detailHeaderRow}>
+              <View style={{ flex: 1 }}>
+                <Text style={localStyles.detailKicker}>
+                  {formatLibraryLabel(
+                    normalizeExerciseMuscleGroup(
+                      selectedDetailExercise?.muscle,
+                    ),
+                  )}
+                  {selectedDetailExercise?.is_custom ? " · Custom" : ""}
+                </Text>
+                <Text style={localStyles.detailTitle}>
+                  {selectedDetailExercise?.name}
+                </Text>
+                <Text style={localStyles.detailSubtitle}>
+                  {[
+                    selectedDetailExercise?.equipment,
+                    isMachineBrandApplicable(selectedDetailExercise)
+                      ? "Machine brand tracked"
+                      : null,
+                  ]
+                    .filter(Boolean)
+                    .map(formatLibraryLabel)
+                    .join(" · ") || "Exercise"}
+                </Text>
+              </View>
+              <TouchableOpacity
+                style={localStyles.detailCloseButton}
+                onPress={closeExerciseDetail}
+              >
+                <Ionicons name="close" size={20} color={Colors.textMuted} />
+              </TouchableOpacity>
+            </View>
+
+            {selectedDetailExercise &&
+              (() => {
+                const detailStats = getSearchExerciseStats(
+                  selectedDetailExercise,
+                );
+                const recent = detailStats.performances.slice(0, 4);
+                return (
+                  <>
+                    <View style={localStyles.detailStatsGrid}>
+                      <View style={localStyles.detailStatBox}>
+                        <Text style={localStyles.detailStatValue}>
+                          {detailStats.sessions}
+                        </Text>
+                        <Text style={localStyles.detailStatLabel}>
+                          Sessions
+                        </Text>
+                      </View>
+                      <View style={localStyles.detailStatBox}>
+                        <Text style={localStyles.detailStatValue}>
+                          {detailStats.sets}
+                        </Text>
+                        <Text style={localStyles.detailStatLabel}>Sets</Text>
+                      </View>
+                      <View style={localStyles.detailStatBox}>
+                        <Text
+                          style={localStyles.detailStatValue}
+                          numberOfLines={1}
+                        >
+                          {detailStats.allTimeBest
+                            ? formatDetailBestSet(detailStats.allTimeBest)
+                            : "—"}
+                        </Text>
+                        <Text style={localStyles.detailStatLabel}>
+                          Best Set
+                        </Text>
+                      </View>
+                      <View style={localStyles.detailStatBox}>
+                        <Text style={localStyles.detailStatValue}>
+                          {detailStats.maxEstimatedOneRM
+                            ? `${detailStats.maxEstimatedOneRM}`
+                            : "—"}
+                        </Text>
+                        <Text style={localStyles.detailStatLabel}>
+                          Est. 1RM
+                        </Text>
+                      </View>
+                    </View>
+
+                    <View style={localStyles.detailRecentBlock}>
+                      <Text style={localStyles.detailSectionTitle}>
+                        Recent Performances
+                      </Text>
+                      {recent.length > 0 ? (
+                        recent.map((item, index) => (
+                          <View
+                            key={`${item.date}-${index}`}
+                            style={localStyles.detailPerformanceRow}
+                          >
+                            <View style={{ flex: 1 }}>
+                              <Text
+                                style={localStyles.detailPerformanceTitle}
+                                numberOfLines={1}
+                              >
+                                {item.workoutName}
+                              </Text>
+                              <Text style={localStyles.detailPerformanceMeta}>
+                                {formatDetailDate(item.date)} · {item.setCount}{" "}
+                                {item.setCount === 1 ? "set" : "sets"}
+                              </Text>
+                            </View>
+                            <Text
+                              style={localStyles.detailPerformanceSet}
+                              numberOfLines={1}
+                            >
+                              {formatDetailBestSet(item)}
+                            </Text>
+                          </View>
+                        ))
+                      ) : (
+                        <View style={localStyles.detailEmptyState}>
+                          <Ionicons
+                            name="barbell-outline"
+                            size={24}
+                            color={Colors.textMuted}
+                          />
+                          <Text style={localStyles.detailEmptyTitle}>
+                            No history yet
+                          </Text>
+                          <Text style={localStyles.detailEmptyBody}>
+                            Add this exercise to a workout to start tracking
+                            stats.
+                          </Text>
+                        </View>
+                      )}
+                    </View>
+                  </>
+                );
+              })()}
+
+            {(() => {
+              const isAlreadyInWorkout =
+                !!selectedDetailExercise &&
+                isExistingExercise(selectedDetailExercise);
+              const isSelectedForMulti =
+                allowMultiSelect &&
+                !!selectedDetailExercise &&
+                isMultiSelectedExercise(selectedDetailExercise);
+              const isPrimaryDisabled =
+                !isReplaceMode && !isGymSwapMode && isAlreadyInWorkout;
+
+              return (
+                <>
+                  {selectedDetailExercise?.is_custom && (
+                    <TouchableOpacity
+                      style={localStyles.detailSecondaryButton}
+                      activeOpacity={0.84}
+                      onPress={() =>
+                        openEditCustomExercise(selectedDetailExercise)
+                      }
+                    >
+                      <Ionicons
+                        name="create-outline"
+                        size={18}
+                        color={Colors.accent}
+                      />
+                      <Text style={localStyles.detailSecondaryButtonText}>
+                        Edit Custom Exercise
+                      </Text>
+                    </TouchableOpacity>
+                  )}
+                  <TouchableOpacity
+                    style={[
+                      localStyles.detailPrimaryButton,
+                      isPrimaryDisabled &&
+                        localStyles.detailPrimaryButtonDisabled,
+                    ]}
+                    disabled={isPrimaryDisabled}
+                    onPress={() => {
+                      if (selectedDetailExercise)
+                        handleExerciseSelection(selectedDetailExercise);
+                    }}
+                  >
+                    <Text style={localStyles.detailPrimaryButtonText}>
+                      {isGymSwapMode
+                        ? "Use Exercise"
+                        : isReplaceMode
+                          ? "Replace Exercise"
+                          : allowMultiSelect
+                            ? isAlreadyInWorkout
+                              ? "Already Added"
+                              : isSelectedForMulti
+                                ? "Remove from Selection"
+                                : "Select Exercise"
+                          : isAlreadyInWorkout
+                            ? "Already Added"
+                            : "Add to Workout"}
+                    </Text>
+                  </TouchableOpacity>
+                </>
+              );
+            })()}
+          </View>
+        </View>
       </Modal>
 
       <View style={localStyles.controlsBlock}>
@@ -554,7 +1477,13 @@ export default function SearchScreen({ navigation, route }: any) {
             style={localStyles.searchInput}
             value={searchQuery}
             onChangeText={setSearchQuery}
-            placeholder="Search exercises..."
+            placeholder={
+              isReplaceMode
+                ? "Search replacement exercise..."
+                : isGymSwapMode
+                  ? "Search gym swap exercise..."
+                  : "Search exercises..."
+            }
             placeholderTextColor={Colors.textMuted}
             selectionColor={Colors.accent}
           />
@@ -583,7 +1512,7 @@ export default function SearchScreen({ navigation, route }: any) {
               ]}
               onPress={async () => {
                 setActiveFilter(muscle);
-                if (uid)
+                if (uid && shouldPersistSearchFilter)
                   await AsyncStorage.setItem(
                     `@last_search_filter_${uid}`,
                     muscle,
@@ -602,12 +1531,52 @@ export default function SearchScreen({ navigation, route }: any) {
           ))}
         </ScrollView>
 
+        <View style={localStyles.resultSummaryRow}>
+          <View style={localStyles.resultSummaryTextBlock}>
+            <Text style={localStyles.resultSummaryTitle}>
+              {resultCountLabel}
+            </Text>
+            <Text style={localStyles.resultSummarySub} numberOfLines={1}>
+              {modeContextLabel}
+            </Text>
+          </View>
+          {activeFilter !== "All" && (
+            <TouchableOpacity
+              style={localStyles.clearFilterPill}
+              activeOpacity={0.8}
+              onPress={async () => {
+                setActiveFilter("All");
+                if (uid && shouldPersistSearchFilter)
+                  await AsyncStorage.setItem(
+                    `@last_search_filter_${uid}`,
+                    "All",
+                  );
+              }}
+            >
+              <Text style={localStyles.clearFilterText}>Clear filter</Text>
+            </TouchableOpacity>
+          )}
+        </View>
+
         {libraryView === "Custom" && (
           <TouchableOpacity
             style={localStyles.createExerciseCard}
             activeOpacity={0.84}
             onPress={() => {
-              setNewMuscle(activeFilter === "All" ? "Chest" : activeFilter);
+              if (personalExercises.length >= LIMITS.customExercisesPerUser) {
+                setInfoAlert({
+                  visible: true,
+                  title: "Custom Exercise Limit Reached",
+                  message: "You can save up to 100 custom exercises.",
+                });
+                return;
+              }
+              setNewMuscle(
+                activeFilter === "All"
+                  ? "Chest"
+                  : normalizeExerciseMuscleGroup(activeFilter),
+              );
+              setEditingCustomExercise(null);
               setIsAddVisible(true);
             }}
           >
@@ -615,9 +1584,15 @@ export default function SearchScreen({ navigation, route }: any) {
               <Ionicons name="add" size={22} color={Colors.accent} />
             </View>
             <View style={{ flex: 1 }}>
-              <Text style={localStyles.createExerciseKicker}>CUSTOM EXERCISE</Text>
-              <Text style={localStyles.createExerciseTitle}>Create Custom Exercise</Text>
-              <Text style={localStyles.createExerciseSub}>Add a movement that is not in the library</Text>
+              <Text style={localStyles.createExerciseKicker}>
+                CUSTOM EXERCISE
+              </Text>
+              <Text style={localStyles.createExerciseTitle}>
+                Create Custom Exercise
+              </Text>
+              <Text style={localStyles.createExerciseSub}>
+                Add a movement that is not in the library
+              </Text>
             </View>
           </TouchableOpacity>
         )}
@@ -633,28 +1608,35 @@ export default function SearchScreen({ navigation, route }: any) {
           sections={sections}
           keyExtractor={(item, idx) => `${item?.name || "exercise"}-${idx}`}
           stickySectionHeadersEnabled={false}
-          contentContainerStyle={localStyles.listContent}
+          contentContainerStyle={[
+            localStyles.listContent,
+            allowMultiSelect &&
+              multiSelectedExercises.length > 0 &&
+              localStyles.listContentWithFooter,
+          ]}
           renderSectionHeader={({ section: { title } }) => (
             <View style={styles.sectionHeader}>
               <Text style={styles.sectionHeaderText}>{title}</Text>
             </View>
           )}
           renderItem={({ item }) => {
-            const isAlreadyAdded = existingExercises.includes(item.name);
+            const isAlreadyAdded = isExistingExercise(item);
             const isFavorite = isExerciseFavorite(item);
+            const isMultiSelected =
+              allowMultiSelect && isMultiSelectedExercise(item);
             const imageUri = normalizeExerciseImageUrl(item.image);
-            const hasVariationOptions =
-              getExerciseVariationOptions(item).length > 0;
+            const isDirectAddDisabled =
+              !isReplaceMode && !isGymSwapMode && isAlreadyAdded;
 
             return (
               <TouchableOpacity
                 style={[
                   localStyles.exerciseCard,
-                  isAlreadyAdded && localStyles.exerciseCardDisabled,
+                  isMultiSelected && localStyles.exerciseCardSelected,
+                  isDirectAddDisabled && localStyles.exerciseCardDisabled,
                 ]}
                 activeOpacity={0.84}
-                disabled={isAlreadyAdded}
-                onPress={() => handleExerciseSelection(item)}
+                onPress={() => openExerciseDetail(item)}
               >
                 {imageUri && !imageErrors[item.name] ? (
                   <Image
@@ -677,45 +1659,71 @@ export default function SearchScreen({ navigation, route }: any) {
                   </View>
                 )}
 
-                <View style={localStyles.exerciseTextBlock}>
+                <View style={localStyles.exerciseContent}>
                   <Text style={localStyles.exerciseKicker}>
-                    {formatLibraryLabel(item.muscle)}{item.is_custom ? " · Custom" : ""}
+                    {formatLibraryLabel(
+                      normalizeExerciseMuscleGroup(item.muscle),
+                    )}
                   </Text>
                   <Text style={localStyles.exerciseTitle} numberOfLines={1}>
                     {item.name}
                   </Text>
-                  <Text style={localStyles.exerciseMeta} numberOfLines={1}>
-                    {item.equipment ? `${formatLibraryLabel(item.equipment)} · ` : ""}
-                    {item.is_custom ? "Custom" : hasVariationOptions ? "Supports variants" : "Tap to add"}
-                  </Text>
                 </View>
 
-                <TouchableOpacity
-                  style={localStyles.favoriteButton}
-                  onPress={() => toggleFavoriteExercise(item)}
-                >
-                  <Ionicons
-                    name={isFavorite ? "star" : "star-outline"}
-                    size={20}
-                    color={isFavorite ? Colors.accent : Colors.textMuted}
-                  />
-                </TouchableOpacity>
-
-                <View
-                  style={[
-                    localStyles.addIndicator,
-                    isAlreadyAdded && localStyles.addIndicatorDone,
-                  ]}
-                >
-                  {isAlreadyAdded ? (
+                <View style={localStyles.exerciseActionsColumn}>
+                  <TouchableOpacity
+                    style={localStyles.favoriteButton}
+                    onPress={(event) => {
+                      event.stopPropagation();
+                      toggleFavoriteExercise(item);
+                    }}
+                  >
                     <Ionicons
-                      name="checkmark"
-                      size={20}
-                      color={Colors.textMuted}
+                      name={isFavorite ? "star" : "star-outline"}
+                      size={22}
+                      color={isFavorite ? Colors.accent : Colors.textMuted}
                     />
-                  ) : (
-                    <Ionicons name="add" size={22} color={Colors.accent} />
-                  )}
+                  </TouchableOpacity>
+
+                  <TouchableOpacity
+                    style={[
+                      localStyles.addIndicator,
+                      isReplaceMode && localStyles.replaceIndicator,
+                      isGymSwapMode && localStyles.useIndicator,
+                      isMultiSelected && localStyles.addIndicatorSelected,
+                      isDirectAddDisabled && localStyles.addIndicatorDone,
+                    ]}
+                    disabled={isDirectAddDisabled}
+                    accessibilityLabel={
+                      isDirectAddDisabled ? "Already added" : primaryActionLabel
+                    }
+                    onPress={(event) => {
+                      event.stopPropagation();
+                      handleExerciseSelection(item);
+                    }}
+                  >
+                    <Ionicons
+                      name={
+                        isDirectAddDisabled
+                          ? "checkmark"
+                          : isMultiSelected
+                            ? "checkmark"
+                          : isGymSwapMode
+                            ? "checkmark"
+                            : isReplaceMode
+                              ? "swap-horizontal"
+                              : "add"
+                      }
+                      size={isReplaceMode ? 19 : 21}
+                      color={
+                        isDirectAddDisabled
+                          ? Colors.textMuted
+                          : isMultiSelected
+                            ? Colors.background
+                            : Colors.accent
+                      }
+                    />
+                  </TouchableOpacity>
                 </View>
               </TouchableOpacity>
             );
@@ -724,27 +1732,51 @@ export default function SearchScreen({ navigation, route }: any) {
             <View style={localStyles.emptyState}>
               <Ionicons name="search" size={28} color={Colors.textMuted} />
               <Text style={localStyles.emptyTitle}>
-                {libraryView === "Favorites"
-                  ? "No favorites yet"
-                  : libraryView === "Recent"
-                    ? "No recent exercises yet"
-                    : libraryView === "Custom"
-                      ? "No custom exercises yet"
-                      : "No exercises found"}
+                {hasSearchQuery || hasActiveFilter
+                  ? "No matching exercises"
+                  : libraryView === "Favorites"
+                    ? "No favorites yet"
+                    : libraryView === "Recent"
+                      ? "No recent exercises yet"
+                      : libraryView === "Custom"
+                        ? "No custom exercises yet"
+                        : "No exercises found"}
               </Text>
               <Text style={localStyles.emptyBody}>
-                {libraryView === "Favorites"
-                  ? "Favorite exercises from the library to find them faster during workouts."
-                  : libraryView === "Recent"
-                    ? "Exercises will appear here after you log them in a workout."
-                    : libraryView === "Custom"
-                      ? "Create a custom exercise when it does not exist in the library."
-                      : "Try a different search term or category filter."}
+                {hasSearchQuery || hasActiveFilter
+                  ? `Try a shorter search${hasSearchQuery ? ` like "${searchQuery.trim().split(/\s+/)[0]}"` : ""}${hasActiveFilter ? ", or clear the muscle filter" : ""}.`
+                  : libraryView === "Favorites"
+                    ? "Favorite exercises from the library to find them faster during workouts."
+                    : libraryView === "Recent"
+                      ? "Exercises will appear here after you log them in a workout."
+                      : libraryView === "Custom"
+                        ? "Create a custom exercise when it does not exist in the library."
+                        : "Try a different search term or category filter."}
               </Text>
             </View>
           }
         />
       )}
+
+      {allowMultiSelect && multiSelectedExercises.length > 0 && (
+        <SafeAreaView edges={["bottom"]} style={localStyles.multiSelectFooter}>
+          <TouchableOpacity
+            style={localStyles.multiSelectButton}
+            activeOpacity={0.86}
+            onPress={submitMultiSelectedExercises}
+          >
+            <Text style={localStyles.multiSelectButtonText}>
+              Add {multiSelectedExercises.length} exercise
+              {multiSelectedExercises.length === 1 ? "" : "s"}
+            </Text>
+          </TouchableOpacity>
+        </SafeAreaView>
+      )}
+
+      <BlockingOverlay
+        visible={isSearchBlocking}
+        message={searchBlockingMessage}
+      />
     </View>
   );
 }
@@ -799,6 +1831,39 @@ const localStyles = StyleSheet.create({
     paddingVertical: 8,
   },
   chipRow: { paddingRight: 20 },
+  resultSummaryRow: {
+    minHeight: 50,
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+    gap: 12,
+    marginTop: 12,
+  },
+  resultSummaryTextBlock: { flex: 1, minWidth: 0 },
+  resultSummaryTitle: {
+    color: Colors.text,
+    fontSize: 15,
+    fontWeight: "900",
+  },
+  resultSummarySub: {
+    color: Colors.textMuted,
+    fontSize: 12,
+    fontWeight: "700",
+    marginTop: 3,
+  },
+  clearFilterPill: {
+    paddingHorizontal: 12,
+    paddingVertical: 8,
+    borderRadius: 999,
+    backgroundColor: Colors.card,
+    borderWidth: 1,
+    borderColor: Colors.border,
+  },
+  clearFilterText: {
+    color: Colors.textMuted,
+    fontSize: 12,
+    fontWeight: "900",
+  },
   categoryChip: {
     paddingHorizontal: 18,
     paddingVertical: 11,
@@ -852,6 +1917,7 @@ const localStyles = StyleSheet.create({
     marginTop: 4,
   },
   listContent: { paddingHorizontal: 20, paddingTop: 8, paddingBottom: 24 },
+  listContentWithFooter: { paddingBottom: 112 },
   sectionTitle: {
     color: Colors.textMuted,
     fontSize: 13,
@@ -861,79 +1927,341 @@ const localStyles = StyleSheet.create({
     marginTop: 8,
   },
   exerciseCard: {
-    minHeight: 100,
-    borderRadius: 24,
+    height: 88,
+    borderRadius: 22,
     backgroundColor: Colors.card,
     borderWidth: 1,
     borderColor: Colors.border,
-    padding: 14,
-    marginBottom: 14,
+    paddingHorizontal: 14,
+    paddingVertical: 12,
+    marginBottom: 12,
     flexDirection: "row",
     alignItems: "center",
   },
+  exerciseCardSelected: {
+    borderColor: "rgba(50,215,75,0.55)",
+    backgroundColor: "rgba(50,215,75,0.1)",
+  },
   exerciseCardDisabled: { opacity: 0.48 },
   exerciseImage: {
-    width: 64,
-    height: 64,
-    borderRadius: 16,
+    width: 52,
+    height: 52,
+    borderRadius: 15,
     backgroundColor: Colors.border,
-    marginRight: 14,
+    marginRight: 13,
   },
   exerciseImageFallback: {
-    width: 64,
-    height: 64,
-    borderRadius: 16,
+    width: 52,
+    height: 52,
+    borderRadius: 15,
     backgroundColor: Colors.border,
     alignItems: "center",
     justifyContent: "center",
-    marginRight: 14,
+    marginRight: 13,
   },
-  exerciseTextBlock: { flex: 1, minWidth: 0, paddingRight: 10 },
+  exerciseContent: {
+    flex: 1,
+    minWidth: 0,
+    justifyContent: "center",
+  },
+  exerciseTextBlock: { minWidth: 0 },
   exerciseKicker: {
     color: Colors.accent,
-    fontSize: 12,
+    fontSize: 11,
     fontWeight: "900",
     letterSpacing: 0.8,
     textTransform: "uppercase",
-    marginBottom: 4,
+    marginBottom: 5,
+  },
+  exerciseTitleRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 8,
+    minWidth: 0,
+    marginBottom: 5,
   },
   exerciseTitle: {
     color: Colors.text,
     fontSize: 20,
     fontWeight: "900",
-    marginBottom: 5,
+    minWidth: 0,
   },
+  sourceBadge: {
+    paddingHorizontal: 8,
+    paddingVertical: 4,
+    borderRadius: 999,
+    backgroundColor: Colors.cardAlt,
+    borderWidth: 1,
+    borderColor: Colors.border,
+  },
+  sourceBadgeCustom: {
+    backgroundColor: "rgba(50, 215, 75, 0.1)",
+    borderColor: "rgba(50, 215, 75, 0.28)",
+  },
+  sourceBadgeText: {
+    color: Colors.textMuted,
+    fontSize: 10,
+    fontWeight: "900",
+  },
+  sourceBadgeTextCustom: { color: Colors.accent },
   exerciseMeta: { color: Colors.textMuted, fontSize: 14, fontWeight: "700" },
+  exerciseBottomRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+    gap: 10,
+  },
+  exerciseActionsColumn: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "flex-end",
+    gap: 8,
+    marginLeft: 10,
+  },
   favoriteButton: {
+    width: 36,
+    height: 36,
+    borderRadius: 18,
+    alignItems: "center",
+    justifyContent: "center",
+    backgroundColor: "transparent",
+    borderWidth: 0,
+    borderColor: "transparent",
+  },
+  addIndicator: {
     width: 38,
     height: 38,
     borderRadius: 19,
     alignItems: "center",
     justifyContent: "center",
-    marginRight: 6,
-  },
-  addIndicator: {
-    minWidth: 48,
-    height: 40,
-    borderRadius: 999,
-    alignItems: "center",
-    justifyContent: "center",
     backgroundColor: "rgba(50,215,75,0.14)",
     borderWidth: 1,
     borderColor: "rgba(50,215,75,0.35)",
-    paddingHorizontal: 12,
   },
+  addIndicatorSelected: {
+    backgroundColor: Colors.accent,
+    borderColor: Colors.accent,
+  },
+  replaceIndicator: {},
+  useIndicator: {},
   addIndicatorDone: {
     backgroundColor: "transparent",
     borderColor: Colors.borderStrong,
   },
-  addIndicatorText: { color: Colors.accent, fontSize: 14, fontWeight: "900" },
+  addIndicatorText: { color: Colors.accent, fontSize: 13, fontWeight: "900" },
+  addIndicatorDoneText: {
+    color: Colors.textMuted,
+    fontSize: 13,
+    fontWeight: "900",
+  },
+  detailModalOverlay: {
+    flex: 1,
+    justifyContent: "flex-end",
+    backgroundColor: "rgba(0,0,0,0.62)",
+  },
+  detailModalBackdrop: {
+    ...StyleSheet.absoluteFillObject,
+  },
+  detailModalCard: {
+    maxHeight: "88%",
+    backgroundColor: Colors.card,
+    borderTopLeftRadius: 28,
+    borderTopRightRadius: 28,
+    borderWidth: 1,
+    borderColor: Colors.border,
+    paddingHorizontal: 20,
+    paddingTop: 10,
+    paddingBottom: 20,
+  },
+  detailModalHandle: {
+    alignSelf: "center",
+    width: 44,
+    height: 5,
+    borderRadius: 999,
+    backgroundColor: Colors.borderStrong,
+    marginBottom: 16,
+  },
+  detailHeaderRow: {
+    flexDirection: "row",
+    alignItems: "flex-start",
+    marginBottom: 16,
+  },
+  detailKicker: {
+    color: Colors.accent,
+    fontSize: 12,
+    fontWeight: "900",
+    letterSpacing: 0.8,
+    textTransform: "uppercase",
+    marginBottom: 5,
+  },
+  detailTitle: {
+    color: Colors.text,
+    fontSize: 24,
+    fontWeight: "900",
+    letterSpacing: -0.4,
+    marginBottom: 5,
+  },
+  detailSubtitle: {
+    color: Colors.textMuted,
+    fontSize: 13,
+    fontWeight: "800",
+  },
+  detailCloseButton: {
+    width: 36,
+    height: 36,
+    borderRadius: 18,
+    backgroundColor: Colors.surface,
+    alignItems: "center",
+    justifyContent: "center",
+    marginLeft: 12,
+  },
+  detailStatsGrid: {
+    flexDirection: "row",
+    flexWrap: "wrap",
+    gap: 10,
+    marginBottom: 16,
+  },
+  detailStatBox: {
+    width: "48.5%",
+    minHeight: 76,
+    borderRadius: 16,
+    backgroundColor: Colors.surface,
+    borderWidth: 1,
+    borderColor: Colors.border,
+    padding: 12,
+    justifyContent: "center",
+  },
+  detailStatValue: {
+    color: Colors.text,
+    fontSize: 18,
+    fontWeight: "900",
+    marginBottom: 4,
+  },
+  detailStatLabel: {
+    color: Colors.textMuted,
+    fontSize: 10,
+    fontWeight: "900",
+    textTransform: "uppercase",
+  },
+  detailRecentBlock: {
+    marginBottom: 16,
+  },
+  detailSectionTitle: {
+    color: Colors.text,
+    fontSize: 16,
+    fontWeight: "900",
+    marginBottom: 10,
+  },
+  detailPerformanceRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    backgroundColor: Colors.surface,
+    borderRadius: 15,
+    borderWidth: 1,
+    borderColor: Colors.border,
+    padding: 12,
+    marginBottom: 8,
+  },
+  detailPerformanceTitle: {
+    color: Colors.text,
+    fontSize: 14,
+    fontWeight: "900",
+    marginBottom: 3,
+  },
+  detailPerformanceMeta: {
+    color: Colors.textMuted,
+    fontSize: 12,
+    fontWeight: "700",
+  },
+  detailPerformanceSet: {
+    color: Colors.accent,
+    fontSize: 13,
+    fontWeight: "900",
+    marginLeft: 10,
+    maxWidth: 112,
+  },
+  detailEmptyState: {
+    alignItems: "center",
+    backgroundColor: Colors.surface,
+    borderRadius: 16,
+    borderWidth: 1,
+    borderColor: Colors.border,
+    padding: 18,
+  },
+  detailEmptyTitle: {
+    color: Colors.text,
+    fontSize: 15,
+    fontWeight: "900",
+    marginTop: 8,
+    marginBottom: 4,
+  },
+  detailEmptyBody: {
+    color: Colors.textMuted,
+    fontSize: 12,
+    fontWeight: "700",
+    textAlign: "center",
+    lineHeight: 17,
+  },
+  detailSecondaryButton: {
+    height: 48,
+    borderRadius: 16,
+    borderWidth: 1,
+    borderColor: "rgba(50, 215, 75, 0.28)",
+    backgroundColor: "rgba(50, 215, 75, 0.1)",
+    alignItems: "center",
+    justifyContent: "center",
+    flexDirection: "row",
+    gap: 8,
+    marginBottom: 10,
+  },
+  detailSecondaryButtonText: {
+    color: Colors.accent,
+    fontSize: 14,
+    fontWeight: "900",
+  },
+  detailPrimaryButton: {
+    height: 52,
+    borderRadius: 16,
+    backgroundColor: Colors.accent,
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  detailPrimaryButtonDisabled: {
+    backgroundColor: Colors.surface,
+    borderWidth: 1,
+    borderColor: Colors.border,
+  },
+  detailPrimaryButtonText: {
+    color: Colors.background,
+    fontSize: 15,
+    fontWeight: "900",
+  },
   loadingState: { flex: 1, alignItems: "center", justifyContent: "center" },
   mutedText: {
     color: Colors.textMuted,
     marginTop: 12,
     fontSize: 15,
     fontWeight: "700",
+  },
+  multiSelectFooter: {
+    paddingHorizontal: 20,
+    paddingTop: 12,
+    backgroundColor: Colors.background,
+    borderTopWidth: 1,
+    borderTopColor: Colors.card,
+  },
+  multiSelectButton: {
+    minHeight: 58,
+    borderRadius: 20,
+    backgroundColor: Colors.accent,
+    alignItems: "center",
+    justifyContent: "center",
+    paddingHorizontal: 18,
+  },
+  multiSelectButtonText: {
+    color: Colors.background,
+    fontSize: 17,
+    fontWeight: "900",
   },
   createModalOverlay: {
     flex: 1,

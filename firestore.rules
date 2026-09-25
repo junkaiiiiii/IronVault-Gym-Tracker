@@ -1,0 +1,319 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+
+    function isOwner(userId) {
+      return isAuthenticated() && request.auth.uid == userId;
+    }
+
+    function isValidString(text, min, max) {
+      return text is string && text.size() >= min && text.size() <= max;
+    }
+
+    function isValidUsername(username) {
+      return isValidString(username, 3, 20)
+        && username.matches('^[a-z0-9_]+$')
+        && !username.matches('^_.*')
+        && !username.matches('.*_$');
+    }
+
+    function userProfileFields() {
+      return [
+        'username',
+        'usernameLower',
+        'metric',
+        'restTime',
+        'restTimerEnabled',
+        'timerEnabled',
+        'autoCheckEnabled',
+        'rpeTrackingEnabled',
+        'plateCalcEnabled',
+        'nextSessionNotesEnabled',
+        'customAttachments',
+        'platesKg',
+        'platesLbs',
+        'plateInventory',
+        'setupComplete',
+        'lastUsedGym',
+        'activeSplitFolderId',
+        'legalAcceptance',
+        'legalAcceptedAt',
+        'termsVersion',
+        'privacyVersion',
+        'createdAt',
+        'updatedAt'
+      ];
+    }
+
+    function validUserProfileValues(keys) {
+      return (!keys.hasAny(['username'])
+        || isValidUsername(request.resource.data.username))
+      && (!keys.hasAny(['usernameLower'])
+        || isValidUsername(request.resource.data.usernameLower))
+      && (!keys.hasAny(['metric'])
+        || request.resource.data.metric in ['KG', 'LBS'])
+      && (!keys.hasAny(['restTime'])
+        || request.resource.data.restTime is number
+        && request.resource.data.restTime >= 15
+        && request.resource.data.restTime <= 600)
+      && (!keys.hasAny(['restTimerEnabled'])
+        || request.resource.data.restTimerEnabled is bool)
+      && (!keys.hasAny(['timerEnabled'])
+        || request.resource.data.timerEnabled is bool)
+      && (!keys.hasAny(['autoCheckEnabled'])
+        || request.resource.data.autoCheckEnabled is bool)
+      && (!keys.hasAny(['rpeTrackingEnabled'])
+        || request.resource.data.rpeTrackingEnabled is bool)
+      && (!keys.hasAny(['plateCalcEnabled'])
+        || request.resource.data.plateCalcEnabled is bool)
+      && (!keys.hasAny(['nextSessionNotesEnabled'])
+        || request.resource.data.nextSessionNotesEnabled is bool)
+      && (!keys.hasAny(['customAttachments'])
+        || request.resource.data.customAttachments is list
+        && request.resource.data.customAttachments.size() <= 20)
+      && (!keys.hasAny(['legalAcceptance'])
+        || request.resource.data.legalAcceptance is map
+        && request.resource.data.legalAcceptance.keys().hasOnly([
+          'termsVersion',
+          'privacyVersion',
+          'acceptedAt'
+        ])
+        && isValidString(request.resource.data.legalAcceptance.termsVersion, 1, 50)
+        && isValidString(request.resource.data.legalAcceptance.privacyVersion, 1, 50)
+        && request.resource.data.legalAcceptance.acceptedAt is number)
+      && (!keys.hasAny(['legalAcceptedAt'])
+        || request.resource.data.legalAcceptedAt is number)
+      && (!keys.hasAny(['termsVersion'])
+        || isValidString(request.resource.data.termsVersion, 1, 50))
+      && (!keys.hasAny(['privacyVersion'])
+        || isValidString(request.resource.data.privacyVersion, 1, 50));
+    }
+
+    function validUserProfileCreate() {
+      return request.resource.data.keys().hasOnly(userProfileFields())
+        && validUserProfileValues(request.resource.data.keys());
+    }
+
+    function validUserProfileUpdate() {
+      return request.resource.data.diff(resource.data).affectedKeys().hasOnly(userProfileFields())
+        && validUserProfileValues(request.resource.data.diff(resource.data).affectedKeys());
+    }
+
+    function workoutFields() {
+      return [
+        'id',
+        'date',
+        'workoutName',
+        'volume',
+        'isKg',
+        'gymId',
+        'gymName',
+        'duration',
+        'durationSeconds',
+        'prType',
+        'fullWorkoutData',
+        'createdAt',
+        'updatedAt',
+        'completedAt',
+        'startedAt',
+        'finishedAt',
+        'timestamp',
+        'totalPausedMs',
+        'rpeTrackingEnabled',
+        'prs'
+      ];
+    }
+
+    function validWorkoutValues(keys) {
+      return (!keys.hasAny(['id'])
+        || isValidString(request.resource.data.id, 1, 100))
+      && (!keys.hasAny(['date'])
+        || isValidString(request.resource.data.date, 1, 50))
+      && (!keys.hasAny(['workoutName'])
+        || isValidString(request.resource.data.workoutName, 1, 50))
+      && (!keys.hasAny(['volume'])
+        || request.resource.data.volume is number
+        && request.resource.data.volume >= 0)
+      && (!keys.hasAny(['gymId'])
+        || request.resource.data.gymId == null
+        || isValidString(request.resource.data.gymId, 1, 100))
+      && (!keys.hasAny(['gymName'])
+        || request.resource.data.gymName == null
+        || isValidString(request.resource.data.gymName, 1, 50))
+      && (!keys.hasAny(['duration'])
+        || request.resource.data.duration is number
+        || isValidString(request.resource.data.duration, 0, 50))
+      && (!keys.hasAny(['durationSeconds'])
+        || request.resource.data.durationSeconds is number
+        && request.resource.data.durationSeconds >= 0
+        && request.resource.data.durationSeconds <= 86400)
+      && (!keys.hasAny(['prType'])
+        || request.resource.data.prType == null
+        || isValidString(request.resource.data.prType, 0, 100))
+      && (!keys.hasAny(['fullWorkoutData'])
+        || request.resource.data.fullWorkoutData is list
+        && request.resource.data.fullWorkoutData.size() <= 25)
+      && (!keys.hasAny(['totalPausedMs'])
+        || request.resource.data.totalPausedMs is number
+        && request.resource.data.totalPausedMs >= 0
+        && request.resource.data.totalPausedMs <= 86400000)
+      && (!keys.hasAny(['rpeTrackingEnabled'])
+        || request.resource.data.rpeTrackingEnabled is bool)
+      && (!keys.hasAny(['prs'])
+        || request.resource.data.prs is list
+        && request.resource.data.prs.size() <= 100);
+    }
+
+    function validWorkoutCreate() {
+      return request.resource.data.keys().hasOnly(workoutFields())
+        && request.resource.data.keys().hasAll(['id', 'date', 'workoutName', 'volume'])
+        && validWorkoutValues(request.resource.data.keys());
+    }
+
+    function validWorkoutUpdate(workoutId) {
+      return request.resource.data.diff(resource.data).affectedKeys().hasOnly(workoutFields())
+        && workoutId == request.resource.data.id
+        && validWorkoutValues(request.resource.data.diff(resource.data).affectedKeys());
+    }
+
+    function validConfigKey(configId) {
+      return configId in [
+        'templates',
+        'personal_exercises',
+        'folders',
+        'gyms',
+        'global_variants',
+        'favorite_exercises',
+        'sync_status'
+      ];
+    }
+
+    function validConfigCreate(configId) {
+      return validConfigKey(configId)
+        && request.resource.data.keys().hasOnly([
+          'data',
+          'updatedAt',
+          'deletedIds',
+          'deletedValues',
+          'deletedVariantValues'
+        ])
+        && validConfigData(configId)
+        && validConfigDeleteMarkers(configId);
+    }
+
+    function validConfigUpdate(configId) {
+      return validConfigKey(configId)
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+          'data',
+          'updatedAt',
+          'deletedIds',
+          'deletedValues',
+          'deletedVariantValues'
+        ])
+        && (!request.resource.data.diff(resource.data).affectedKeys().hasAny(['data'])
+          || validConfigData(configId))
+        && validConfigDeleteMarkers(configId);
+    }
+
+    function validConfigData(configId) {
+      return (configId != 'templates'
+          || request.resource.data.data is list
+          && request.resource.data.data.size() <= 50)
+        && (configId != 'folders'
+          || request.resource.data.data is list
+          && request.resource.data.data.size() <= 20)
+        && (configId != 'personal_exercises'
+          || request.resource.data.data is list
+          && request.resource.data.data.size() <= 100)
+        && (configId != 'gyms'
+          || request.resource.data.data is list
+          && request.resource.data.data.size() <= 25)
+        && (configId != 'global_variants'
+          || request.resource.data.data is list
+          && request.resource.data.data.size() <= 100)
+        && (configId != 'favorite_exercises'
+          || request.resource.data.data is list
+          && request.resource.data.data.size() <= 500)
+        && (configId != 'sync_status'
+          || request.resource.data.data is map);
+    }
+
+    function validConfigDeleteMarkers(configId) {
+      return (!request.resource.data.keys().hasAny(['deletedIds'])
+          || configId in ['templates', 'personal_exercises', 'folders', 'gyms']
+          && request.resource.data.deletedIds is list
+          && request.resource.data.deletedIds.size() <= 1000)
+        && (!request.resource.data.keys().hasAny(['deletedValues'])
+          || configId in ['global_variants', 'favorite_exercises']
+          && request.resource.data.deletedValues is list
+          && request.resource.data.deletedValues.size() <= 1000)
+        && (!request.resource.data.keys().hasAny(['deletedVariantValues'])
+          || configId == 'gyms'
+          && request.resource.data.deletedVariantValues is list
+          && request.resource.data.deletedVariantValues.size() <= 1000);
+    }
+
+    match /usernames/{username} {
+      allow read: if isAuthenticated();
+
+      allow create: if isAuthenticated()
+        && isValidUsername(username)
+        && request.resource.data.keys().hasOnly([
+          'uid',
+          'username',
+          'usernameLower',
+          'display_name',
+          'updatedAt'
+        ])
+        && request.resource.data.uid == request.auth.uid
+        && request.resource.data.username == username
+        && request.resource.data.usernameLower == username;
+
+      allow update: if isAuthenticated()
+        && isValidUsername(username)
+        && resource.data.uid == request.auth.uid
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+          'uid',
+          'username',
+          'usernameLower',
+          'display_name',
+          'updatedAt'
+        ])
+        && request.resource.data.uid == request.auth.uid
+        && request.resource.data.username == username
+        && request.resource.data.usernameLower == username;
+
+      allow delete: if isAuthenticated()
+        && resource.data.uid == request.auth.uid;
+    }
+
+    match /users/{userId} {
+      allow read: if isOwner(userId);
+      allow create: if isOwner(userId) && validUserProfileCreate();
+      allow update: if isOwner(userId) && validUserProfileUpdate();
+      allow delete: if isOwner(userId);
+
+      match /workouts/{workoutId} {
+        allow read, delete: if isOwner(userId);
+        allow create: if isOwner(userId)
+          && workoutId == request.resource.data.id
+          && validWorkoutCreate();
+        allow update: if isOwner(userId) && validWorkoutUpdate(workoutId);
+      }
+
+      match /configs/{configId} {
+        allow read, delete: if isOwner(userId);
+        allow create: if isOwner(userId) && validConfigCreate(configId);
+        allow update: if isOwner(userId) && validConfigUpdate(configId);
+      }
+    }
+
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}

@@ -11,15 +11,13 @@ import {
   KeyboardAvoidingView,
   Platform,
 } from "react-native";
-import {
-  SafeAreaView,
-  useSafeAreaInsets,
-} from "react-native-safe-area-context";
+import { SafeAreaView } from "react-native-safe-area-context";
 import AsyncStorage from "@react-native-async-storage/async-storage";
 import * as Haptics from "expo-haptics";
 import * as FileSystem from "expo-file-system/legacy";
 import * as Sharing from "expo-sharing";
 import * as DocumentPicker from "expo-document-picker";
+import * as WebBrowser from "expo-web-browser";
 import { Ionicons } from "@expo/vector-icons";
 import { styles } from "../constants/globalStyles";
 import { DEFAULT_PLATES_KG, DEFAULT_PLATES_LBS } from "../constants/data";
@@ -34,6 +32,8 @@ import {
   getDocs,
   query,
   where,
+  runTransaction,
+  setDoc,
 } from "firebase/firestore";
 
 import {
@@ -44,12 +44,40 @@ import {
   pushWorkoutListToCloud,
   syncEverythingWithCloud,
   getLocalCloudSyncStatus,
+  assertReasonableBackupFileSize,
+  safeJsonParse,
+  markConfigItemsDeletedLocally,
+  markConfigValuesDeletedLocally,
+  clearConfigValuesDeletedLocally,
+  sanitizeGymsForStorage,
+  sanitizeMachineBrandsForStorage,
   buildIronVaultBackup,
+  previewIronVaultBackupImport,
   importIronVaultBackup,
+  previewCloudCategoryRestore,
+  restoreCloudCategories,
 } from "../utils/firebaseSync";
+import type { CloudRestoreCategory } from "../utils/firebaseSync";
 
-import CustomAlert from "../components/CustomAlert";
+import BlockingOverlay from "../components/BlockingOverlay";
+import LegalDocument from "../components/LegalDocument";
+import {
+  LEGAL_DOCUMENTS,
+  LEGAL_WEBSITE_URL,
+  LegalDocumentType,
+} from "../constants/legal";
 import { genId } from "../utils/helpers";
+import {
+  LIMITS,
+  clampRestSeconds,
+  cleanLimitedText,
+  limitText,
+  sanitizeWholeNumberInput,
+} from "../constants/limits";
+import {
+  readNextSessionNotesEnabled,
+  writeNextSessionNotesEnabled,
+} from "../utils/nextSessionNotes";
 
 const GUIDE_CONTENT = [
   {
@@ -126,6 +154,13 @@ const GUIDE_CONTENT = [
   },
 ];
 
+const REST_TIMER_PRESETS = [
+  { label: "60s", value: "60" },
+  { label: "90s", value: "90" },
+  { label: "2m", value: "120" },
+  { label: "3m", value: "180" },
+];
+
 const DEFAULT_VARIANTS = [
   "Precor",
   "Hammer Strength",
@@ -160,25 +195,252 @@ const formatSyncTime = (timestamp?: number | null) => {
   });
 };
 
-const formatSyncCounts = (status: any) => {
-  if (!status) return "No sync data yet";
-
-  const details = [
-    `${status.workouts ?? 0} workouts`,
-    `${status.templates ?? 0} templates`,
-    `${status.folders ?? 0} folders`,
-    `${status.personalExercises ?? 0} exercises`,
-    `${status.favoriteExercises ?? 0} favorites`,
-    `${status.gyms ?? 0} gyms`,
-    `${status.machineBrands ?? 0} brands`,
-  ];
-
-  return details.join(" · ");
+const getSyncTone = (status: any, isSyncing: boolean) => {
+  if (isSyncing) return "#32D74B";
+  if (status?.success === false) return "#FF9F0A";
+  if (status?.lastSyncedAt) return "#32D74B";
+  return "#8E8E93";
 };
+
+const getSyncIcon = (status: any, isSyncing: boolean) => {
+  if (isSyncing) return "cloud-upload-outline";
+  if (status?.success === false) return "alert-circle-outline";
+  if (status?.lastSyncedAt) return "cloud-done-outline";
+  return "cloud-outline";
+};
+
+const getSyncTitle = (status: any, isSyncing: boolean) => {
+  if (isSyncing) return "Syncing data";
+  if (status?.success === false) return "Cloud backup did not finish";
+  if (status?.lastSyncedAt) return "Cloud sync is up to date";
+  return "Cloud sync not run yet";
+};
+
+const getSyncSubtitle = (status: any, isSyncing = false) => {
+  if (isSyncing) {
+    return "Merging this device with your cloud backup. Local data stays on this device.";
+  }
+
+  if (!status) {
+    return "Saved locally. Run a cloud sync to back up this device.";
+  }
+
+  if (status.success === false) {
+    return "Your data is still saved on this device. Cloud backup did not finish.";
+  }
+
+  return `Last successful sync: ${formatSyncTime(status.lastSyncedAt)}`;
+};
+
+const getSyncDetailRows = (status: any, isSyncing = false) => {
+  if (isSyncing) {
+    return [
+      "Local data is kept while cloud sync runs.",
+      "Do not close the app until the sync finishes.",
+    ];
+  }
+
+  if (!status) {
+    return [
+      "Local data is saved on this device first.",
+      "No successful cloud backup has been recorded yet.",
+    ];
+  }
+
+  if (status.success === false) {
+    const failedAt = formatSyncTime(status.lastFailedAt || status.lastAttemptedAt);
+    const rows = [
+      "Local data is safe on this device.",
+      `Last cloud attempt: ${failedAt}`,
+    ];
+    if (status.lastSyncedAt) {
+      rows.push(`Last successful sync: ${formatSyncTime(status.lastSyncedAt)}`);
+    } else {
+      rows.push("No successful cloud sync recorded yet.");
+    }
+    if (status.errorMessage) rows.push(`Reason: ${status.errorMessage}`);
+    return rows;
+  }
+
+  return [
+    `Last successful sync: ${formatSyncTime(status.lastSyncedAt)}`,
+    `Last attempted: ${formatSyncTime(status.lastAttemptedAt || status.lastSyncedAt)}`,
+  ];
+};
+
+const getSyncSummaryChips = (status: any) => [
+  `${status?.workouts ?? 0} workouts`,
+  `${status?.templates ?? 0} templates`,
+  `${status?.folders ?? 0} folders`,
+  `${status?.personalExercises ?? 0} exercises`,
+  `${status?.favoriteExercises ?? 0} favorites`,
+  `${status?.gyms ?? 0} gyms`,
+  `${status?.machineBrands ?? 0} brands`,
+  status?.settingsSynced ? "settings synced" : "settings",
+];
 
 const getSyncConfigCount = (configs: any[] = [], key: string) =>
   configs.find((item: any) => item.key === key)?.mergedCount ?? 0;
 
+const RESTORE_CATEGORY_OPTIONS: {
+  key: CloudRestoreCategory;
+  title: string;
+  subtitle: string;
+  icon: keyof typeof Ionicons.glyphMap;
+}[] = [
+  {
+    key: "workouts",
+    title: "Workout History",
+    subtitle: "Completed sessions, PRs, and logged sets.",
+    icon: "time-outline",
+  },
+  {
+    key: "templates",
+    title: "Templates",
+    subtitle: "Saved routines and their exercise structures.",
+    icon: "clipboard-outline",
+  },
+  {
+    key: "folders",
+    title: "Folders & Splits",
+    subtitle: "Template folders, split days, and active split links.",
+    icon: "folder-outline",
+  },
+  {
+    key: "personalExercises",
+    title: "Custom Exercises",
+    subtitle: "Exercises you created yourself.",
+    icon: "barbell-outline",
+  },
+  {
+    key: "favoriteExercises",
+    title: "Favourite Exercises",
+    subtitle: "Your starred exercise shortcuts.",
+    icon: "star-outline",
+  },
+  {
+    key: "gyms",
+    title: "Gyms",
+    subtitle: "Gym list, default machine brands, and local variants.",
+    icon: "location-outline",
+  },
+  {
+    key: "machineBrands",
+    title: "Machine Brands",
+    subtitle: "Global machine brand names.",
+    icon: "construct-outline",
+  },
+  {
+    key: "settings",
+    title: "Settings",
+    subtitle: "Units, rest timer, plate calculator, and setup preferences.",
+    icon: "settings-outline",
+  },
+];
+
+const buildCloudRestoreCompleteSummary = (result: any) => {
+  const restored = result?.restored || {};
+  return RESTORE_CATEGORY_OPTIONS.filter((option) =>
+    result?.selected?.includes(option.key),
+  )
+    .map((option) => `${option.title}: ${restored[option.key] ?? 0}`)
+    .join("\n");
+};
+
+
+
+const RECENT_LOGIN_WINDOW_MS = 5 * 60 * 1000;
+
+const normalizeUsername = (value: any) => String(value || "").trim().toLowerCase();
+
+const hasRecentSignIn = () => {
+  const lastSignInTime = auth.currentUser?.metadata?.lastSignInTime;
+  const lastSignInMs = lastSignInTime ? Date.parse(lastSignInTime) : 0;
+  return !!lastSignInMs && Date.now() - lastSignInMs <= RECENT_LOGIN_WINDOW_MS;
+};
+
+const validateUsername = (value: string) => {
+  const normalized = normalizeUsername(value);
+
+  if (!normalized) return "Enter a username.";
+  if (normalized.length < 3) return "Username must be at least 3 characters.";
+  if (normalized.length > 20) return "Username must be 20 characters or fewer.";
+  if (!/^[a-z0-9_]+$/.test(normalized)) {
+    return "Use lowercase letters, numbers, and underscores only.";
+  }
+  if (normalized.startsWith("_") || normalized.endsWith("_")) {
+    return "Username cannot start or end with an underscore.";
+  }
+
+  return null;
+};
+
+
+
+const formatBackupPreviewDate = (value: any) => {
+  const timestamp = typeof value === "number" ? value : Date.parse(String(value || ""));
+  if (!timestamp || Number.isNaN(timestamp)) return "Unknown date";
+  return new Date(timestamp).toLocaleString(undefined, {
+    day: "numeric",
+    month: "short",
+    year: "numeric",
+    hour: "numeric",
+    minute: "2-digit",
+  });
+};
+
+const formatBackupPreviewCount = (label: string, total: number, added: number) =>
+  `${label}: ${total} in backup · ${added} new`;
+
+const buildBackupPreviewSummary = (preview: any) => {
+  const totals = preview?.totals || {};
+  const additions = preview?.additions || {};
+  const hasNewData = Object.values(additions).some(
+    (value: any) => Number(value || 0) > 0,
+  );
+
+  return [
+    `Exported: ${formatBackupPreviewDate(preview?.metadata?.exportedAt)}`,
+    `Backup version: ${preview?.metadata?.version ?? 1}`,
+    "",
+    formatBackupPreviewCount("Workouts", totals.workouts ?? 0, additions.workouts ?? 0),
+    formatBackupPreviewCount("Templates", totals.templates ?? 0, additions.templates ?? 0),
+    formatBackupPreviewCount("Folders", totals.folders ?? 0, additions.folders ?? 0),
+    formatBackupPreviewCount("Exercises", totals.personalExercises ?? 0, additions.personalExercises ?? 0),
+    formatBackupPreviewCount("Favorites", totals.favoriteExercises ?? 0, additions.favoriteExercises ?? 0),
+    formatBackupPreviewCount("Gyms", totals.gyms ?? 0, additions.gyms ?? 0),
+    formatBackupPreviewCount("Machine brands", totals.machineBrands ?? 0, additions.machineBrands ?? 0),
+    formatBackupPreviewCount("Settings", totals.settings ?? 0, additions.settings ?? 0),
+    "",
+    hasNewData
+      ? "Merge-only import adds the new items shown above. Existing local data is kept and duplicates are skipped."
+      : "No new items were found. Your current data already appears to contain this backup.",
+  ].join("\n");
+};
+
+const buildImportCompleteSummary = (importResult: any) => {
+  const added = importResult?.added || {};
+  const lines = [
+    `Workouts added: ${added.workouts ?? 0}`,
+    `Templates added: ${added.templates ?? 0}`,
+    `Folders added: ${added.folders ?? 0}`,
+    `Exercises added: ${added.personalExercises ?? 0}`,
+    `Favorites added: ${added.favoriteExercises ?? 0}`,
+    `Gyms added: ${added.gyms ?? 0}`,
+    `Machine brands added: ${added.machineBrands ?? 0}`,
+    `Settings added: ${added.settings ?? 0}`,
+  ];
+
+  return [
+    "Merged your backup without wiping current data.",
+    "",
+    ...lines,
+    "",
+    "Duplicates were skipped and existing local items were kept.",
+  ].join("\n");
+};
+
+const USERNAME_TAKEN_ERROR = "IRONVAULT_USERNAME_TAKEN";
 
 const getFriendlyOperationError = (error: any, fallback: string) => {
   const message = String(error?.message || "").toLowerCase();
@@ -204,20 +466,34 @@ const getFriendlyOperationError = (error: any, fallback: string) => {
 };
 
 export default function SettingsScreen({ navigation }: any) {
-  const insets = useSafeAreaInsets();
   const scrollRef = useRef<ScrollView>(null);
   const [metric, setMetric] = useState("LBS");
   const [rest, setRest] = useState("90");
   const [timerEnabled, setTimerEnabled] = useState(true);
   const [autoCheckEnabled, setAutoCheckEnabled] = useState(false);
+  const [rpeTrackingEnabled, setRpeTrackingEnabled] = useState(false);
   const [plateCalcEnabled, setPlateCalcEnabled] = useState(true);
+  const [nextSessionNotesEnabled, setNextSessionNotesEnabled] =
+    useState(false);
   const [platesKg, setPlatesKg] = useState<number[]>(DEFAULT_PLATES_KG);
   const [platesLbs, setPlatesLbs] = useState<number[]>(DEFAULT_PLATES_LBS);
   const [isSyncing, setIsSyncing] = useState(false);
   const [isExporting, setIsExporting] = useState(false);
   const [isImporting, setIsImporting] = useState(false);
+  const [isRestorePreviewLoading, setIsRestorePreviewLoading] = useState(false);
+  const [isRestoringCloudData, setIsRestoringCloudData] = useState(false);
+  const [restorePreview, setRestorePreview] = useState<any>(null);
+  const [selectedRestoreCategories, setSelectedRestoreCategories] = useState<
+    CloudRestoreCategory[]
+  >([]);
   const [syncStatus, setSyncStatus] = useState<any>(null);
   const [accountDisplayName, setAccountDisplayName] = useState("Athlete");
+  const [currentUsernameLower, setCurrentUsernameLower] = useState("");
+  const [isUsernameModalVisible, setIsUsernameModalVisible] = useState(false);
+  const [usernameDraft, setUsernameDraft] = useState("");
+  const [usernameError, setUsernameError] = useState("");
+  const [isUsernameSaving, setIsUsernameSaving] = useState(false);
+  const [usernameWarning, setUsernameWarning] = useState("");
 
   const [isDeleteModalVisible, setIsDeleteModalVisible] = useState(false);
   const [deleteConfirmationText, setDeleteConfirmationText] = useState("");
@@ -225,7 +501,7 @@ export default function SettingsScreen({ navigation }: any) {
 
   const [isGuideVisible, setIsGuideVisible] = useState(false);
   const [isLegalModalVisible, setIsLegalModalVisible] = useState(false);
-  const [legalTab, setLegalTab] = useState<"TERMS" | "PRIVACY">("TERMS");
+  const [legalTab, setLegalTab] = useState<LegalDocumentType>("terms");
 
   const [gyms, setGyms] = useState<any[]>([]);
   const [isGymModalVisible, setIsGymModalVisible] = useState(false);
@@ -240,12 +516,72 @@ export default function SettingsScreen({ navigation }: any) {
   const [isGlobalVariantModalVisible, setIsGlobalVariantModalVisible] =
     useState(false);
   const [newGlobalVariant, setNewGlobalVariant] = useState("");
+  const [settingsBlockingMessage, setSettingsBlockingMessage] = useState("");
+  const settingsBlockingRef = useRef(false);
 
   const uid = auth.currentUser?.uid;
+  const isSettingsBlocking = settingsBlockingMessage.length > 0;
+
+  const runSettingsBlockingAction = async (
+    message: string,
+    action: () => Promise<void> | void,
+  ) => {
+    if (settingsBlockingRef.current) return;
+
+    settingsBlockingRef.current = true;
+    setSettingsBlockingMessage(message);
+    const startedAt = Date.now();
+    try {
+      await action();
+    } catch (error) {
+      console.error("Settings action failed:", error);
+    } finally {
+      const remainingVisibleMs = Math.max(0, 350 - (Date.now() - startedAt));
+      if (remainingVisibleMs > 0) {
+        await new Promise((resolve) => setTimeout(resolve, remainingVisibleMs));
+      }
+      settingsBlockingRef.current = false;
+      setSettingsBlockingMessage("");
+    }
+  };
 
   const machineBrandOptions = Array.from(
     new Set([...DEFAULT_VARIANTS, ...globalVariants]),
   );
+
+  const normalizeListName = (value: any) =>
+    String(value || "")
+      .trim()
+      .toLowerCase()
+      .replace(/\s+/g, " ");
+
+  const sanitizeGlobalVariantList = (items: any[]) =>
+    sanitizeMachineBrandsForStorage(items);
+
+  const updateRestDraft = (value: string) => {
+    const safeInput = sanitizeWholeNumberInput(value, LIMITS.restSecondsMax);
+    setRest(safeInput);
+  };
+
+  const saveRestDuration = async (value: string) => {
+    const safeInput = sanitizeWholeNumberInput(value, LIMITS.restSecondsMax);
+    if (!uid) return;
+
+    const parsed = Math.round(Number(safeInput));
+    if (
+      !Number.isFinite(parsed) ||
+      parsed < LIMITS.restSecondsMin ||
+      parsed > LIMITS.restSecondsMax
+    )
+      return;
+
+    const clampedRest = clampRestSeconds(parsed);
+    setRest(String(clampedRest));
+    await AsyncStorage.setItem(`@rest_time_${uid}`, String(clampedRest));
+    syncSettingsToCloud({ restTime: clampedRest }).catch((error) =>
+      console.log("Rest setting cloud sync delayed:", error),
+    );
+  };
 
   useEffect(() => {
     const unsubscribe = navigation.addListener("focus", () => {
@@ -263,17 +599,21 @@ export default function SettingsScreen({ navigation }: any) {
       const r = await AsyncStorage.getItem(`@rest_time_${uid}`);
       const te = await AsyncStorage.getItem(`@rest_timer_enabled_${uid}`);
       const ac = await AsyncStorage.getItem(`@auto_check_enabled_${uid}`);
+      const rpe = await AsyncStorage.getItem(`@rpe_tracking_enabled_${uid}`);
       const pc = await AsyncStorage.getItem(`@plate_calc_enabled_${uid}`);
+      const nsn = await readNextSessionNotesEnabled(uid);
       const pkg = await AsyncStorage.getItem(`@plates_kg_${uid}`);
       const plbs = await AsyncStorage.getItem(`@plates_lbs_${uid}`);
 
       if (m) setMetric(m);
-      if (r) setRest(r);
+      if (r) setRest(String(clampRestSeconds(r)));
       if (te !== null) setTimerEnabled(te === "true");
       if (ac !== null) setAutoCheckEnabled(ac === "true");
+      if (rpe !== null) setRpeTrackingEnabled(rpe === "true");
       if (pc !== null) setPlateCalcEnabled(pc === "true");
-      if (pkg) setPlatesKg(JSON.parse(pkg));
-      if (plbs) setPlatesLbs(JSON.parse(plbs));
+      setNextSessionNotesEnabled(nsn);
+      if (pkg) setPlatesKg(safeJsonParse(pkg, DEFAULT_PLATES_KG));
+      if (plbs) setPlatesLbs(safeJsonParse(plbs, DEFAULT_PLATES_LBS));
 
       const localSyncStatus = await getLocalCloudSyncStatus(uid);
       if (localSyncStatus) {
@@ -291,46 +631,119 @@ export default function SettingsScreen({ navigation }: any) {
         }
       }
 
+      const ensureUsernameReservation = async (candidateUsername: string) => {
+        const user = auth.currentUser;
+        const normalized = normalizeUsername(candidateUsername);
+        if (!user || validateUsername(normalized)) return false;
+
+        try {
+          const now = Date.now();
+          const usernameRef = doc(db, "usernames", normalized);
+          const userRef = doc(db, "users", user.uid);
+
+          await runTransaction(db, async (transaction) => {
+            const usernameSnap = await transaction.get(usernameRef);
+
+            if (usernameSnap.exists()) {
+              const ownerUid = usernameSnap.data().uid;
+              if (ownerUid && ownerUid !== user.uid) {
+                throw new Error(USERNAME_TAKEN_ERROR);
+              }
+            }
+
+            transaction.set(
+              usernameRef,
+              {
+                uid: user.uid,
+                username: normalized,
+                usernameLower: normalized,
+                display_name: normalized,
+                updatedAt: now,
+              },
+              { merge: true },
+            );
+
+            transaction.set(
+              userRef,
+              {
+                username: normalized,
+                usernameLower: normalized,
+                updatedAt: now,
+              },
+              { merge: true },
+            );
+          });
+
+          setUsernameWarning("");
+          return true;
+        } catch (error: any) {
+          if (String(error?.message || "").includes(USERNAME_TAKEN_ERROR)) {
+            setUsernameWarning(
+              "Your saved username is no longer available. Choose a new one to keep your account synced.",
+            );
+          } else {
+            console.log("Username reservation migration failed:", error);
+            setUsernameWarning(
+              "Could not verify your username reservation. Check your connection and try again later.",
+            );
+          }
+          return false;
+        }
+      };
+
       const loadAccountUsername = async () => {
         const user = auth.currentUser;
         if (!user) return;
 
-        const fallbackName = user.email?.split("@")[0] || "Athlete";
-        const storedName = await AsyncStorage.getItem(
-          `@user_username_${user.uid}`,
-        );
-
-        if (storedName) {
-          setAccountDisplayName(storedName);
-          return;
-        }
+        const cacheKey = `@user_username_${user.uid}`;
+        const fallbackName = normalizeUsername(user.email?.split("@")[0] || "Athlete");
+        const storedName = normalizeUsername(await AsyncStorage.getItem(cacheKey));
 
         try {
           let cloudName: string | null = null;
+          let cloudUsernameLower = "";
           const userDoc = await getDoc(doc(db, "users", user.uid));
 
-          if (userDoc.exists() && userDoc.data().username) {
-            cloudName = userDoc.data().username;
-          } else {
+          if (userDoc.exists()) {
+            const data = userDoc.data();
+            cloudName = data.username || data.usernameLower || null;
+            cloudUsernameLower = normalizeUsername(data.usernameLower || data.username);
+          }
+
+          if (!cloudUsernameLower) {
             const q = query(
               collection(db, "usernames"),
               where("uid", "==", user.uid),
             );
             const qSnap = await getDocs(q);
             if (!qSnap.empty) {
-              cloudName = qSnap.docs[0].data().display_name;
+              const reservation = qSnap.docs[0];
+              const data = reservation.data();
+              cloudName =
+                data.usernameLower ||
+                data.username ||
+                data.display_name ||
+                reservation.id;
+              cloudUsernameLower = normalizeUsername(
+                data.usernameLower || data.username || reservation.id,
+              );
             }
           }
 
-          if (cloudName) {
-            setAccountDisplayName(cloudName);
-            await AsyncStorage.setItem(`@user_username_${user.uid}`, cloudName);
-          } else {
-            setAccountDisplayName(fallbackName);
-          }
+          const resolvedUsername = cloudUsernameLower || normalizeUsername(cloudName) || storedName || fallbackName;
+
+          setAccountDisplayName(resolvedUsername);
+          setCurrentUsernameLower(resolvedUsername);
+          await AsyncStorage.setItem(cacheKey, resolvedUsername);
+          await ensureUsernameReservation(resolvedUsername);
         } catch (error) {
           console.log("Error fetching settings account username:", error);
-          setAccountDisplayName(fallbackName);
+          const fallbackResolved = storedName || fallbackName;
+          setAccountDisplayName(fallbackResolved);
+          setCurrentUsernameLower(fallbackResolved);
+          setUsernameWarning(
+            "Could not verify your username. Showing your saved username for now.",
+          );
         }
       };
 
@@ -338,15 +751,34 @@ export default function SettingsScreen({ navigation }: any) {
 
       const savedGyms = await AsyncStorage.getItem(`@user_gyms_${uid}`);
       if (savedGyms) {
-        setGyms(JSON.parse(savedGyms));
+        const parsedGyms = safeJsonParse(savedGyms, []);
+        const sanitizedGyms = sanitizeGymsForStorage(parsedGyms);
+        setGyms(sanitizedGyms);
+        if (JSON.stringify(parsedGyms) !== JSON.stringify(sanitizedGyms)) {
+          await AsyncStorage.setItem(
+            `@user_gyms_${uid}`,
+            JSON.stringify(sanitizedGyms),
+          );
+          syncGymsToCloud(sanitizedGyms).catch((error) =>
+            console.log("Cleaned gym sync delayed:", error),
+          );
+        }
       } else {
         const cloudGyms = await fetchConfigFromCloud("gyms");
         if (cloudGyms && cloudGyms.length > 0) {
-          setGyms(cloudGyms);
+          const sanitizedCloudGyms = sanitizeGymsForStorage(cloudGyms);
+          setGyms(sanitizedCloudGyms);
           await AsyncStorage.setItem(
             `@user_gyms_${uid}`,
-            JSON.stringify(cloudGyms),
+            JSON.stringify(sanitizedCloudGyms),
           );
+          if (
+            JSON.stringify(cloudGyms) !== JSON.stringify(sanitizedCloudGyms)
+          ) {
+            syncGymsToCloud(sanitizedCloudGyms).catch((error) =>
+              console.log("Cleaned cloud gym sync delayed:", error),
+            );
+          }
         }
       }
 
@@ -354,31 +786,164 @@ export default function SettingsScreen({ navigation }: any) {
         `@global_variants_${uid}`,
       );
       if (savedGlobalVars) {
-        setGlobalVariants(JSON.parse(savedGlobalVars));
+        const parsedGlobalVars = safeJsonParse(savedGlobalVars, []);
+        const sanitizedGlobalVars = sanitizeGlobalVariantList(parsedGlobalVars);
+        setGlobalVariants(sanitizedGlobalVars);
+        if (
+          JSON.stringify(parsedGlobalVars) !==
+          JSON.stringify(sanitizedGlobalVars)
+        ) {
+          await AsyncStorage.setItem(
+            `@global_variants_${uid}`,
+            JSON.stringify(sanitizedGlobalVars),
+          );
+          syncConfigToCloud("global_variants" as any, sanitizedGlobalVars).catch(
+            (error) => console.log("Cleaned machine brand sync delayed:", error),
+          );
+        }
       } else {
         const cloudVars = await fetchConfigFromCloud("global_variants" as any);
-        if (cloudVars) setGlobalVariants(cloudVars);
+        if (cloudVars) {
+          const sanitizedCloudVars = sanitizeGlobalVariantList(cloudVars);
+          setGlobalVariants(sanitizedCloudVars);
+          await AsyncStorage.setItem(
+            `@global_variants_${uid}`,
+            JSON.stringify(sanitizedCloudVars),
+          );
+          if (
+            JSON.stringify(cloudVars) !== JSON.stringify(sanitizedCloudVars)
+          ) {
+            syncConfigToCloud("global_variants" as any, sanitizedCloudVars).catch(
+              (error) =>
+                console.log("Cleaned cloud machine brand sync delayed:", error),
+            );
+          }
+        }
       }
     })();
   }, [uid]);
 
   const saveGyms = async (newGyms: any[]) => {
-    setGyms(newGyms);
+    const sanitizedGyms = sanitizeGymsForStorage(newGyms);
+    setGyms(sanitizedGyms);
     if (uid) {
-      await AsyncStorage.setItem(`@user_gyms_${uid}`, JSON.stringify(newGyms));
-      await syncGymsToCloud(newGyms);
+      await AsyncStorage.setItem(
+        `@user_gyms_${uid}`,
+        JSON.stringify(sanitizedGyms),
+      );
+      syncGymsToCloud(sanitizedGyms).catch((error) =>
+        console.log("Gym sync delayed:", error),
+      );
     }
   };
 
+  const deleteSelectedGym = async () => {
+    const gymToDelete = selectedGym;
+    if (!gymToDelete?.id) {
+      setDeleteGymAlertVisible(false);
+      setSelectedGym(null);
+      return;
+    }
+
+    Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Heavy);
+    const updatedGyms = sanitizeGymsForStorage(
+      gyms.filter((g) => String(g?.id) !== String(gymToDelete.id)),
+    );
+
+    setDeleteGymAlertVisible(false);
+    setIsGymMenuVisible(false);
+    setSelectedGym(null);
+    setEditingGymId(null);
+    setGyms(updatedGyms);
+
+    Promise.resolve()
+      .then(async () => {
+        if (uid) {
+          await markConfigItemsDeletedLocally("gyms", [gymToDelete], uid);
+        }
+        await saveGyms(updatedGyms);
+      })
+      .catch((error) => {
+        console.log("Gym delete persistence delayed:", error);
+        Alert.alert(
+          "Sync Delayed",
+          "The gym was removed on this device. IronVault will try syncing the change again later.",
+        );
+      });
+  };
+
+  const cancelDeleteGym = () => {
+    setDeleteGymAlertVisible(false);
+    setSelectedGym(null);
+  };
+
   const saveGlobalVariants = async (newVars: string[]) => {
-    setGlobalVariants(newVars);
+    const sanitizedVars = sanitizeGlobalVariantList(newVars);
+    const nextKeys = new Set(sanitizedVars.map(normalizeListName));
+    const currentKeys = new Set(globalVariants.map(normalizeListName));
+    const removedVariants = globalVariants.filter(
+      (variant) => !nextKeys.has(normalizeListName(variant)),
+    );
+    const restoredVariants = sanitizedVars.filter(
+      (variant) => !currentKeys.has(normalizeListName(variant)),
+    );
+
+    setGlobalVariants(sanitizedVars);
     if (uid) {
+      if (removedVariants.length > 0) {
+        await markConfigValuesDeletedLocally(
+          "global_variants",
+          removedVariants,
+          uid,
+        );
+      }
+      if (restoredVariants.length > 0) {
+        await clearConfigValuesDeletedLocally(
+          "global_variants",
+          restoredVariants,
+          uid,
+        );
+      }
       await AsyncStorage.setItem(
         `@global_variants_${uid}`,
-        JSON.stringify(newVars),
+        JSON.stringify(sanitizedVars),
       );
-      await syncConfigToCloud("global_variants" as any, newVars);
+      syncConfigToCloud("global_variants" as any, sanitizedVars).catch(
+        (error) => console.log("Machine brand cloud sync delayed:", error),
+      );
     }
+  };
+
+  const deleteGlobalVariant = (variant: string) => {
+    const variantKey = normalizeListName(variant);
+    if (!variantKey) return;
+
+    const nextVariants = sanitizeGlobalVariantList(
+      globalVariants.filter((item) => normalizeListName(item) !== variantKey),
+    );
+
+    Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Heavy);
+    setGlobalVariants(nextVariants);
+
+    Promise.resolve()
+      .then(async () => {
+        if (!uid) return;
+        await markConfigValuesDeletedLocally(
+          "global_variants",
+          [variant],
+          uid,
+        );
+        await AsyncStorage.setItem(
+          `@global_variants_${uid}`,
+          JSON.stringify(nextVariants),
+        );
+        syncConfigToCloud("global_variants" as any, nextVariants).catch(
+          (error) => console.log("Machine brand cloud sync delayed:", error),
+        );
+      })
+      .catch((error) => {
+        console.log("Machine brand delete persistence delayed:", error);
+      });
   };
 
   const migrateGymNameUsage = async (gymId: string, newGymName: string) => {
@@ -390,7 +955,7 @@ export default function SettingsScreen({ navigation }: any) {
     const historyRaw = await AsyncStorage.getItem(`@workout_history_${uid}`);
     if (historyRaw) {
       try {
-        const history = JSON.parse(historyRaw);
+        const history = safeJsonParse(historyRaw, []);
         if (Array.isArray(history)) {
           const migratedHistory = history.map((workout: any) => {
             if (!workout || String(workout.gymId || "") !== String(gymId)) {
@@ -412,7 +977,9 @@ export default function SettingsScreen({ navigation }: any) {
               `@workout_history_${uid}`,
               JSON.stringify(migratedHistory),
             );
-            await pushWorkoutListToCloud(changedWorkouts);
+            pushWorkoutListToCloud(changedWorkouts).catch((error) =>
+              console.log("Gym-name history cloud sync delayed:", error),
+            );
           }
         }
       } catch (error) {
@@ -425,7 +992,7 @@ export default function SettingsScreen({ navigation }: any) {
     );
     if (activeSessionRaw) {
       try {
-        const activeSession = JSON.parse(activeSessionRaw);
+        const activeSession = safeJsonParse<any>(activeSessionRaw, {});
         if (String(activeSession?.gymId || "") === String(gymId)) {
           await AsyncStorage.setItem(
             `@active_session_${uid}`,
@@ -490,7 +1057,7 @@ export default function SettingsScreen({ navigation }: any) {
     const historyRaw = await AsyncStorage.getItem(`@workout_history_${uid}`);
     if (historyRaw) {
       try {
-        const history = JSON.parse(historyRaw);
+        const history = safeJsonParse(historyRaw, []);
 
         if (Array.isArray(history)) {
           const migratedHistory = history.map((workout: any) => {
@@ -516,10 +1083,12 @@ export default function SettingsScreen({ navigation }: any) {
               JSON.stringify(migratedHistory),
             );
 
-            await pushWorkoutListToCloud(
+            pushWorkoutListToCloud(
               migratedHistory.filter(
                 (workout: any) => workout && workout.gymId === gymId,
               ),
+            ).catch((error) =>
+              console.log("Gym-brand history cloud sync delayed:", error),
             );
           }
         }
@@ -535,7 +1104,7 @@ export default function SettingsScreen({ navigation }: any) {
 
     if (activeSessionRaw) {
       try {
-        const activeSession = JSON.parse(activeSessionRaw);
+        const activeSession = safeJsonParse<any>(activeSessionRaw, {});
 
         if (activeSession?.gymId === gymId) {
           const {
@@ -583,12 +1152,13 @@ export default function SettingsScreen({ navigation }: any) {
                 setSyncStatus(syncResult.syncStatus);
               }
 
-              const [m, r, te, ac, pc, pkg, plbs, savedGyms, savedGlobalVars] =
+              const [m, r, te, ac, rpe, pc, pkg, plbs, savedGyms, savedGlobalVars] =
                 await Promise.all([
                   AsyncStorage.getItem(`@user_metric_${uid}`),
                   AsyncStorage.getItem(`@rest_time_${uid}`),
                   AsyncStorage.getItem(`@rest_timer_enabled_${uid}`),
                   AsyncStorage.getItem(`@auto_check_enabled_${uid}`),
+                  AsyncStorage.getItem(`@rpe_tracking_enabled_${uid}`),
                   AsyncStorage.getItem(`@plate_calc_enabled_${uid}`),
                   AsyncStorage.getItem(`@plates_kg_${uid}`),
                   AsyncStorage.getItem(`@plates_lbs_${uid}`),
@@ -597,15 +1167,22 @@ export default function SettingsScreen({ navigation }: any) {
                 ]);
 
               if (m) setMetric(m);
-              if (r) setRest(r);
+              if (r) setRest(String(clampRestSeconds(r)));
               if (te !== null) setTimerEnabled(te === "true");
               if (ac !== null) setAutoCheckEnabled(ac === "true");
+              if (rpe !== null) setRpeTrackingEnabled(rpe === "true");
               if (pc !== null) setPlateCalcEnabled(pc === "true");
-              if (pkg) setPlatesKg(JSON.parse(pkg));
-              if (plbs) setPlatesLbs(JSON.parse(plbs));
-              if (savedGyms) setGyms(JSON.parse(savedGyms));
+              if (pkg) setPlatesKg(safeJsonParse(pkg, DEFAULT_PLATES_KG));
+              if (plbs) setPlatesLbs(safeJsonParse(plbs, DEFAULT_PLATES_LBS));
+              if (savedGyms)
+                setGyms(
+                  sanitizeGymsForStorage(safeJsonParse(savedGyms, [])),
+                );
               if (savedGlobalVars)
-                setGlobalVariants(JSON.parse(savedGlobalVars));
+                setGlobalVariants(
+                  sanitizeGlobalVariantList(safeJsonParse(savedGlobalVars, [])),
+                );
+              await refreshCloudRestorePreview(false);
 
               const templatesCount = getSyncConfigCount(
                 syncResult.configs,
@@ -644,16 +1221,34 @@ Exercises: ${exercisesCount}
 Favorites: ${favoritesCount}
 Gyms: ${gymsCount}
 Machine brands: ${brandsCount}
+Settings: ${syncResult.syncStatus?.settingsSynced ? "synced" : "checked"}
 Last synced: ${formatSyncTime(syncResult.syncStatus?.lastSyncedAt)}`,
               );
             } catch (error) {
               console.error("Cloud sync error:", error);
+              const failedStatus = {
+                ...(syncStatus || {}),
+                success: false,
+                lastAttemptedAt: Date.now(),
+                lastFailedAt: Date.now(),
+                errorMessage: getFriendlyOperationError(
+                  error,
+                  "Could not complete the cloud sync.",
+                ),
+              };
+              setSyncStatus(failedStatus);
+              await AsyncStorage.setItem(
+                `@cloud_sync_status_${uid}`,
+                JSON.stringify(failedStatus),
+              );
               Alert.alert(
                 "Sync Failed",
-                `${getFriendlyOperationError(
-                  error,
-                  "Could not complete the cloud sync. Your local data was not deleted.",
-                )}\n\nYour local data was not deleted.`,
+                `${failedStatus.errorMessage}
+
+Your data is still saved on this device. Cloud backup did not finish.
+
+Last tried: ${formatSyncTime(failedStatus.lastFailedAt)}
+${failedStatus.lastSyncedAt ? `Last successful sync: ${formatSyncTime(failedStatus.lastSyncedAt)}\n` : ""}Try Retry Sync again when your connection is stable.`,
               );
             } finally {
               setIsSyncing(false);
@@ -667,12 +1262,13 @@ Last synced: ${formatSyncTime(syncResult.syncStatus?.lastSyncedAt)}`,
   const refreshLocalSettingsAfterDataImport = async () => {
     if (!uid) return;
 
-    const [m, r, te, ac, pc, pkg, plbs, savedGyms, savedGlobalVars, status] =
+    const [m, r, te, ac, rpe, pc, pkg, plbs, savedGyms, savedGlobalVars, status] =
       await Promise.all([
         AsyncStorage.getItem(`@user_metric_${uid}`),
         AsyncStorage.getItem(`@rest_time_${uid}`),
         AsyncStorage.getItem(`@rest_timer_enabled_${uid}`),
         AsyncStorage.getItem(`@auto_check_enabled_${uid}`),
+        AsyncStorage.getItem(`@rpe_tracking_enabled_${uid}`),
         AsyncStorage.getItem(`@plate_calc_enabled_${uid}`),
         AsyncStorage.getItem(`@plates_kg_${uid}`),
         AsyncStorage.getItem(`@plates_lbs_${uid}`),
@@ -682,14 +1278,19 @@ Last synced: ${formatSyncTime(syncResult.syncStatus?.lastSyncedAt)}`,
       ]);
 
     if (m) setMetric(m);
-    if (r) setRest(r);
+    if (r) setRest(String(clampRestSeconds(r)));
     if (te !== null) setTimerEnabled(te === "true");
     if (ac !== null) setAutoCheckEnabled(ac === "true");
+    if (rpe !== null) setRpeTrackingEnabled(rpe === "true");
     if (pc !== null) setPlateCalcEnabled(pc === "true");
-    if (pkg) setPlatesKg(JSON.parse(pkg));
-    if (plbs) setPlatesLbs(JSON.parse(plbs));
-    if (savedGyms) setGyms(JSON.parse(savedGyms));
-    if (savedGlobalVars) setGlobalVariants(JSON.parse(savedGlobalVars));
+    if (pkg) setPlatesKg(safeJsonParse(pkg, DEFAULT_PLATES_KG));
+    if (plbs) setPlatesLbs(safeJsonParse(plbs, DEFAULT_PLATES_LBS));
+    if (savedGyms)
+      setGyms(sanitizeGymsForStorage(safeJsonParse(savedGyms, [])));
+    if (savedGlobalVars)
+      setGlobalVariants(
+        sanitizeGlobalVariantList(safeJsonParse(savedGlobalVars, [])),
+      );
     if (status) setSyncStatus(status);
   };
 
@@ -743,63 +1344,180 @@ Last synced: ${formatSyncTime(syncResult.syncStatus?.lastSyncedAt)}`,
   const handleImportData = async () => {
     if (!uid || isImporting) return;
 
+    try {
+      setIsImporting(true);
+      const result = await DocumentPicker.getDocumentAsync({
+        type: "application/json",
+        copyToCacheDirectory: true,
+        multiple: false,
+      });
+
+      if (result.canceled) return;
+
+      const file = result.assets?.[0];
+      if (!file?.uri) {
+        throw new Error("Could not read the selected file.");
+      }
+
+      const raw = await FileSystem.readAsStringAsync(file.uri, {
+        encoding: FileSystem.EncodingType.UTF8,
+      });
+      assertReasonableBackupFileSize(raw);
+      const backup = JSON.parse(raw);
+      const preview = await previewIronVaultBackupImport(backup);
+      const previewSummary = buildBackupPreviewSummary(preview);
+
+      setIsImporting(false);
+      Alert.alert(
+        "Preview IronVault Backup",
+        previewSummary,
+        [
+          { text: "Cancel", style: "cancel" },
+          {
+            text: "Merge Backup",
+            onPress: async () => {
+              try {
+                setIsImporting(true);
+                const importResult = await importIronVaultBackup(backup);
+                await refreshLocalSettingsAfterDataImport();
+
+                Haptics.notificationAsync(
+                  Haptics.NotificationFeedbackType.Success,
+                );
+                Alert.alert(
+                  "Import Complete",
+                  buildImportCompleteSummary(importResult),
+                );
+              } catch (error: any) {
+                console.error("Import backup error:", error);
+                Alert.alert(
+                  "Import Failed",
+                  getFriendlyOperationError(
+                    error,
+                    "Could not import this backup file. Please try again.",
+                  ),
+                );
+              } finally {
+                setIsImporting(false);
+              }
+            },
+          },
+        ],
+      );
+    } catch (error: any) {
+      console.error("Import backup preview error:", error);
+      Alert.alert(
+        "Import Failed",
+        getFriendlyOperationError(
+          error,
+          "Could not read this backup file. Please try again.",
+        ),
+      );
+    } finally {
+      setIsImporting(false);
+    }
+  };
+
+  const refreshCloudRestorePreview = async (showError = true) => {
+    if (!uid || isRestorePreviewLoading) return null;
+
+    try {
+      setIsRestorePreviewLoading(true);
+      const preview = await previewCloudCategoryRestore();
+      setRestorePreview(preview);
+      return preview;
+    } catch (error: any) {
+      console.error("Cloud restore preview error:", error);
+      if (showError) {
+        Alert.alert(
+          "Could Not Check Cloud Backup",
+          getFriendlyOperationError(
+            error,
+            "Could not check your cloud backup. Please try again.",
+          ),
+        );
+      }
+      return null;
+    } finally {
+      setIsRestorePreviewLoading(false);
+    }
+  };
+
+  const toggleRestoreCategory = (category: CloudRestoreCategory) => {
+    Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
+    setSelectedRestoreCategories((current) =>
+      current.includes(category)
+        ? current.filter((item) => item !== category)
+        : [...current, category],
+    );
+  };
+
+  const handleRestoreSelectedCategories = async () => {
+    if (!uid || isRestoringCloudData) return;
+
+    if (selectedRestoreCategories.length === 0) {
+      Alert.alert(
+        "Choose Data to Restore",
+        "Select at least one category before restoring from cloud.",
+      );
+      return;
+    }
+
+    const preview = restorePreview || (await refreshCloudRestorePreview(false));
+    const labels = RESTORE_CATEGORY_OPTIONS.filter((option) =>
+      selectedRestoreCategories.includes(option.key),
+    ).map((option) => option.title);
+
     Alert.alert(
-      "Import Backup?",
-      "Choose an IronVault backup JSON file. The import will merge workouts, templates, exercises, favorites, gyms, brands, and settings without wiping local data.",
+      "Restore Selected Data?",
+      `This replaces the selected categories on this device with your current cloud copy.
+
+Selected:
+${labels.map((label) => `• ${label}`).join("\n")}
+
+Cloud checked: ${formatBackupPreviewDate(preview?.readAt)}
+
+IronVault will save a local before-restore backup first.`,
       [
         { text: "Cancel", style: "cancel" },
         {
-          text: "Choose File",
+          text: "Restore",
+          style: "destructive",
           onPress: async () => {
+            if (settingsBlockingRef.current) return;
+
+            settingsBlockingRef.current = true;
+            setIsRestoringCloudData(true);
+            setSettingsBlockingMessage("Restoring cloud data...");
             try {
-              setIsImporting(true);
-              const result = await DocumentPicker.getDocumentAsync({
-                type: "application/json",
-                copyToCacheDirectory: true,
-                multiple: false,
-              });
-
-              if (result.canceled) return;
-
-              const file = result.assets?.[0];
-              if (!file?.uri) {
-                throw new Error("Could not read the selected file.");
-              }
-
-              const raw = await FileSystem.readAsStringAsync(file.uri, {
-                encoding: FileSystem.EncodingType.UTF8,
-              });
-              const backup = JSON.parse(raw);
-              const importResult = await importIronVaultBackup(backup);
-
+              const result = await restoreCloudCategories(
+                selectedRestoreCategories,
+              );
               await refreshLocalSettingsAfterDataImport();
-
+              if (result.syncStatus) setSyncStatus(result.syncStatus);
+              await refreshCloudRestorePreview(false);
               Haptics.notificationAsync(
                 Haptics.NotificationFeedbackType.Success,
               );
               Alert.alert(
-                "Import Complete",
-                `Merged your backup into IronVault.
+                "Restore Complete",
+                `${buildCloudRestoreCompleteSummary(result)}
 
-Workouts: ${importResult.workouts}
-Templates: ${importResult.templates}
-Folders: ${importResult.folders}
-Exercises: ${importResult.personalExercises}
-Favorites: ${importResult.favoriteExercises ?? 0}
-Gyms: ${importResult.gyms}
-Machine brands: ${importResult.machineBrands}`,
+Only the selected categories were replaced. A before-restore backup was kept on this device.`,
               );
             } catch (error: any) {
-              console.error("Import backup error:", error);
+              console.error("Cloud restore error:", error);
               Alert.alert(
-                "Import Failed",
+                "Restore Failed",
                 getFriendlyOperationError(
                   error,
-                  "Could not import this backup file. Please try again.",
+                  "Could not restore your cloud backup. Please try again.",
                 ),
               );
             } finally {
-              setIsImporting(false);
+              settingsBlockingRef.current = false;
+              setIsRestoringCloudData(false);
+              setSettingsBlockingMessage("");
             }
           },
         },
@@ -816,14 +1534,18 @@ Machine brands: ${importResult.machineBrands}`,
         : [...platesKg, plate].sort((a, b) => b - a);
       setPlatesKg(updated);
       await AsyncStorage.setItem(`@plates_kg_${uid}`, JSON.stringify(updated));
-      await syncSettingsToCloud({ platesKg: updated });
+      syncSettingsToCloud({ platesKg: updated }).catch((error) =>
+        console.log("Plate settings cloud sync delayed:", error),
+      );
     } else {
       const updated = platesLbs.includes(plate)
         ? platesLbs.filter((p) => p !== plate)
         : [...platesLbs, plate].sort((a, b) => b - a);
       setPlatesLbs(updated);
       await AsyncStorage.setItem(`@plates_lbs_${uid}`, JSON.stringify(updated));
-      await syncSettingsToCloud({ platesLbs: updated });
+      syncSettingsToCloud({ platesLbs: updated }).catch((error) =>
+        console.log("Plate settings cloud sync delayed:", error),
+      );
     }
   };
 
@@ -854,20 +1576,51 @@ Machine brands: ${importResult.machineBrands}`,
       return;
     }
 
-    if (!uid || !auth.currentUser) return;
+    const userToDelete = auth.currentUser;
+    if (!uid || !userToDelete) return;
+
+    if (!hasRecentSignIn()) {
+      setIsDeleteModalVisible(false);
+      setDeleteConfirmationText("");
+      Alert.alert(
+        "Security Verification Required",
+        "For your security, log out and back in, then delete your account right away. No data has been deleted.",
+      );
+      return;
+    }
 
     Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Heavy);
     setIsDeleting(true);
 
+    const restoreUsernameReservations = async (
+      reservations: { ref: any; data: any }[],
+    ) => {
+      await Promise.all(
+        reservations.map(({ ref, data }) =>
+          setDoc(ref, data).catch(() => null),
+        ),
+      );
+    };
+
+    let usernameReservations: { ref: any; data: any }[] = [];
+    let cloudDataDeleteStarted = false;
+
     try {
+      await userToDelete.getIdToken(true);
+
       const usernamesRef = collection(db, "usernames");
       const q = query(usernamesRef, where("uid", "==", uid));
       const querySnapshot = await getDocs(q);
+      usernameReservations = querySnapshot.docs.map((d) => ({
+        ref: d.ref,
+        data: d.data(),
+      }));
 
       const usernameDeletePromises = querySnapshot.docs.map((d) =>
         deleteDoc(d.ref),
       );
       await Promise.all(usernameDeletePromises);
+      cloudDataDeleteStarted = true;
 
       const workoutsSnap = await getDocs(
         collection(db, "users", uid, "workouts"),
@@ -880,15 +1633,26 @@ Machine brands: ${importResult.machineBrands}`,
 
       await deleteDoc(doc(db, "users", uid));
 
-      const allKeys = await AsyncStorage.getAllKeys();
-      const userKeys = allKeys.filter((k) => k.includes(`_${uid}`));
-      await AsyncStorage.multiRemove([
-        ...userKeys,
-        "@has_completed_setup",
-      ]);
+      await deleteUser(userToDelete);
 
-      await deleteUser(auth.currentUser);
+      try {
+        const allKeys = await AsyncStorage.getAllKeys();
+        const userKeys = allKeys.filter((k) => k.includes(`_${uid}`));
+        await AsyncStorage.multiRemove([
+          ...userKeys,
+          "@has_completed_setup",
+        ]);
+      } catch (storageError) {
+        console.log("Account deleted, but local cleanup was incomplete:", storageError);
+      }
     } catch (error: any) {
+      if (cloudDataDeleteStarted && auth.currentUser?.uid === uid) {
+        await restoreUsernameReservations(usernameReservations);
+        syncEverythingWithCloud().catch((syncError) => {
+          console.log("Could not restore cloud data after failed deletion:", syncError);
+        });
+      }
+
       setIsDeleting(false);
       setIsDeleteModalVisible(false);
       setDeleteConfirmationText("");
@@ -896,17 +1660,138 @@ Machine brands: ${importResult.machineBrands}`,
       if (error.code === "auth/requires-recent-login") {
         Alert.alert(
           "Security Verification Required",
-          "For your security, you must log out and log back in before deleting your account.",
+          "For your security, you must log out and log back in before deleting your account. No local data has been deleted.",
         );
       } else {
         Alert.alert(
           "Delete Account Failed",
           getFriendlyOperationError(
             error,
-            "Could not delete your account. Please try again.",
+            "Could not delete your account. Your local data has been kept on this device.",
           ),
         );
       }
+    }
+  };
+
+
+  const openUsernameEditor = () => {
+    const currentName = normalizeUsername(accountDisplayName);
+    setUsernameDraft(currentName);
+    setUsernameError("");
+    setIsUsernameModalVisible(true);
+  };
+
+  const handleSaveUsername = async () => {
+    if (isUsernameSaving) return;
+
+    const user = auth.currentUser;
+    if (!user) {
+      setUsernameError("You need to be signed in to change your username.");
+      return;
+    }
+
+    const nextUsername = normalizeUsername(usernameDraft);
+    const validationError = validateUsername(nextUsername);
+
+    if (validationError) {
+      setUsernameError(validationError);
+      return;
+    }
+
+    const previousUsernameLower = currentUsernameLower || normalizeUsername(accountDisplayName);
+
+    if (previousUsernameLower === nextUsername) {
+      setAccountDisplayName(nextUsername);
+      setCurrentUsernameLower(nextUsername);
+      setUsernameWarning("");
+      await AsyncStorage.setItem(`@user_username_${user.uid}`, nextUsername);
+      setIsUsernameModalVisible(false);
+      return;
+    }
+
+    setIsUsernameSaving(true);
+    setUsernameError("");
+
+    try {
+      const now = Date.now();
+      const userRef = doc(db, "users", user.uid);
+      const nextUsernameRef = doc(db, "usernames", nextUsername);
+
+      await runTransaction(db, async (transaction) => {
+        const userSnap = await transaction.get(userRef);
+        const nextUsernameSnap = await transaction.get(nextUsernameRef);
+
+        const cloudPreviousUsername = userSnap.exists()
+          ? normalizeUsername(userSnap.data().usernameLower || userSnap.data().username || "")
+          : "";
+        const oldUsernameLower =
+          previousUsernameLower || cloudPreviousUsername || normalizeUsername(accountDisplayName);
+
+        let oldUsernameRef = null as any;
+        let oldUsernameSnap = null as any;
+
+        if (oldUsernameLower && oldUsernameLower !== nextUsername) {
+          oldUsernameRef = doc(db, "usernames", oldUsernameLower);
+          oldUsernameSnap = await transaction.get(oldUsernameRef);
+        }
+
+        if (nextUsernameSnap.exists()) {
+          const ownerUid = nextUsernameSnap.data().uid;
+          if (ownerUid && ownerUid !== user.uid) {
+            throw new Error(USERNAME_TAKEN_ERROR);
+          }
+        }
+
+        transaction.set(
+          nextUsernameRef,
+          {
+            uid: user.uid,
+            username: nextUsername,
+            usernameLower: nextUsername,
+            display_name: nextUsername,
+            updatedAt: now,
+          },
+          { merge: true },
+        );
+
+        transaction.set(
+          userRef,
+          {
+            username: nextUsername,
+            usernameLower: nextUsername,
+            updatedAt: now,
+          },
+          { merge: true },
+        );
+
+        if (oldUsernameRef && oldUsernameSnap?.exists()) {
+          const oldOwnerUid = oldUsernameSnap.data().uid;
+          if (!oldOwnerUid || oldOwnerUid === user.uid) {
+            transaction.delete(oldUsernameRef);
+          }
+        }
+      });
+
+      await AsyncStorage.setItem(`@user_username_${user.uid}`, nextUsername);
+      setAccountDisplayName(nextUsername);
+      setCurrentUsernameLower(nextUsername);
+      setUsernameWarning("");
+      setIsUsernameModalVisible(false);
+      Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
+    } catch (error: any) {
+      if (String(error?.message || "").includes(USERNAME_TAKEN_ERROR)) {
+        setUsernameError("This username is already taken.");
+      } else {
+        setUsernameError(
+          getFriendlyOperationError(
+            error,
+            "Could not update your username. Please try again.",
+          ),
+        );
+      }
+    } finally {
+      setIsUsernameSaving(false);
     }
   };
 
@@ -1059,26 +1944,207 @@ Machine brands: ${importResult.machineBrands}`,
     </View>
   );
 
+  const syncDetailRows = getSyncDetailRows(syncStatus, isSyncing);
+  const syncSummaryChips = getSyncSummaryChips(syncStatus);
+  const restoreCategoryCounts = restorePreview?.categories || {};
+  const restoreSelectedCount = selectedRestoreCategories.length;
+
   return (
     <View style={styles.screen}>
-      <CustomAlert
+      <Modal
         visible={deleteGymAlertVisible}
-        title="Delete Gym?"
-        message={`Are you sure you want to permanently delete "${selectedGym?.name}"? This will not delete your workout history.`}
-        buttons={[
-          { text: "Cancel", style: "cancel" },
-          {
-            text: "Delete",
-            style: "destructive",
-            onPress: () => {
-              Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Heavy);
-              const updatedGyms = gyms.filter((g) => g.id !== selectedGym.id);
-              saveGyms(updatedGyms);
-            },
-          },
-        ]}
-        onClose={() => setDeleteGymAlertVisible(false)}
-      />
+        transparent
+        animationType="fade"
+        onRequestClose={cancelDeleteGym}
+      >
+        <TouchableOpacity
+          style={[
+            styles.modalOverlay,
+            { justifyContent: "center", paddingHorizontal: 24 },
+          ]}
+          activeOpacity={1}
+          onPress={cancelDeleteGym}
+        >
+          <TouchableOpacity
+            activeOpacity={1}
+            style={{
+              width: "100%",
+              maxWidth: 420,
+              borderRadius: 24,
+              backgroundColor: "#1C1C1E",
+              borderWidth: 1,
+              borderColor: "#3A3A3C",
+              padding: 22,
+            }}
+          >
+            <Text
+              style={{
+                color: "#FFF",
+                fontSize: 20,
+                fontWeight: "900",
+                textAlign: "center",
+                marginBottom: 10,
+              }}
+            >
+              Delete Gym?
+            </Text>
+            <Text
+              style={{
+                color: "#8E8E93",
+                fontSize: 15,
+                lineHeight: 22,
+                textAlign: "center",
+                marginBottom: 24,
+              }}
+            >
+              Are you sure you want to permanently delete "{selectedGym?.name}"?
+              This will not delete your workout history.
+            </Text>
+            <View style={styles.modalButtonRow}>
+              <TouchableOpacity
+                style={{
+                  flex: 1,
+                  minHeight: 50,
+                  borderRadius: 16,
+                  alignItems: "center",
+                  justifyContent: "center",
+                  backgroundColor: "#2C2C2E",
+                }}
+                onPress={cancelDeleteGym}
+              >
+                <Text
+                  style={{
+                    color: "#8E8E93",
+                    fontSize: 16,
+                    fontWeight: "800",
+                  }}
+                >
+                  Cancel
+                </Text>
+              </TouchableOpacity>
+              <TouchableOpacity
+                style={{
+                  flex: 1,
+                  minHeight: 50,
+                  borderRadius: 16,
+                  alignItems: "center",
+                  justifyContent: "center",
+                  backgroundColor: "rgba(255, 59, 48, 0.14)",
+                }}
+                onPress={deleteSelectedGym}
+              >
+                <Text
+                  style={{
+                    color: "#FF3B30",
+                    fontSize: 16,
+                    fontWeight: "900",
+                  }}
+                >
+                  Delete
+                </Text>
+              </TouchableOpacity>
+            </View>
+          </TouchableOpacity>
+        </TouchableOpacity>
+      </Modal>
+
+      <Modal visible={isUsernameModalVisible} transparent animationType="fade">
+        <KeyboardAvoidingView
+          behavior={Platform.OS === "ios" ? "padding" : "height"}
+          style={[styles.modalOverlay, { justifyContent: "flex-end" }]}
+        >
+          <View style={[styles.modalContent, { marginBottom: 40 }]}>
+            <Text style={styles.modalTitle}>Change Username</Text>
+            <Text
+              style={{
+                color: "#8E8E93",
+                fontSize: 13,
+                lineHeight: 19,
+                fontWeight: "600",
+                marginBottom: 14,
+              }}
+            >
+              Your username is your unique IronVault nickname. Use 3–20
+              lowercase letters, numbers, or underscores.
+            </Text>
+
+            <View
+              style={{
+                flexDirection: "row",
+                alignItems: "center",
+                backgroundColor: "#2C2C2E",
+                borderRadius: 14,
+                borderWidth: 1,
+                borderColor: usernameError ? "#FF453A" : "#3A3A3C",
+                paddingHorizontal: 14,
+              }}
+            >
+              <Text style={{ color: "#8E8E93", fontSize: 16, fontWeight: "900" }}>
+                @
+              </Text>
+              <TextInput
+                style={[styles.modalInput, { flex: 1, marginBottom: 0, borderWidth: 0 }]}
+                value={usernameDraft}
+                onChangeText={(value) => {
+                  setUsernameDraft(normalizeUsername(value));
+                  if (usernameError) setUsernameError("");
+                }}
+                placeholder="username"
+                placeholderTextColor="#636366"
+                selectionColor="#FFF"
+                autoCapitalize="none"
+                autoCorrect={false}
+                autoFocus
+                maxLength={20}
+              />
+            </View>
+
+            {!!usernameError && (
+              <Text
+                style={{
+                  color: "#FF453A",
+                  fontSize: 12,
+                  fontWeight: "800",
+                  marginTop: 9,
+                }}
+              >
+                {usernameError}
+              </Text>
+            )}
+
+            <View style={styles.modalButtonRow}>
+              <TouchableOpacity
+                disabled={isUsernameSaving}
+                onPress={() => {
+                  setUsernameError("");
+                  setIsUsernameModalVisible(false);
+                }}
+              >
+                <Text style={styles.modalActionText}>Cancel</Text>
+              </TouchableOpacity>
+              <TouchableOpacity
+                disabled={isUsernameSaving}
+                onPress={handleSaveUsername}
+                style={{ minWidth: 64, alignItems: "flex-end" }}
+              >
+                {isUsernameSaving ? (
+                  <ActivityIndicator size="small" color="#32D74B" />
+                ) : (
+                  <Text
+                    style={[
+                      styles.modalActionText,
+                      { fontWeight: "bold", color: "#32D74B" },
+                    ]}
+                  >
+                    Save
+                  </Text>
+                )}
+              </TouchableOpacity>
+            </View>
+          </View>
+        </KeyboardAvoidingView>
+      </Modal>
+
 
       <Modal
         visible={isGuideVisible}
@@ -1197,7 +2263,7 @@ Machine brands: ${importResult.machineBrands}`,
               }}
             >
               <Text style={{ color: "#FFF", fontSize: 18, fontWeight: "900" }}>
-                {legalTab === "TERMS" ? "Terms of Service" : "Privacy Policy"}
+                {LEGAL_DOCUMENTS[legalTab].title}
               </Text>
               <TouchableOpacity onPress={() => setIsLegalModalVisible(false)}>
                 <Text style={{ color: "#32D74B", fontSize: 16, fontWeight: "800" }}>
@@ -1208,55 +2274,11 @@ Machine brands: ${importResult.machineBrands}`,
           </SafeAreaView>
 
           <ScrollView contentContainerStyle={{ padding: 24, paddingBottom: 64 }}>
-            {legalTab === "TERMS" ? (
-              <Text style={{ color: "#D1D1D6", fontSize: 15, lineHeight: 24 }}>
-                <Text style={{ color: "#FFF", fontWeight: "900" }}>Last Updated: May 2026</Text>
-                {"\n\n"}
-                <Text style={{ color: "#FFF", fontWeight: "900" }}>1. Acceptance of Terms</Text>
-                {"\n"}
-                By creating an account or using IronVault, you agree to these Terms of Service and the Privacy Policy.
-                {"\n\n"}
-                <Text style={{ color: "#FFF", fontWeight: "900" }}>2. Fitness and Medical Disclaimer</Text>
-                {"\n"}
-                IronVault is a workout logging tool. It does not provide medical advice, diagnosis, treatment, coaching, or emergency assistance. You are responsible for training safely.
-                {"\n\n"}
-                <Text style={{ color: "#FFF", fontWeight: "900" }}>3. User Responsibility</Text>
-                {"\n"}
-                You are responsible for the workouts, exercises, weights, notes, custom exercises, gyms, machine brands, templates, and other information you create or enter.
-                {"\n\n"}
-                <Text style={{ color: "#FFF", fontWeight: "900" }}>4. Sync, Backup, and Data Loss</Text>
-                {"\n"}
-                IronVault provides cloud sync and export/import tools to help keep your data available. No sync or storage system can be guaranteed to be error-free. Keep backups when your data matters.
-                {"\n\n"}
-                <Text style={{ color: "#FFF", fontWeight: "900" }}>5. Account Deletion</Text>
-                {"\n"}
-                You can initiate account deletion from Settings. Deletion is intended to remove your cloud account data where possible.
-              </Text>
-            ) : (
-              <Text style={{ color: "#D1D1D6", fontSize: 15, lineHeight: 24 }}>
-                <Text style={{ color: "#FFF", fontWeight: "900" }}>Last Updated: May 2026</Text>
-                {"\n\n"}
-                <Text style={{ color: "#FFF", fontWeight: "900" }}>1. Information We Collect</Text>
-                {"\n"}
-                IronVault stores account information, workout logs, templates, folders, custom exercises, favorites, gyms, machine brands, app preferences, setup choices, and backup/sync data needed to run the app.
-                {"\n\n"}
-                <Text style={{ color: "#FFF", fontWeight: "900" }}>2. How We Use Data</Text>
-                {"\n"}
-                Data is used to provide workout logging, history, progress statistics, exercise stats, templates, gym-specific filters, sync, and backup features.
-                {"\n\n"}
-                <Text style={{ color: "#FFF", fontWeight: "900" }}>3. Third-Party Services</Text>
-                {"\n"}
-                IronVault uses Firebase for authentication, cloud database storage, and account-related services.
-                {"\n\n"}
-                <Text style={{ color: "#FFF", fontWeight: "900" }}>4. Your Controls</Text>
-                {"\n"}
-                You can export backups, import backups, sync with cloud, sign out, and initiate account deletion from Settings.
-                {"\n\n"}
-                <Text style={{ color: "#FFF", fontWeight: "900" }}>5. No Selling of Data</Text>
-                {"\n"}
-                IronVault does not sell your personal information or workout data.
-              </Text>
-            )}
+            <LegalDocument
+              type={legalTab}
+              textStyle={{ color: "#D1D1D6", fontSize: 15, lineHeight: 24 }}
+              headingStyle={{ color: "#FFF", fontWeight: "900" }}
+            />
           </ScrollView>
         </View>
       </Modal>
@@ -1384,11 +2406,14 @@ Machine brands: ${importResult.machineBrands}`,
             <TouchableOpacity
               style={styles.actionMenuBtn}
               onPress={() => {
+                const gym = selectedGym;
                 setIsGymMenuVisible(false);
                 setTimeout(() => {
-                  setEditingGymId(selectedGym.id);
-                  setGymName(selectedGym.name);
-                  setGymDefaultBrand(selectedGym.defaultMachineBrand || null);
+                  if (!gym?.id) return;
+                  setSelectedGym(gym);
+                  setEditingGymId(gym.id);
+                  setGymName(limitText(gym.name, LIMITS.nameChars));
+                  setGymDefaultBrand(gym.defaultMachineBrand || null);
                   setIsGymModalVisible(true);
                 }, 400);
               }}
@@ -1398,8 +2423,13 @@ Machine brands: ${importResult.machineBrands}`,
             <TouchableOpacity
               style={[styles.actionMenuBtn, styles.actionMenuBtnDestructive]}
               onPress={() => {
+                const gym = selectedGym;
                 setIsGymMenuVisible(false);
-                setTimeout(() => setDeleteGymAlertVisible(true), 400);
+                setTimeout(() => {
+                  if (!gym?.id) return;
+                  setSelectedGym(gym);
+                  setDeleteGymAlertVisible(true);
+                }, 400);
               }}
             >
               <Text style={styles.actionMenuBtnText}>Delete Gym</Text>
@@ -1426,7 +2456,10 @@ Machine brands: ${importResult.machineBrands}`,
             <TextInput
               style={styles.modalInput}
               value={gymName}
-              onChangeText={setGymName}
+              onChangeText={(value) =>
+                setGymName(limitText(value, LIMITS.nameChars))
+              }
+              maxLength={LIMITS.nameChars}
               placeholder="e.g., Anytime Fitness, Home Gym"
               placeholderTextColor="#48484A"
               selectionColor="#FFF"
@@ -1533,62 +2566,101 @@ Machine brands: ${importResult.machineBrands}`,
                 <Text style={styles.modalActionText}>Cancel</Text>
               </TouchableOpacity>
               <TouchableOpacity
-                onPress={async () => {
-                  if (!gymName.trim()) return;
-                  Haptics.notificationAsync(
-                    Haptics.NotificationFeedbackType.Success,
-                  );
+                disabled={isSettingsBlocking}
+                onPress={() =>
+                  runSettingsBlockingAction(
+                    editingGymId ? "Saving gym..." : "Adding gym...",
+                    async () => {
+                      const finalGymName = cleanLimitedText(
+                        gymName,
+                        LIMITS.nameChars,
+                      );
+                      if (!finalGymName) return;
+                      const finalGymKey = normalizeListName(finalGymName);
+                      const gymNameExists = gyms.some(
+                        (gym) =>
+                          gym?.id !== editingGymId &&
+                          normalizeListName(gym?.name) === finalGymKey,
+                      );
+                      if (gymNameExists) {
+                        Alert.alert(
+                          "Already Exists",
+                          "A gym with this name is already in your list.",
+                        );
+                        return;
+                      }
+                      if (!editingGymId && gyms.length >= LIMITS.gymsPerUser) {
+                        Alert.alert(
+                          "Gym Limit Reached",
+                          "You can save up to 25 gyms.",
+                        );
+                        return;
+                      }
+                      Haptics.notificationAsync(
+                        Haptics.NotificationFeedbackType.Success,
+                      );
 
-                  const nextDefaultBrand = gymDefaultBrand || null;
+                      const nextDefaultBrand = gymDefaultBrand
+                        ? cleanLimitedText(gymDefaultBrand, LIMITS.nameChars)
+                        : null;
 
-                  if (editingGymId) {
-                    const existingGym = gyms.find((g) => g.id === editingGymId);
-                    const previousDefaultBrand =
-                      existingGym?.defaultMachineBrand || null;
+                      if (editingGymId) {
+                        const existingGym = gyms.find(
+                          (g) => g.id === editingGymId,
+                        );
+                        const previousDefaultBrand =
+                          existingGym?.defaultMachineBrand || null;
 
-                    const updatedGyms = gyms.map((g) =>
-                      g.id === editingGymId
-                        ? {
-                            ...g,
-                            name: gymName.trim(),
+                        const updatedGyms = gyms.map((g) =>
+                          g.id === editingGymId
+                            ? {
+                                ...g,
+                                name: finalGymName,
+                                defaultMachineBrand: nextDefaultBrand,
+                              }
+                            : g,
+                        );
+
+                        await saveGyms(updatedGyms);
+                        await migrateGymNameUsage(editingGymId, finalGymName);
+
+                        await migrateGymDefaultBrandUsage(
+                          editingGymId,
+                          previousDefaultBrand,
+                          nextDefaultBrand,
+                        );
+                      } else {
+                        await saveGyms([
+                          ...gyms,
+                          {
+                            id: genId("gym-"),
+                            name: finalGymName,
+                            variants: [],
                             defaultMachineBrand: nextDefaultBrand,
-                          }
-                        : g,
-                    );
+                          },
+                        ]);
+                      }
 
-                    await saveGyms(updatedGyms);
-                    await migrateGymNameUsage(editingGymId, gymName.trim());
-
-                    await migrateGymDefaultBrandUsage(
-                      editingGymId,
-                      previousDefaultBrand,
-                      nextDefaultBrand,
-                    );
-                  } else {
-                    await saveGyms([
-                      ...gyms,
-                      {
-                        id: genId("gym-"),
-                        name: gymName.trim(),
-                        variants: [],
-                        defaultMachineBrand: nextDefaultBrand,
-                      },
-                    ]);
-                  }
-
-                  setGymDefaultBrand(null);
-                  setEditingGymId(null);
-                  setIsGymModalVisible(false);
-                }}
+                      setGymDefaultBrand(null);
+                      setEditingGymId(null);
+                      setIsGymModalVisible(false);
+                    },
+                  )
+                }
               >
-                <Text
-                  style={[
-                    styles.modalActionText,
-                    { fontWeight: "bold", color: "#32D74B" },
-                  ]}
-                >
-                  Save
-                </Text>
+                {isSettingsBlocking &&
+                settingsBlockingMessage.toLowerCase().includes("gym") ? (
+                  <ActivityIndicator color="#32D74B" size="small" />
+                ) : (
+                  <Text
+                    style={[
+                      styles.modalActionText,
+                      { fontWeight: "bold", color: "#32D74B" },
+                    ]}
+                  >
+                    Save
+                  </Text>
+                )}
               </TouchableOpacity>
             </View>
           </View>
@@ -1609,7 +2681,10 @@ Machine brands: ${importResult.machineBrands}`,
             <TextInput
               style={styles.modalInput}
               value={newGlobalVariant}
-              onChangeText={setNewGlobalVariant}
+              onChangeText={(value) =>
+                setNewGlobalVariant(limitText(value, LIMITS.nameChars))
+              }
+              maxLength={LIMITS.nameChars}
               placeholder="e.g., Rogue, Prime..."
               placeholderTextColor="#48484A"
               selectionColor="#FFF"
@@ -1622,26 +2697,34 @@ Machine brands: ${importResult.machineBrands}`,
                 <Text style={styles.modalActionText}>Cancel</Text>
               </TouchableOpacity>
               <TouchableOpacity
-                onPress={() => {
-                  const finalBrand = newGlobalVariant.trim();
-                  if (!finalBrand) return;
-                  if (
-                    globalVariants.includes(finalBrand) ||
-                    DEFAULT_VARIANTS.includes(finalBrand)
-                  ) {
-                    Alert.alert(
-                      "Already Exists",
-                      "This brand is already in your list.",
+                disabled={isSettingsBlocking}
+                onPress={() =>
+                  runSettingsBlockingAction("Saving brand...", async () => {
+                    const finalBrand = cleanLimitedText(
+                      newGlobalVariant,
+                      LIMITS.nameChars,
                     );
-                    return;
-                  }
-                  Haptics.notificationAsync(
-                    Haptics.NotificationFeedbackType.Success,
-                  );
-                  saveGlobalVariants([...globalVariants, finalBrand]);
-                  setIsGlobalVariantModalVisible(false);
-                  setNewGlobalVariant("");
-                }}
+                    if (!finalBrand) return;
+                    const finalBrandKey = normalizeListName(finalBrand);
+                    if (
+                      [...globalVariants, ...DEFAULT_VARIANTS].some(
+                        (brand) => normalizeListName(brand) === finalBrandKey,
+                      )
+                    ) {
+                      Alert.alert(
+                        "Already Exists",
+                        "This brand is already in your list.",
+                      );
+                      return;
+                    }
+                    Haptics.notificationAsync(
+                      Haptics.NotificationFeedbackType.Success,
+                    );
+                    await saveGlobalVariants([...globalVariants, finalBrand]);
+                    setIsGlobalVariantModalVisible(false);
+                    setNewGlobalVariant("");
+                  })
+                }
               >
                 <Text
                   style={[
@@ -1677,121 +2760,80 @@ Machine brands: ${importResult.machineBrands}`,
         }}
         showsVerticalScrollIndicator={false}
       >
-        <SettingsCard style={{ marginBottom: 18 }}>
-          <View
-            style={{
-              padding: 20,
-              flexDirection: "row",
-              alignItems: "center",
-            }}
-          >
+        <View style={{ marginBottom: 26 }}>
+          <SectionTitle title="Account" />
+          <SettingsCard>
             <View
               style={{
-                width: 58,
-                height: 58,
-                borderRadius: 20,
-                backgroundColor: "rgba(50, 215, 75, 0.14)",
+                padding: 20,
+                flexDirection: "row",
                 alignItems: "center",
-                justifyContent: "center",
-                marginRight: 14,
+                borderBottomWidth: 1,
+                borderBottomColor: "#2C2C2E",
               }}
             >
-              <Ionicons name="person-outline" size={26} color="#32D74B" />
-            </View>
-            <View style={{ flex: 1 }}>
-              <Text
+              <View
                 style={{
-                  color: "#FFF",
-                  fontSize: 22,
-                  fontWeight: "900",
+                  width: 58,
+                  height: 58,
+                  borderRadius: 20,
+                  backgroundColor: "rgba(50, 215, 75, 0.14)",
+                  alignItems: "center",
+                  justifyContent: "center",
+                  marginRight: 14,
                 }}
-                numberOfLines={1}
               >
-                {displayName}
-              </Text>
-              <Text
-                style={{
-                  color: "#8E8E93",
-                  fontSize: 13,
-                  fontWeight: "700",
-                  marginTop: 5,
-                }}
-                numberOfLines={1}
-              >
-                Logged in as: {auth.currentUser?.email || "No email available"}
-              </Text>
+                <Ionicons name="person-outline" size={26} color="#32D74B" />
+              </View>
+              <View style={{ flex: 1 }}>
+                <Text
+                  style={{
+                    color: "#FFF",
+                    fontSize: 22,
+                    fontWeight: "900",
+                  }}
+                  numberOfLines={1}
+                >
+                  @{displayName}
+                </Text>
+                <Text
+                  style={{
+                    color: "#8E8E93",
+                    fontSize: 13,
+                    fontWeight: "700",
+                    marginTop: 5,
+                  }}
+                  numberOfLines={1}
+                >
+                  {auth.currentUser?.email || "No email available"}
+                </Text>
+              </View>
             </View>
-          </View>
-        </SettingsCard>
-
-        <TouchableOpacity
-          activeOpacity={0.78}
-          style={{
-            backgroundColor: "rgba(10, 132, 255, 0.08)",
-            borderColor: "rgba(10, 132, 255, 0.55)",
-            borderWidth: 1,
-            borderRadius: 24,
-            padding: 18,
-            flexDirection: "row",
-            alignItems: "center",
-            marginBottom: 26,
-          }}
-          onPress={() => {
-            Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
-            navigation.navigate("OnboardingGuide", { manual: true });
-          }}
-        >
-          <View
-            style={{
-              width: 46,
-              height: 46,
-              borderRadius: 16,
-              backgroundColor: "rgba(10, 132, 255, 0.18)",
-              alignItems: "center",
-              justifyContent: "center",
-              marginRight: 14,
-            }}
-          >
-            <Ionicons name="book-outline" size={22} color="#0A84FF" />
-          </View>
-          <View style={{ flex: 1 }}>
-            <Text
-              style={{
-                color: "#0A84FF",
-                fontSize: 12,
-                fontWeight: "900",
-                letterSpacing: 1.2,
-              }}
-            >
-              HELP
-            </Text>
-            <Text
-              style={{
-                color: "#FFF",
-                fontSize: 20,
-                fontWeight: "900",
-                marginTop: 4,
-              }}
-            >
-              IronVault Guide
-            </Text>
-            <Text
-              style={{
-                color: "#8E8E93",
-                fontSize: 14,
-                fontWeight: "600",
-                marginTop: 4,
-              }}
-            >
-              Learn setup, workouts, splits, stats, and backup.
-            </Text>
-          </View>
-          <Ionicons name="chevron-forward" size={22} color="#8E8E93" />
-        </TouchableOpacity>
+            <SettingRow
+              title="Username"
+              subtitle={
+                usernameWarning || "Unique nickname used for your IronVault account."
+              }
+              icon={usernameWarning ? "warning-outline" : "at-outline"}
+              iconColor={usernameWarning ? "#FF9F0A" : "#32D74B"}
+              onPress={openUsernameEditor}
+              isLast
+              right={<Ionicons name="chevron-forward" size={20} color="#636366" />}
+            />
+          </SettingsCard>
+        </View>
 
         <View style={{ marginBottom: 26 }}>
           <SectionTitle title="Training Preferences" />
-          <SettingsCard>
+          <View
+            style={{
+              backgroundColor: "#1C1C1E",
+              borderRadius: 24,
+              borderWidth: 1,
+              borderColor: "#2C2C2E",
+              overflow: "hidden",
+            }}
+          >
             <SettingRow
               title="Units"
               subtitle="Used across workouts, history, and plate calculator."
@@ -1805,7 +2847,9 @@ Machine brands: ${importResult.machineBrands}`,
                     Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
                     setMetric(m);
                     await AsyncStorage.setItem(`@user_metric_${uid}`, m);
-                    await syncSettingsToCloud({ metric: m });
+                    syncSettingsToCloud({ metric: m }).catch((error) =>
+                      console.log("Metric cloud sync delayed:", error),
+                    );
                   }}
                 />
               }
@@ -1828,51 +2872,151 @@ Machine brands: ${importResult.machineBrands}`,
                       `@rest_timer_enabled_${uid}`,
                       enabled.toString(),
                     );
-                    await syncSettingsToCloud({ timerEnabled: enabled });
+                    syncSettingsToCloud({ timerEnabled: enabled }).catch(
+                      (error) =>
+                        console.log("Rest timer cloud sync delayed:", error),
+                    );
                   }}
                 />
               }
             />
 
             {timerEnabled && (
-              <SettingRow
-                title="Default Rest"
-                subtitle="Your default rest timer duration in seconds."
-                icon="hourglass-outline"
-                right={
-                  <View
+              <View
+                style={{
+                  minHeight: 72,
+                  paddingVertical: 14,
+                  paddingHorizontal: 18,
+                  flexDirection: "row",
+                  alignItems: "center",
+                  borderBottomWidth: 1,
+                  borderBottomColor: "#2C2C2E",
+                }}
+              >
+                <View
+                  style={{
+                    width: 38,
+                    height: 38,
+                    borderRadius: 13,
+                    backgroundColor: "#32D74B20",
+                    alignItems: "center",
+                    justifyContent: "center",
+                    marginRight: 12,
+                  }}
+                >
+                  <Ionicons
+                    name="hourglass-outline"
+                    size={20}
+                    color="#32D74B"
+                  />
+                </View>
+                <View style={{ flex: 1, paddingRight: 12 }}>
+                  <Text style={{ color: "#FFF", fontSize: 17, fontWeight: "800" }}>
+                    Default Rest
+                  </Text>
+                  <Text
                     style={{
-                      flexDirection: "row",
-                      alignItems: "center",
-                      backgroundColor: "#2C2C2E",
-                      borderRadius: 16,
-                      paddingHorizontal: 12,
+                      color: "#8E8E93",
+                      fontSize: 13,
+                      fontWeight: "600",
+                      marginTop: 4,
+                      lineHeight: 18,
                     }}
                   >
-                    <TextInput
-                      style={{
-                        color: "#FFF",
-                        fontSize: 16,
-                        fontWeight: "900",
-                        width: 54,
-                        height: 44,
-                        textAlign: "center",
-                      }}
-                      keyboardType="number-pad"
-                      value={rest}
-                      onChangeText={async (t) => {
-                        if (!uid) return;
-                        setRest(t);
-                        await AsyncStorage.setItem(`@rest_time_${uid}`, t);
-                        await syncSettingsToCloud({ restTime: t });
-                      }}
-                    />
-                    <Text style={{ color: "#8E8E93", fontWeight: "800" }}>
-                      s
-                    </Text>
-                  </View>
-                }
-              />
+                    Your default rest timer duration in seconds.
+                  </Text>
+                </View>
+                <View
+                  style={{
+                    flexDirection: "row",
+                    alignItems: "center",
+                    backgroundColor: "#2C2C2E",
+                    borderRadius: 16,
+                    paddingHorizontal: 12,
+                  }}
+                >
+                  <TextInput
+                    style={{
+                      color: "#FFF",
+                      fontSize: 16,
+                      fontWeight: "900",
+                      width: 54,
+                      height: 44,
+                      textAlign: "center",
+                    }}
+                    keyboardType="number-pad"
+                    value={rest}
+                    onChangeText={updateRestDraft}
+                    maxLength={3}
+                    onEndEditing={() => {
+                      const parsed = Math.round(Number(rest));
+                      const nextRest = Number.isFinite(parsed)
+                        ? clampRestSeconds(parsed)
+                        : 90;
+                      saveRestDuration(String(nextRest));
+                    }}
+                  />
+                  <Text style={{ color: "#8E8E93", fontWeight: "800" }}>s</Text>
+                </View>
+              </View>
+            )}
+
+            {timerEnabled && (
+              <View
+                style={{
+                  paddingHorizontal: 20,
+                  paddingVertical: 14,
+                  borderBottomWidth: 1,
+                  borderBottomColor: "#2C2C2E",
+                }}
+              >
+                <View
+                  style={{
+                    flexDirection: "row",
+                    alignItems: "center",
+                    justifyContent: "space-between",
+                  }}
+                >
+                  {REST_TIMER_PRESETS.map((preset) => {
+                    const active = String(rest) === String(preset.value);
+                    return (
+                      <TouchableOpacity
+                        key={preset.value}
+                        activeOpacity={0.8}
+                        style={{
+                          width: "23%",
+                          height: 42,
+                          borderRadius: 21,
+                          alignItems: "center",
+                          justifyContent: "center",
+                          backgroundColor: active ? "#32D74B" : "#2C2C2E",
+                          borderWidth: 1,
+                          borderColor: active ? "#32D74B" : "#3A3A3C",
+                        }}
+                        onPress={async () => {
+                          Haptics.impactAsync(
+                            Haptics.ImpactFeedbackStyle.Light,
+                          );
+                          await saveRestDuration(preset.value);
+                        }}
+                      >
+                        <Text
+                          style={{
+                            color: active ? "#000" : "#FFF",
+                            fontSize: 13,
+                            lineHeight: 16,
+                            fontWeight: "900",
+                            textAlign: "center",
+                            includeFontPadding: false,
+                          }}
+                        >
+                          {preset.label}
+                        </Text>
+                      </TouchableOpacity>
+                    );
+                  })}
+                </View>
+              </View>
             )}
 
             <SettingRow
@@ -1892,7 +3036,64 @@ Machine brands: ${importResult.machineBrands}`,
                       `@auto_check_enabled_${uid}`,
                       enabled.toString(),
                     );
-                    await syncSettingsToCloud({ autoCheckEnabled: enabled });
+                    syncSettingsToCloud({ autoCheckEnabled: enabled }).catch(
+                      (error) =>
+                        console.log("Auto-check cloud sync delayed:", error),
+                    );
+                  }}
+                />
+              }
+            />
+
+            <SettingRow
+              title="RPE Tracking"
+              subtitle="Add optional effort ratings to warm-up and working sets."
+              icon="speedometer-outline"
+              right={
+                <TogglePill
+                  options={["ON", "OFF"]}
+                  value={rpeTrackingEnabled ? "ON" : "OFF"}
+                  onChange={async (next: string) => {
+                    if (!uid) return;
+                    const enabled = next === "ON";
+                    Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
+                    setRpeTrackingEnabled(enabled);
+                    await AsyncStorage.setItem(
+                      `@rpe_tracking_enabled_${uid}`,
+                      enabled.toString(),
+                    );
+                    syncSettingsToCloud({
+                      rpeTrackingEnabled: enabled,
+                    }).catch((error) =>
+                      console.log("RPE tracking cloud sync delayed:", error),
+                    );
+                  }}
+                />
+              }
+            />
+
+            <SettingRow
+              title="Next Session Notes"
+              subtitle="Show one-time template exercise notes for your next workout only."
+              icon="document-text-outline"
+              right={
+                <TogglePill
+                  options={["ON", "OFF"]}
+                  value={nextSessionNotesEnabled ? "ON" : "OFF"}
+                  onChange={async (next: string) => {
+                    if (!uid) return;
+                    const enabled = next === "ON";
+                    Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
+                    setNextSessionNotesEnabled(enabled);
+                    await writeNextSessionNotesEnabled(uid, enabled);
+                    syncSettingsToCloud({
+                      nextSessionNotesEnabled: enabled,
+                    }).catch((error) =>
+                      console.log(
+                        "Next session notes setting cloud sync delayed:",
+                        error,
+                      ),
+                    );
                   }}
                 />
               }
@@ -1916,12 +3117,18 @@ Machine brands: ${importResult.machineBrands}`,
                       `@plate_calc_enabled_${uid}`,
                       enabled.toString(),
                     );
-                    await syncSettingsToCloud({ plateCalcEnabled: enabled });
+                    syncSettingsToCloud({ plateCalcEnabled: enabled }).catch(
+                      (error) =>
+                        console.log(
+                          "Plate calculator cloud sync delayed:",
+                          error,
+                        ),
+                    );
                   }}
                 />
               }
             />
-          </SettingsCard>
+          </View>
 
           {plateCalcEnabled && (
             <SettingsCard style={{ marginTop: 12, padding: 18 }}>
@@ -1996,7 +3203,7 @@ Machine brands: ${importResult.machineBrands}`,
         </View>
 
         <View style={{ marginBottom: 26 }}>
-          <SectionTitle title="Training Environment" />
+          <SectionTitle title="Training Setup" />
           <SettingsCard style={{ marginBottom: 12 }}>
             <SettingRow
               title="Gyms"
@@ -2005,6 +3212,13 @@ Machine brands: ${importResult.machineBrands}`,
               right={
                 <TouchableOpacity
                   onPress={() => {
+                    if (gyms.length >= LIMITS.gymsPerUser) {
+                      Alert.alert(
+                        "Gym Limit Reached",
+                        "You can save up to 25 gyms.",
+                      );
+                      return;
+                    }
                     setEditingGymId(null);
                     setGymName("");
                     setGymDefaultBrand(null);
@@ -2129,7 +3343,7 @@ Machine brands: ${importResult.machineBrands}`,
                       }}
                     >
                       {gym.defaultMachineBrand
-                        ? `Default Machine Brand: ${gym.defaultMachineBrand}`
+                        ? `Default machine brand: ${gym.defaultMachineBrand}`
                         : "No default machine brand"}
                     </Text>
                     <Text
@@ -2206,11 +3420,7 @@ Machine brands: ${importResult.machineBrands}`,
                             {
                               text: "Delete",
                               style: "destructive",
-                              onPress: () => {
-                                saveGlobalVariants(
-                                  globalVariants.filter((v) => v !== variant),
-                                );
-                              },
+                              onPress: () => deleteGlobalVariant(variant),
                             },
                           ],
                         );
@@ -2230,100 +3440,496 @@ Machine brands: ${importResult.machineBrands}`,
         </View>
 
         <View style={{ marginBottom: 26 }}>
-          <SectionTitle title="Data & Backup" />
-          <TouchableOpacity
-            activeOpacity={0.78}
+          <SectionTitle title="Data & Sync" />
+          <View
             style={{
-              backgroundColor: "rgba(50, 215, 75, 0.08)",
-              borderColor: "rgba(50, 215, 75, 0.45)",
+              backgroundColor:
+                syncStatus?.success === false
+                  ? "rgba(255, 159, 10, 0.08)"
+                  : "rgba(50, 215, 75, 0.08)",
+              borderColor:
+                syncStatus?.success === false
+                  ? "rgba(255, 159, 10, 0.45)"
+                  : "rgba(50, 215, 75, 0.45)",
               borderWidth: 1,
               borderRadius: 24,
               padding: 18,
-              flexDirection: "row",
-              alignItems: "center",
             }}
-            onPress={handleFullSync}
-            disabled={isSyncing}
           >
+            <View style={{ flexDirection: "row", alignItems: "center" }}>
+              <View
+                style={{
+                  width: 46,
+                  height: 46,
+                  borderRadius: 16,
+                  backgroundColor:
+                    syncStatus?.success === false
+                      ? "rgba(255, 159, 10, 0.14)"
+                      : "rgba(50, 215, 75, 0.14)",
+                  alignItems: "center",
+                  justifyContent: "center",
+                  marginRight: 14,
+                }}
+              >
+                {isSyncing ? (
+                  <ActivityIndicator size="small" color="#32D74B" />
+                ) : (
+                  <Ionicons
+                    name={getSyncIcon(syncStatus, isSyncing) as any}
+                    size={22}
+                    color={getSyncTone(syncStatus, isSyncing)}
+                  />
+                )}
+              </View>
+              <View style={{ flex: 1 }}>
+                <Text
+                  style={{
+                    color: getSyncTone(syncStatus, isSyncing),
+                    fontSize: 12,
+                    fontWeight: "900",
+                    letterSpacing: 1.2,
+                  }}
+                >
+                  CLOUD SYNC
+                </Text>
+                <Text
+                  style={{
+                    color: "#FFF",
+                    fontSize: 20,
+                    fontWeight: "900",
+                    marginTop: 4,
+                  }}
+                >
+                  {getSyncTitle(syncStatus, isSyncing)}
+                </Text>
+                <Text
+                  style={{
+                    color: "#8E8E93",
+                    fontSize: 14,
+                    fontWeight: "600",
+                    marginTop: 4,
+                    lineHeight: 20,
+                  }}
+                >
+                  {getSyncSubtitle(syncStatus, isSyncing)}
+                </Text>
+              </View>
+            </View>
+
             <View
               style={{
-                width: 46,
-                height: 46,
-                borderRadius: 16,
-                backgroundColor: "rgba(50, 215, 75, 0.14)",
-                alignItems: "center",
-                justifyContent: "center",
-                marginRight: 14,
+                marginTop: 14,
+                backgroundColor:
+                  syncStatus?.success === false
+                    ? "rgba(255, 159, 10, 0.1)"
+                    : "rgba(255,255,255,0.05)",
+                borderRadius: 14,
+                padding: 12,
+                borderWidth: syncStatus?.success === false ? 1 : 0,
+                borderColor: "rgba(255, 159, 10, 0.28)",
               }}
             >
-              {isSyncing ? (
-                <ActivityIndicator size="small" color="#32D74B" />
-              ) : (
-                <Ionicons
-                  name="cloud-upload-outline"
-                  size={22}
-                  color="#32D74B"
-                />
-              )}
+              {syncDetailRows.map((line, index) => (
+                <View
+                  key={line}
+                  style={{
+                    flexDirection: "row",
+                    alignItems: "flex-start",
+                    marginBottom: index === syncDetailRows.length - 1 ? 0 : 8,
+                  }}
+                >
+                  <Ionicons
+                    name={
+                      syncStatus?.success === false
+                        ? "alert-circle-outline"
+                        : "checkmark-circle-outline"
+                    }
+                    size={15}
+                    color={getSyncTone(syncStatus, isSyncing)}
+                    style={{ marginTop: 1, marginRight: 8 }}
+                  />
+                  <Text
+                    style={{
+                      color: "#D1D1D6",
+                      fontSize: 12,
+                      fontWeight: "700",
+                      lineHeight: 18,
+                      flex: 1,
+                    }}
+                  >
+                    {line}
+                  </Text>
+                </View>
+              ))}
             </View>
-            <View style={{ flex: 1 }}>
+
+            <View
+              style={{
+                flexDirection: "row",
+                flexWrap: "wrap",
+                marginTop: 14,
+                paddingTop: 14,
+                borderTopWidth: 1,
+                borderTopColor: "rgba(255,255,255,0.08)",
+                gap: 8,
+              }}
+            >
+              {syncSummaryChips.map((label) => (
+                <View
+                  key={label}
+                  style={{
+                    backgroundColor: "rgba(255,255,255,0.06)",
+                    borderRadius: 999,
+                    paddingHorizontal: 10,
+                    paddingVertical: 6,
+                  }}
+                >
+                  <Text
+                    style={{
+                      color: "#C7C7CC",
+                      fontSize: 12,
+                      fontWeight: "800",
+                    }}
+                  >
+                    {label}
+                  </Text>
+                </View>
+              ))}
+            </View>
+
+            <View
+              style={{
+                marginTop: 14,
+                backgroundColor: "rgba(255,255,255,0.05)",
+                borderRadius: 14,
+                padding: 12,
+              }}
+            >
               <Text
                 style={{
-                  color: "#32D74B",
-                  fontSize: 12,
-                  fontWeight: "900",
-                  letterSpacing: 1.2,
-                }}
-              >
-                SYNC & BACKUP
-              </Text>
-              <Text
-                style={{
-                  color: "#FFF",
-                  fontSize: 20,
-                  fontWeight: "900",
-                  marginTop: 4,
-                }}
-              >
-                {isSyncing
-                  ? "Syncing Data"
-                  : syncStatus
-                    ? "Synced with Cloud"
-                    : "Sync with Cloud"}
-              </Text>
-              <Text
-                style={{
-                  color: "#8E8E93",
-                  fontSize: 14,
-                  fontWeight: "600",
-                  marginTop: 4,
-                  lineHeight: 20,
-                }}
-              >
-                Last synced: {formatSyncTime(syncStatus?.lastSyncedAt)}
-              </Text>
-              <Text
-                style={{
-                  color: "#8E8E93",
+                  color: "#C7C7CC",
                   fontSize: 12,
                   fontWeight: "700",
-                  marginTop: 4,
                   lineHeight: 18,
                 }}
               >
-                {formatSyncCounts(syncStatus)}
+                Data is always saved locally first. Cloud sync backs up workouts,
+                templates, folders, exercises, gyms, machine brands, and settings
+                when your connection is available.
               </Text>
             </View>
-            <Ionicons name="chevron-forward" size={22} color="#8E8E93" />
-          </TouchableOpacity>
+          </View>
 
           <SettingsCard style={{ marginTop: 14 }}>
             <SettingRow
+              title={syncStatus?.success === false ? "Retry Sync" : "Sync Now"}
+              subtitle={
+                syncStatus?.success === false
+                  ? "Try cloud backup again. Local data will stay on this device."
+                  : "Manually merge this device with your cloud backup."
+              }
+              icon="sync-outline"
+              iconColor={
+                syncStatus?.success === false ? "#FF9F0A" : "#32D74B"
+              }
+              onPress={isSyncing ? undefined : handleFullSync}
+              isLast
+              right={
+                isSyncing ? (
+                  <ActivityIndicator size="small" color="#32D74B" />
+                ) : (
+                  <Ionicons name="chevron-forward" size={22} color="#8E8E93" />
+                )
+              }
+            />
+          </SettingsCard>
+
+          <Text
+            style={{
+              color: "#8E8E93",
+              fontSize: 12,
+              fontWeight: "900",
+              textTransform: "uppercase",
+              letterSpacing: 1,
+              marginTop: 20,
+              marginBottom: 10,
+              paddingHorizontal: 2,
+            }}
+          >
+            Cloud Restore
+          </Text>
+
+          <SettingsCard>
+            <View
+              style={{
+                padding: 18,
+                flexDirection: "row",
+                alignItems: "center",
+                borderBottomWidth: 1,
+                borderBottomColor: "#2C2C2E",
+              }}
+            >
+              <View
+                style={{
+                  width: 42,
+                  height: 42,
+                  borderRadius: 14,
+                  backgroundColor: "rgba(10, 132, 255, 0.14)",
+                  alignItems: "center",
+                  justifyContent: "center",
+                  marginRight: 12,
+                }}
+              >
+                {isRestorePreviewLoading ? (
+                  <ActivityIndicator size="small" color="#0A84FF" />
+                ) : (
+                  <Ionicons
+                    name="cloud-download-outline"
+                    size={21}
+                    color="#0A84FF"
+                  />
+                )}
+              </View>
+              <View style={{ flex: 1 }}>
+                <Text style={{ color: "#FFF", fontSize: 18, fontWeight: "900" }}>
+                  Restore from Cloud
+                </Text>
+                <Text
+                  style={{
+                    color: "#8E8E93",
+                    fontSize: 13,
+                    fontWeight: "600",
+                    marginTop: 4,
+                    lineHeight: 18,
+                  }}
+                >
+                  Replace selected categories on this device with your cloud
+                  copy.
+                </Text>
+                <Text
+                  style={{
+                    color: "#C7C7CC",
+                    fontSize: 12,
+                    fontWeight: "800",
+                    marginTop: 8,
+                  }}
+                >
+                  {restorePreview?.readAt
+                    ? `Cloud checked: ${formatBackupPreviewDate(restorePreview.readAt)}`
+                    : "Check your cloud copy before restoring."}
+                </Text>
+              </View>
+            </View>
+
+            {RESTORE_CATEGORY_OPTIONS.map((option, index) => {
+              const selected = selectedRestoreCategories.includes(option.key);
+              const count = restoreCategoryCounts[option.key];
+              const hasCount = Number.isFinite(Number(count));
+
+              return (
+                <TouchableOpacity
+                  key={option.key}
+                  activeOpacity={0.78}
+                  onPress={() => toggleRestoreCategory(option.key)}
+                  style={{
+                    minHeight: 68,
+                    paddingVertical: 12,
+                    paddingHorizontal: 18,
+                    flexDirection: "row",
+                    alignItems: "center",
+                    borderBottomWidth:
+                      index === RESTORE_CATEGORY_OPTIONS.length - 1 ? 0 : 1,
+                    borderBottomColor: "#2C2C2E",
+                    backgroundColor: selected
+                      ? "rgba(50, 215, 75, 0.06)"
+                      : "transparent",
+                  }}
+                >
+                  <View
+                    style={{
+                      width: 36,
+                      height: 36,
+                      borderRadius: 12,
+                      backgroundColor: selected
+                        ? "rgba(50, 215, 75, 0.16)"
+                        : "rgba(255,255,255,0.06)",
+                      alignItems: "center",
+                      justifyContent: "center",
+                      marginRight: 12,
+                    }}
+                  >
+                    <Ionicons
+                      name={option.icon as any}
+                      size={18}
+                      color={selected ? "#32D74B" : "#8E8E93"}
+                    />
+                  </View>
+                  <View style={{ flex: 1, paddingRight: 12 }}>
+                    <Text
+                      style={{
+                        color: "#FFF",
+                        fontSize: 15,
+                        fontWeight: "900",
+                      }}
+                    >
+                      {option.title}
+                    </Text>
+                    <Text
+                      style={{
+                        color: "#8E8E93",
+                        fontSize: 12,
+                        fontWeight: "600",
+                        marginTop: 3,
+                        lineHeight: 17,
+                      }}
+                    >
+                      {hasCount
+                        ? `${count} in cloud · ${option.subtitle}`
+                        : option.subtitle}
+                    </Text>
+                  </View>
+                  <Ionicons
+                    name={selected ? "checkbox" : "square-outline"}
+                    size={24}
+                    color={selected ? "#32D74B" : "#8E8E93"}
+                  />
+                </TouchableOpacity>
+              );
+            })}
+
+            <View
+              style={{
+                flexDirection: "row",
+                gap: 10,
+                padding: 14,
+                borderTopWidth: 1,
+                borderTopColor: "#2C2C2E",
+              }}
+            >
+              <TouchableOpacity
+                activeOpacity={0.8}
+                onPress={() => refreshCloudRestorePreview(true)}
+                disabled={isRestorePreviewLoading || isRestoringCloudData}
+                style={{
+                  flex: 1,
+                  minHeight: 48,
+                  borderRadius: 16,
+                  borderWidth: 1,
+                  borderColor: "rgba(10, 132, 255, 0.35)",
+                  backgroundColor: "rgba(10, 132, 255, 0.1)",
+                  alignItems: "center",
+                  justifyContent: "center",
+                  flexDirection: "row",
+                  gap: 8,
+                  opacity:
+                    isRestorePreviewLoading || isRestoringCloudData ? 0.6 : 1,
+                }}
+              >
+                {isRestorePreviewLoading ? (
+                  <ActivityIndicator size="small" color="#0A84FF" />
+                ) : (
+                  <Ionicons
+                    name="refresh-outline"
+                    size={18}
+                    color="#0A84FF"
+                  />
+                )}
+                <Text
+                  style={{ color: "#0A84FF", fontSize: 13, fontWeight: "900" }}
+                >
+                  Check Cloud
+                </Text>
+              </TouchableOpacity>
+
+              <TouchableOpacity
+                activeOpacity={0.82}
+                onPress={handleRestoreSelectedCategories}
+                disabled={
+                  restoreSelectedCount === 0 ||
+                  isRestorePreviewLoading ||
+                  isRestoringCloudData
+                }
+                style={{
+                  flex: 1.15,
+                  minHeight: 48,
+                  borderRadius: 16,
+                  backgroundColor:
+                    restoreSelectedCount === 0 ? "#2C2C2E" : "#32D74B",
+                  alignItems: "center",
+                  justifyContent: "center",
+                  flexDirection: "row",
+                  gap: 8,
+                  opacity:
+                    isRestorePreviewLoading || isRestoringCloudData ? 0.65 : 1,
+                }}
+              >
+                {isRestoringCloudData ? (
+                  <ActivityIndicator size="small" color="#000" />
+                ) : (
+                  <Ionicons
+                    name="return-down-back-outline"
+                    size={18}
+                    color={restoreSelectedCount === 0 ? "#8E8E93" : "#000"}
+                  />
+                )}
+                <Text
+                  style={{
+                    color: restoreSelectedCount === 0 ? "#8E8E93" : "#000",
+                    fontSize: 13,
+                    fontWeight: "900",
+                  }}
+                >
+                  Restore {restoreSelectedCount || ""}
+                </Text>
+              </TouchableOpacity>
+            </View>
+          </SettingsCard>
+
+          <View
+            style={{
+              marginTop: 12,
+              backgroundColor: "rgba(10, 132, 255, 0.08)",
+              borderColor: "rgba(10, 132, 255, 0.25)",
+              borderWidth: 1,
+              borderRadius: 16,
+              padding: 12,
+            }}
+          >
+            <Text
+              style={{
+                color: "#C7C7CC",
+                fontSize: 12,
+                fontWeight: "700",
+                lineHeight: 18,
+              }}
+            >
+              Cloud Restore is replace-only for the checked categories. It keeps
+              a before-restore backup on this device before making changes.
+            </Text>
+          </View>
+
+          <Text
+            style={{
+              color: "#8E8E93",
+              fontSize: 12,
+              fontWeight: "900",
+              textTransform: "uppercase",
+              letterSpacing: 1,
+              marginTop: 20,
+              marginBottom: 10,
+              paddingHorizontal: 2,
+            }}
+          >
+            Backup
+          </Text>
+
+          <SettingsCard>
+            <SettingRow
               title="Export Data"
-              subtitle="Export workouts, templates, exercises, favorites, gyms, brands, and settings."
+              subtitle="Create a JSON backup you can save or share."
               icon="download-outline"
               iconColor="#0A84FF"
-              onPress={handleExportData}
+              onPress={isExporting ? undefined : handleExportData}
               right={
                 isExporting ? (
                   <ActivityIndicator size="small" color="#0A84FF" />
@@ -2333,11 +3939,11 @@ Machine brands: ${importResult.machineBrands}`,
               }
             />
             <SettingRow
-              title="Import Data"
-              subtitle="Import a backup safely without wiping local data."
+              title="Import Backup"
+              subtitle="Merge missing data from an IronVault backup. Existing data is kept."
               icon="folder-open-outline"
               iconColor="#FF9F0A"
-              onPress={handleImportData}
+              onPress={isImporting ? undefined : handleImportData}
               isLast
               right={
                 isImporting ? (
@@ -2348,19 +3954,73 @@ Machine brands: ${importResult.machineBrands}`,
               }
             />
           </SettingsCard>
+
+          <View
+            style={{
+              marginTop: 12,
+              backgroundColor: "rgba(255, 159, 10, 0.08)",
+              borderColor: "rgba(255, 159, 10, 0.25)",
+              borderWidth: 1,
+              borderRadius: 16,
+              padding: 12,
+            }}
+          >
+            <Text
+              style={{
+                color: "#C7C7CC",
+                fontSize: 12,
+                fontWeight: "700",
+                lineHeight: 18,
+              }}
+            >
+              Import is merge-only. It adds missing backup data and will not
+              delete or overwrite your current data.
+            </Text>
+          </View>
         </View>
 
 
         <View style={{ marginBottom: 26 }}>
-          <SectionTitle title="Legal & Account" />
+          <SectionTitle title="Help" />
           <SettingsCard>
+            <SettingRow
+              title="Quick Start Guide"
+              subtitle="Learn the simple flow: add a gym, start a workout, log sets, finish, and save templates only when useful."
+              icon="book-outline"
+              iconColor="#0A84FF"
+              onPress={() => {
+                Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
+                navigation.navigate("OnboardingGuide", { manual: true });
+              }}
+              isLast
+              right={
+                <Ionicons name="chevron-forward" size={22} color="#8E8E93" />
+              }
+            />
+          </SettingsCard>
+        </View>
+
+
+        <View style={{ marginBottom: 26 }}>
+          <SectionTitle title="Legal" />
+          <SettingsCard>
+            <SettingRow
+              title="Support & Legal Website"
+              subtitle="Open the public support, privacy, terms, and deletion page."
+              icon="globe-outline"
+              iconColor="#0A84FF"
+              onPress={() => WebBrowser.openBrowserAsync(LEGAL_WEBSITE_URL)}
+              right={
+                <Ionicons name="open-outline" size={22} color="#8E8E93" />
+              }
+            />
             <SettingRow
               title="Terms of Service"
               subtitle="Review the rules and fitness disclaimer for using IronVault."
               icon="document-text-outline"
               iconColor="#32D74B"
               onPress={() => {
-                setLegalTab("TERMS");
+                setLegalTab("terms");
                 setIsLegalModalVisible(true);
               }}
               right={
@@ -2374,7 +4034,7 @@ Machine brands: ${importResult.machineBrands}`,
               iconColor="#0A84FF"
               isLast
               onPress={() => {
-                setLegalTab("PRIVACY");
+                setLegalTab("privacy");
                 setIsLegalModalVisible(true);
               }}
               right={
@@ -2385,7 +4045,7 @@ Machine brands: ${importResult.machineBrands}`,
         </View>
 
         <View>
-          <SectionTitle title="Danger Zone" />
+          <SectionTitle title="Account Actions" />
           <SettingsCard>
             <SettingRow
               title="Sign Out"
@@ -2399,7 +4059,7 @@ Machine brands: ${importResult.machineBrands}`,
             />
             <SettingRow
               title="Delete Account"
-              subtitle="Permanently erase all data."
+              subtitle="Permanently delete your account and cloud data."
               icon="warning-outline"
               iconColor="#FF3B30"
               isLast
@@ -2411,6 +4071,11 @@ Machine brands: ${importResult.machineBrands}`,
           </SettingsCard>
         </View>
       </ScrollView>
+
+      <BlockingOverlay
+        visible={isSettingsBlocking}
+        message={settingsBlockingMessage}
+      />
     </View>
   );
 }

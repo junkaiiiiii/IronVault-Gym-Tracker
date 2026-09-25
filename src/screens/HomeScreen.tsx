@@ -24,12 +24,15 @@ import {
 import FirstTimeOnboarding from "../components/FirstTimeOnboarding";
 import CustomAlert from "../components/CustomAlert";
 import { Colors } from "../theme";
+import { safeJsonParse } from "../utils/firebaseSync";
 
 const GREEN = Colors.accent;
 const CARD = Colors.card;
 const CARD_SOFT = Colors.surface;
 const BORDER = Colors.border;
 const MUTED = Colors.textMuted;
+
+const normalizeUsername = (value: any) => String(value || "").trim().toLowerCase();
 
 type HomeStats = {
   workouts: number;
@@ -57,6 +60,15 @@ type TemplateFolder = {
 const startOfLocalDay = (value: number): number => {
   const date = new Date(value);
   date.setHours(0, 0, 0, 0);
+  return date.getTime();
+};
+
+const getWeekStart = (timestamp: number): number => {
+  const date = new Date(timestamp);
+  date.setHours(0, 0, 0, 0);
+  const day = date.getDay();
+  const diff = day === 0 ? -6 : 1 - day;
+  date.setDate(date.getDate() + diff);
   return date.getTime();
 };
 
@@ -212,7 +224,7 @@ export default function HomeScreen({ navigation }: any) {
     }
 
     try {
-      const parsed = JSON.parse(session);
+      const parsed = safeJsonParse<any>(session, {});
       const exerciseCount = Array.isArray(parsed.exercises)
         ? parsed.exercises.length
         : 0;
@@ -240,39 +252,45 @@ export default function HomeScreen({ navigation }: any) {
 
   const loadUserData = async () => {
     const user = auth.currentUser;
-    if (user) {
-      const storedName = await AsyncStorage.getItem(
-        `@user_username_${user.uid}`,
-      );
+    if (!user) return;
 
-      if (storedName) {
-        setDisplayName(storedName);
-      } else {
-        try {
-          let cloudName = null;
-          const userDoc = await getDoc(doc(db, "users", user.uid));
+    const cacheKey = `@user_username_${user.uid}`;
+    const storedName = normalizeUsername(await AsyncStorage.getItem(cacheKey));
 
-          if (userDoc.exists() && userDoc.data().username) {
-            cloudName = userDoc.data().username;
-          } else {
-            const q = query(
-              collection(db, "usernames"),
-              where("uid", "==", user.uid),
-            );
-            const qSnap = await getDocs(q);
-            if (!qSnap.empty) {
-              cloudName = qSnap.docs[0].data().display_name;
-            }
-          }
+    try {
+      let cloudName = "";
+      const userDoc = await getDoc(doc(db, "users", user.uid));
 
-          if (cloudName) {
-            setDisplayName(cloudName);
-            await AsyncStorage.setItem(`@user_username_${user.uid}`, cloudName);
-          }
-        } catch (e) {
-          console.log("Error fetching username fallback:", e);
+      if (userDoc.exists()) {
+        const data = userDoc.data();
+        cloudName = normalizeUsername(data.usernameLower || data.username);
+      }
+
+      if (!cloudName) {
+        const q = query(
+          collection(db, "usernames"),
+          where("uid", "==", user.uid),
+        );
+        const qSnap = await getDocs(q);
+        if (!qSnap.empty) {
+          const reservation = qSnap.docs[0];
+          cloudName = normalizeUsername(
+            reservation.data().usernameLower ||
+              reservation.data().username ||
+              reservation.data().display_name ||
+              reservation.id,
+          );
         }
       }
+
+      const resolvedName = cloudName || storedName;
+      if (resolvedName) {
+        setDisplayName(resolvedName);
+        await AsyncStorage.setItem(cacheKey, resolvedName);
+      }
+    } catch (e) {
+      console.log("Error fetching username fallback:", e);
+      if (storedName) setDisplayName(storedName);
     }
   };
 
@@ -287,7 +305,7 @@ export default function HomeScreen({ navigation }: any) {
       `@workout_history_${user.uid}`,
     );
     const parsedHistory = savedHistory
-      ? JSON.parse(savedHistory).filter((w: any) => w && w.id)
+      ? safeJsonParse<any[]>(savedHistory, []).filter((w: any) => w && w.id)
       : [];
 
     setHistory(
@@ -298,7 +316,7 @@ export default function HomeScreen({ navigation }: any) {
       `@workout_templates_${user.uid}`,
     );
     const parsedTemplates = savedTemplates
-      ? JSON.parse(savedTemplates).filter((t: any) => t && t.id)
+      ? safeJsonParse<any[]>(savedTemplates, []).filter((t: any) => t && t.id)
       : [];
 
     setTemplates(
@@ -309,7 +327,9 @@ export default function HomeScreen({ navigation }: any) {
       `@workout_folders_${user.uid}`,
     );
     const parsedFolders = savedFolders
-      ? JSON.parse(savedFolders).filter((folder: any) => folder && folder.id)
+      ? safeJsonParse<any[]>(savedFolders, []).filter(
+          (folder: any) => folder && folder.id,
+        )
       : [];
     setFolders(parsedFolders);
 
@@ -339,12 +359,8 @@ export default function HomeScreen({ navigation }: any) {
     let hasGyms = false;
 
     if (savedGymsRaw) {
-      try {
-        const parsedGyms = JSON.parse(savedGymsRaw);
-        hasGyms = Array.isArray(parsedGyms) && parsedGyms.length > 0;
-      } catch (e) {
-        hasGyms = false;
-      }
+      const parsedGyms = safeJsonParse<any[]>(savedGymsRaw, []);
+      hasGyms = Array.isArray(parsedGyms) && parsedGyms.length > 0;
     }
 
     if (!hasGyms) {
@@ -384,10 +400,10 @@ export default function HomeScreen({ navigation }: any) {
   };
 
   const weekStats = useMemo<HomeStats>(() => {
-    const sevenDaysAgo = Date.now() - 7 * 24 * 60 * 60 * 1000;
+    const weekStart = getWeekStart(Date.now());
     const workoutsThisWeek = history.filter((w) => {
       const time = getWorkoutTimestamp(w);
-      return Number.isFinite(time) && time >= sevenDaysAgo;
+      return Number.isFinite(time) && time >= weekStart;
     });
 
     return workoutsThisWeek.reduce(
@@ -427,19 +443,7 @@ export default function HomeScreen({ navigation }: any) {
         null
       : null;
 
-    const primaryFolder =
-      explicitActiveFolder ||
-      candidateFolders.find(
-        (folder) =>
-          folder.name?.toLowerCase() === "current split" &&
-          hasConfiguredSplit(folder),
-      ) ||
-      candidateFolders.find((folder) => hasConfiguredSplit(folder)) ||
-      candidateFolders.find(
-        (folder) => folder.name?.toLowerCase() === "current split",
-      ) ||
-      candidateFolders[0] ||
-      null;
+    const primaryFolder = activeSplitFolderId ? explicitActiveFolder : null;
 
     if (!primaryFolder) {
       return { state: "none" as const };
@@ -482,33 +486,38 @@ export default function HomeScreen({ navigation }: any) {
     };
   }, [folders, templates, activeSplitFolderId]);
 
-
-
   const completedTodayWorkout = useMemo(() => {
     if (todaySplit.state !== "template") return null;
 
     const today = startOfLocalDay(Date.now());
     const templateId = String(todaySplit.template.id || "");
-    const templateName = String(todaySplit.template.name || "").trim().toLowerCase();
+    const templateName = String(todaySplit.template.name || "")
+      .trim()
+      .toLowerCase();
 
     return (
       history.find((workout) => {
         const workoutDay = startOfLocalDay(getWorkoutTimestamp(workout));
         if (workoutDay !== today) return false;
 
-        const workoutTemplateId = workout?.templateId ? String(workout.templateId) : "";
-        if (templateId && workoutTemplateId && workoutTemplateId === templateId) return true;
+        const workoutTemplateId = workout?.templateId
+          ? String(workout.templateId)
+          : "";
+        if (templateId && workoutTemplateId && workoutTemplateId === templateId)
+          return true;
 
-        const workoutName = String(workout?.workoutName || "").trim().toLowerCase();
+        const workoutName = String(workout?.workoutName || "")
+          .trim()
+          .toLowerCase();
         return !!templateName && workoutName === templateName;
       }) || null
     );
   }, [history, todaySplit]);
 
-
   const lastWorkout = history[0];
   const lastTrainedText = lastWorkout
-    ? startOfLocalDay(getWorkoutTimestamp(lastWorkout)) === startOfLocalDay(Date.now())
+    ? startOfLocalDay(getWorkoutTimestamp(lastWorkout)) ===
+      startOfLocalDay(Date.now())
       ? "Today"
       : startOfLocalDay(getWorkoutTimestamp(lastWorkout)) ===
           startOfLocalDay(Date.now()) - 86400000
@@ -517,7 +526,8 @@ export default function HomeScreen({ navigation }: any) {
     : "No workouts yet";
 
   const nextScheduledWorkout = useMemo(() => {
-    if (todaySplit.state !== "template" && todaySplit.state !== "rest") return null;
+    if (todaySplit.state !== "template" && todaySplit.state !== "rest")
+      return null;
 
     const folder: any = todaySplit.folder;
     const cycleLength = clampCycleLength(folder?.cycleLength ?? 7);
@@ -546,8 +556,12 @@ export default function HomeScreen({ navigation }: any) {
     return null;
   }, [todaySplit, templates]);
 
-  const completedTodayExerciseCount = getWorkoutExerciseCount(completedTodayWorkout);
-  const completedTodaySetCount = getWorkoutWorkingSetCount(completedTodayWorkout);
+  const completedTodayExerciseCount = getWorkoutExerciseCount(
+    completedTodayWorkout,
+  );
+  const completedTodaySetCount = getWorkoutWorkingSetCount(
+    completedTodayWorkout,
+  );
   const completedTodayDuration = formatDuration(
     parseDurationToSeconds(completedTodayWorkout?.duration),
   );
@@ -639,15 +653,21 @@ export default function HomeScreen({ navigation }: any) {
                   hasActiveWorkout
                     ? "play"
                     : completedTodayWorkout
-                    ? "checkmark-circle"
-                    : todaySplit.state === "template"
-                      ? "calendar"
-                      : todaySplit.state === "rest"
-                      ? "moon"
-                      : "layers-outline"
+                      ? "checkmark-circle"
+                      : todaySplit.state === "template"
+                        ? "calendar"
+                        : todaySplit.state === "rest"
+                          ? "moon"
+                          : "layers-outline"
                 }
                 size={20}
-                color={hasActiveWorkout || completedTodayWorkout ? GREEN : todaySplit.state === "rest" ? MUTED : GREEN}
+                color={
+                  hasActiveWorkout || completedTodayWorkout
+                    ? GREEN
+                    : todaySplit.state === "rest"
+                      ? MUTED
+                      : GREEN
+                }
               />
             </View>
             <View style={{ flex: 1 }}>
@@ -655,40 +675,40 @@ export default function HomeScreen({ navigation }: any) {
                 {hasActiveWorkout
                   ? "Workout in Progress"
                   : completedTodayWorkout
-                  ? "Completed Today"
-                  : todaySplit.state === "none"
-                    ? "No split configured"
-                    : todaySplit.state === "empty"
-                    ? todaySplit.folder.name
-                    : `${todaySplit.folder.name} · D${todaySplit.day.dayNumber}`}
+                    ? "Completed Today"
+                    : todaySplit.state === "none"
+                      ? "Free Training"
+                      : todaySplit.state === "empty"
+                        ? todaySplit.folder.name
+                        : `${todaySplit.folder.name} · D${todaySplit.day.dayNumber}`}
               </Text>
               <Text style={localStyles.todayTitle}>
                 {hasActiveWorkout
                   ? activeWorkoutName
                   : completedTodayWorkout
-                  ? todaySplit.state === "template"
-                    ? todaySplit.template.name
-                    : completedTodayWorkout?.workoutName || "Workout Complete"
-                  : todaySplit.state === "template"
-                    ? todaySplit.template.name
-                    : todaySplit.state === "rest"
-                    ? "Rest Day"
-                    : todaySplit.state === "empty"
-                      ? "Set up your split days"
-                      : "Create your training split"}
+                    ? todaySplit.state === "template"
+                      ? todaySplit.template.name
+                      : completedTodayWorkout?.workoutName || "Workout Complete"
+                    : todaySplit.state === "template"
+                      ? todaySplit.template.name
+                      : todaySplit.state === "rest"
+                        ? "Rest Day"
+                        : todaySplit.state === "empty"
+                          ? "Ready to train?"
+                          : "Ready to train?"}
               </Text>
               <Text style={localStyles.todayMeta}>
                 {hasActiveWorkout
                   ? `${activeExerciseCount} exercise${activeExerciseCount === 1 ? "" : "s"} loaded · resume your session`
                   : completedTodayWorkout
-                  ? `${completedTodayDuration} · ${completedTodayExerciseCount} exercise${completedTodayExerciseCount === 1 ? "" : "s"} · ${completedTodaySetCount} set${completedTodaySetCount === 1 ? "" : "s"}`
-                  : todaySplit.state === "template"
-                    ? `${todaySplit.template.exercises?.length || 0} exercises · ${todaySplit.cycleLength}-day cycle`
-                    : todaySplit.state === "rest"
-                    ? `No scheduled workout today · ${todaySplit.cycleLength}-day cycle`
-                    : todaySplit.state === "empty"
-                      ? "Assign templates or rest days to show your daily plan here."
-                      : "Create a template folder and assign your training days to unlock daily workout suggestions."}
+                    ? `${completedTodayDuration} · ${completedTodayExerciseCount} exercise${completedTodayExerciseCount === 1 ? "" : "s"} · ${completedTodaySetCount} set${completedTodaySetCount === 1 ? "" : "s"}`
+                    : todaySplit.state === "template"
+                      ? `${todaySplit.template.exercises?.length || 0} exercises · ${todaySplit.cycleLength}-day cycle`
+                      : todaySplit.state === "rest"
+                        ? `No scheduled workout today · ${todaySplit.cycleLength}-day cycle`
+                        : todaySplit.state === "empty"
+                          ? "No plan needed. Start a workout now, or set up your split later."
+                          : "No plan needed. Add exercises as you go, or create a split if you follow a routine."}
               </Text>
             </View>
           </View>
@@ -731,7 +751,7 @@ export default function HomeScreen({ navigation }: any) {
                     style={localStyles.todaySecondaryText}
                     numberOfLines={1}
                   >
-                    Start Extra Workout
+                    Start Another Workout
                   </Text>
                 </TouchableOpacity>
               </>
@@ -753,7 +773,7 @@ export default function HomeScreen({ navigation }: any) {
                     style={localStyles.todaySecondaryText}
                     numberOfLines={1}
                   >
-                    Start Empty Workout
+                    Start Workout
                   </Text>
                 </TouchableOpacity>
               </>
@@ -763,23 +783,23 @@ export default function HomeScreen({ navigation }: any) {
                 onPress={startEmptyWorkout}
               >
                 <Text style={localStyles.todayPrimaryText}>
-                  Start Empty Workout
+                  Start Workout
                 </Text>
               </TouchableOpacity>
             ) : (
               <>
                 <TouchableOpacity
                   style={localStyles.todayPrimaryButton}
-                  onPress={() => navigation.navigate("Templates")}
+                  onPress={startEmptyWorkout}
                 >
-                  <Text style={localStyles.todayPrimaryText}>Set Up Split</Text>
+                  <Text style={localStyles.todayPrimaryText}>Start Workout</Text>
                 </TouchableOpacity>
                 <TouchableOpacity
                   style={localStyles.todaySecondaryButton}
-                  onPress={startEmptyWorkout}
+                  onPress={() => navigation.navigate("Templates")}
                 >
                   <Text style={localStyles.todaySecondaryText}>
-                    Start Empty Workout
+                    Set Up Split
                   </Text>
                 </TouchableOpacity>
               </>
@@ -803,7 +823,9 @@ export default function HomeScreen({ navigation }: any) {
 
         <View style={localStyles.sectionHeader}>
           <Text style={localStyles.sectionTitle}>Training Momentum</Text>
-          <TouchableOpacity onPress={() => navigation.navigate("ProgressStats")}>
+          <TouchableOpacity
+            onPress={() => navigation.navigate("ProgressStats")}
+          >
             <Text style={localStyles.sectionLink}>View Stats</Text>
           </TouchableOpacity>
         </View>

@@ -10,6 +10,7 @@ import {
   Platform,
   Modal,
   Alert,
+  ActivityIndicator,
   useWindowDimensions,
 } from "react-native";
 import {
@@ -27,9 +28,15 @@ import { auth } from "../config/firebaseConfig";
 import { styles } from "../constants/globalStyles";
 import {
   genId,
-  calculate1RM,
-  formatDuration,
   getExerciseVariationOptions,
+  getExerciseSupportsVariantsForStorage,
+  getExerciseAttachmentOptions,
+  getDefaultExerciseAttachment,
+  getExerciseAttachmentForSave,
+  getExerciseAttachmentForStorage,
+  hasExplicitNoAttachment,
+  NO_ATTACHMENT_OPTION_LABEL,
+  normalizeExerciseForAttachmentStorage,
   formatExerciseDisplayName,
   isMachineBrandApplicable,
   isFirstInSuperset,
@@ -37,8 +44,13 @@ import {
   getSupersetInfo,
   assignSuperset,
   removeSupersetFromExercise,
+  cleanInvalidSupersets,
   buildReorderBlocks,
   flattenReorderBlocks,
+  createGymReplacementEntry,
+  normalizeGymReplacements,
+  applyGymReplacementToExerciseSlot,
+  cleanExerciseNameForAttachments,
 } from "../utils/helpers";
 import {
   detectWorkoutPRs,
@@ -49,14 +61,62 @@ import {
 } from "../utils/performance";
 import { DEFAULT_PLATES_KG, DEFAULT_PLATES_LBS } from "../constants/data";
 import {
+  LIMITS,
+  MAX_WORKOUT_DURATION_MS,
+  clampRestSeconds,
+  cleanLimitedText,
+  limitText,
+  sanitizeRepsInput,
+  sanitizeSetWeightInput,
+} from "../constants/limits";
+import {
+  safeJsonParse,
   pushWorkoutToCloud,
   fetchConfigFromCloud,
   syncGymsToCloud,
-  syncTemplatesToCloud,
+  saveTemplatesLocallyAndToCloud,
+  sanitizeGymsForStorage,
+  markGymVariantsDeletedLocally,
+  clearGymVariantsDeletedLocally,
 } from "../utils/firebaseSync";
+import CustomAttachmentModal from "../components/CustomAttachmentModal";
 import CustomAlert from "../components/CustomAlert";
+import BlockingOverlay from "../components/BlockingOverlay";
 import DraggableFlatList from "react-native-draggable-flatlist";
 import { GestureHandlerRootView } from "react-native-gesture-handler";
+import {
+  deleteTemplateNextSessionNotes,
+  getTemplateExerciseNoteKey,
+  readNextSessionNotesEnabled,
+  readTemplateNextSessionNotes,
+} from "../utils/nextSessionNotes";
+import {
+  getExerciseAttachmentSelectionOptions,
+  getExerciseAttachmentOptionsWithCustom,
+  mergeAttachmentOptions,
+  normalizeAttachmentIdentity,
+  readCustomAttachments,
+  removeCustomAttachmentFromList,
+  replaceCustomAttachmentInList,
+  saveCustomAttachments,
+  sanitizeCustomAttachmentName,
+  validateCustomAttachmentName,
+} from "../utils/customAttachments";
+import {
+  formatRpeValue,
+  parseRpeValue,
+  sanitizeRpeInput,
+  workoutUsesRpeTracking,
+} from "../utils/rpe";
+import {
+  buildBestHistoricalSetPositionHints,
+  createHistoricalWeightPrefillState,
+  getHistoricalSetHintIdentityKey,
+  markHistoricalWeightPrefillManual,
+  reconcileHistoricalWeightPrefills,
+  restoreHistoricalWeightPrefillState,
+  type HistoricalWeightPrefillState,
+} from "../utils/setHistoryHints";
 
 Notifications.setNotificationHandler({
   handleNotification: async () =>
@@ -74,6 +134,9 @@ const DEFAULT_VARIANTS = [
   "Life Fitness",
 ];
 
+const waitForUiFrame = () =>
+  new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
+
 const startOfLocalDay = (value: number): number => {
   const date = new Date(value);
   date.setHours(0, 0, 0, 0);
@@ -89,6 +152,85 @@ const formatRestClock = (totalSeconds: number): string => {
   const minutes = Math.floor(safeSeconds / 60);
   const seconds = safeSeconds % 60;
   return `${minutes}:${String(seconds).padStart(2, "0")}`;
+};
+
+const REST_TIMER_PRESETS = [
+  { label: "60s", value: 60 },
+  { label: "90s", value: 90 },
+  { label: "2m", value: 120 },
+  { label: "3m", value: 180 },
+];
+
+const WARMUP_REST_TIMER_PRESETS = [
+  { label: "30s", value: 30 },
+  { label: "45s", value: 45 },
+  { label: "60s", value: 60 },
+  { label: "90s", value: 90 },
+];
+
+const toSetInputValue = (value: any) =>
+  value === undefined || value === null ? "" : String(value);
+
+const trimmedSetValue = (value: any) => toSetInputValue(value).trim();
+
+const isPositiveSetNumber = (value: any) => {
+  const parsed = Number(trimmedSetValue(value));
+  return Number.isFinite(parsed) && parsed > 0;
+};
+
+const hasValidSetInputs = (exercise: any, set: any) => {
+  if (!isPositiveSetNumber(set?.weight)) return false;
+  if (exercise?.is_unilateral) {
+    return (
+      isPositiveSetNumber(set?.repsL) && isPositiveSetNumber(set?.repsR)
+    );
+  }
+  return isPositiveSetNumber(set?.reps);
+};
+
+const isValidCompletedSet = (
+  exercise: any,
+  set: any,
+  options: { includeWarmup?: boolean } = {},
+) =>
+  !!set?.completed &&
+  (options.includeWarmup !== false || !set?.isWarmup) &&
+  hasValidSetInputs(exercise, set);
+
+const getWeightPrefillIdentityKey = (items: any[] = []) =>
+  items.map(getHistoricalSetHintIdentityKey).join("||");
+
+const getWeightPrefillStructureKey = (items: any[] = []) =>
+  items
+    .map((exercise) =>
+      (exercise?.sets || [])
+        .map(
+          (set: any) =>
+            `${String(set?.id || "")}:${set?.isWarmup ? 1 : 0}:${set?.completed ? 1 : 0}`,
+        )
+        .join(","),
+    )
+    .join("||");
+
+const DEFAULT_WORKING_REST_SECONDS = 90;
+const DEFAULT_WARMUP_REST_SECONDS = 60;
+
+type RestTimerType = "working" | "warmup";
+type TemplateChangeType = "added" | "deleted" | "replaced" | "variant" | "name";
+type TemplateChangeChoice = "dontUpdate" | "updateTemplate" | "gymSwap";
+
+type TemplateChangeItem = {
+  id: string;
+  type: TemplateChangeType;
+  templateExerciseId: string | null;
+  originalExercise: any | null;
+  workoutExercise: any | null;
+  workoutIndex: number | null;
+  canGymSwap: boolean;
+  hasOtherGymSwaps: boolean;
+  choice: TemplateChangeChoice;
+  fromLabel?: string | null;
+  toLabel?: string | null;
 };
 
 const REORDER_DRAG_ANIMATION_CONFIG = {
@@ -109,20 +251,33 @@ export default function WorkoutScreen({ navigation, route }: any) {
   const [workoutName, setWorkoutName] = useState("New Session");
   const [startTimeMs, setStartTimeMs] = useState<number | null>(null);
   const [workoutDurationStr, setWorkoutDurationStr] = useState("0m 0s");
+  const [totalPausedMs, setTotalPausedMs] = useState(0);
+  const [pauseStartedAt, setPauseStartedAt] = useState<number | null>(null);
   const [timerEndTime, setTimerEndTime] = useState<number | null>(null);
   const [displayRestTime, setDisplayRestTime] = useState(0);
 
   const [sessionRestEnabled, setSessionRestEnabled] = useState(true);
-  const [sessionRestDuration, setSessionRestDuration] = useState("90");
+  const [sessionRestDuration, setSessionRestDuration] = useState(
+    String(DEFAULT_WORKING_REST_SECONDS),
+  );
+  const [sessionWarmupRestEnabled, setSessionWarmupRestEnabled] =
+    useState(false);
+  const [sessionWarmupRestDuration, setSessionWarmupRestDuration] = useState(
+    String(DEFAULT_WARMUP_REST_SECONDS),
+  );
+  const [activeRestType, setActiveRestType] = useState<RestTimerType | null>(
+    null,
+  );
   const [isSessionMenuVisible, setIsSessionMenuVisible] = useState(false);
   const [isAutoCheckEnabled, setIsAutoCheckEnabled] = useState(false);
+  const [rpeTrackingEnabled, setRpeTrackingEnabled] = useState(false);
   const [isPlateCalcEnabled, setIsPlateCalcEnabled] = useState(true);
   const [availablePlates, setAvailablePlates] = useState<number[]>([]);
   const [isReorderMode, setIsReorderMode] = useState(false);
-  const [isDraggingExercise, setIsDraggingExercise] = useState(false);
   const [isReorderModalVisible, setIsReorderModalVisible] = useState(false);
   const [reorderDraftExercises, setReorderDraftExercises] = useState<any[]>([]);
   const [isKeyboardVisible, setIsKeyboardVisible] = useState(false);
+  const [footerHeight, setFooterHeight] = useState(0);
 
   const isEditing = !!route.params?.editData;
   const [isEditable, setIsEditable] = useState(!isEditing);
@@ -166,7 +321,11 @@ export default function WorkoutScreen({ navigation, route }: any) {
   const [templateNameInput, setTemplateNameInput] = useState("");
 
   const [activeTemplate, setActiveTemplate] = useState<any>(null);
-  const [isDiffModalVisible, setIsDiffModalVisible] = useState(false);
+  const [nextSessionNotesEnabled, setNextSessionNotesEnabled] =
+    useState(false);
+  const [nextSessionNotes, setNextSessionNotes] = useState<
+    Record<string, string>
+  >({});
   const [isPlateCalcVisible, setIsPlateCalcVisible] = useState(false);
   const [calcTarget, setCalcTarget] = useState("");
   const [calcBar, setCalcBar] = useState("20");
@@ -176,28 +335,81 @@ export default function WorkoutScreen({ navigation, route }: any) {
 
   const [isPreFlightVisible, setIsPreFlightVisible] = useState(false);
   const [isChangingLocation, setIsChangingLocation] = useState(false);
+  const [isPreFlightConfirming, setIsPreFlightConfirming] = useState(false);
   const [gyms, setGyms] = useState<any[]>([]);
+  const [workoutHistory, setWorkoutHistory] = useState<any[]>([]);
   const [selectedGymId, setSelectedGymId] = useState<string | null>(null);
   const [globalVariants, setGlobalVariants] = useState<string[]>([]);
 
   const [isTagModalVisible, setIsTagModalVisible] = useState(false);
   const [tagExIdx, setTagExIdx] = useState<number | null>(null);
   const [tagSearchQuery, setTagSearchQuery] = useState("");
+  const [customAttachments, setCustomAttachments] = useState<string[]>([]);
+  const [customAttachmentModal, setCustomAttachmentModal] = useState<{
+    visible: boolean;
+    exerciseIndex: number | null;
+    value: string;
+    error: string;
+    editingAttachment: string | null;
+  }>({
+    visible: false,
+    exerciseIndex: null,
+    value: "",
+    error: "",
+    editingAttachment: null,
+  });
 
   const igCardRef = useRef<any>(null);
-  const [initialStateStr, setInitialStateStr] = useState<string | null>(null);
   const [hasUnsavedChanges, setHasUnsavedChanges] = useState(false);
   const [isFinishing, setIsFinishing] = useState(false);
+  const [workoutBlockingMessage, setWorkoutBlockingMessage] = useState("");
+  const [isHistoricalWeightPrefillActive, setIsHistoricalWeightPrefillActive] =
+    useState(false);
+  const workoutNameInputRef = useRef<TextInput>(null);
   const saveTimeoutRef = useRef<any>(null);
   const restNotificationIdRef = useRef<string | null>(null);
   const sessionRestEnabledRef = useRef(sessionRestEnabled);
   const sessionRestDurationRef = useRef(sessionRestDuration);
+  const sessionWarmupRestEnabledRef = useRef(sessionWarmupRestEnabled);
+  const sessionWarmupRestDurationRef = useRef(sessionWarmupRestDuration);
+  const activeRestTypeRef = useRef<RestTimerType | null>(activeRestType);
   const finishWorkoutInFlightRef = useRef(false);
+  const workoutBlockingRef = useRef(false);
+  const historicalWeightPrefillStateRef =
+    useRef<HistoricalWeightPrefillState>({});
+  const skipNextWeightPrefillReconcileRef = useRef(false);
+  const isWorkoutBlocking = workoutBlockingMessage.length > 0;
+
+  const markSetWeightManual = (setId: any) => {
+    historicalWeightPrefillStateRef.current =
+      markHistoricalWeightPrefillManual(
+        historicalWeightPrefillStateRef.current,
+        setId,
+      );
+  };
+
+  const runWorkoutBlockingAction = async (
+    message: string,
+    action: () => Promise<void> | void,
+  ) => {
+    if (workoutBlockingRef.current) return;
+
+    workoutBlockingRef.current = true;
+    setWorkoutBlockingMessage(message);
+    try {
+      await action();
+    } catch (error) {
+      console.error("Workout action failed:", error);
+    } finally {
+      workoutBlockingRef.current = false;
+      setWorkoutBlockingMessage("");
+    }
+  };
 
   const templateActionTaken = useRef(false);
-  const diffActionTaken = useRef(false);
   const incompleteActionTaken = useRef(false);
   const workoutFinalizedRef = useRef(false);
+  const durationLimitNoticeShownRef = useRef(false);
 
   const [infoAlert, setInfoAlert] = useState({
     visible: false,
@@ -214,14 +426,49 @@ export default function WorkoutScreen({ navigation, route }: any) {
     visible: false,
     navAction: null as any,
   });
+  const [finishConfirmAlert, setFinishConfirmAlert] = useState({
+    visible: false,
+    navAction: null as any,
+  });
+  const [durationLimitAlert, setDurationLimitAlert] = useState<{
+    visible: boolean;
+    finalExercises: any[];
+    navAction: any;
+    cappedFinishedAt: number | null;
+  }>({
+    visible: false,
+    finalExercises: [],
+    navAction: null,
+    cappedFinishedAt: null,
+  });
   const [templateAlertVisible, setTemplateAlertVisible] = useState(false);
-  const [diffAlertVisible, setDiffAlertVisible] = useState(false);
+  const [templateDecisionAlert, setTemplateDecisionAlert] = useState<{
+    visible: boolean;
+    finalExercises: any[];
+    navAction: any;
+    forcedFinishedAt: number | null;
+    changes: TemplateChangeItem[];
+    createNewTemplate: boolean;
+    newTemplateName: string;
+    newTemplateNameError: string;
+  }>({
+    visible: false,
+    finalExercises: [],
+    navAction: null,
+    forcedFinishedAt: null,
+    changes: [],
+    createNewTemplate: false,
+    newTemplateName: "",
+    newTemplateNameError: "",
+  });
   const [removeSetAlert, setRemoveSetAlert] = useState({
     visible: false,
     exIdx: -1,
     setId: "",
     isWarmup: false,
   });
+  const [pendingGymReplacementUpdates, setPendingGymReplacementUpdates] =
+    useState<any[]>([]);
 
   const showInfo = (
     title: string,
@@ -236,7 +483,114 @@ export default function WorkoutScreen({ navigation, route }: any) {
     });
   };
 
+  const formatDurationFromMs = (durationMs: number) => {
+    const totalSeconds = Math.max(0, Math.floor(durationMs / 1000));
+    const hours = Math.floor(totalSeconds / 3600);
+    const minutes = Math.floor((totalSeconds % 3600) / 60);
+    const seconds = totalSeconds % 60;
+    if (hours > 0) return `${hours}h ${minutes}m`;
+    return `${minutes}m ${seconds}s`;
+  };
+
+  const getActiveWorkoutDurationMs = (endMs = Date.now()) => {
+    if (!startTimeMs) return 0;
+    const runningPausedMs = pauseStartedAt
+      ? Math.max(0, endMs - pauseStartedAt)
+      : 0;
+    return Math.max(0, endMs - startTimeMs - totalPausedMs - runningPausedMs);
+  };
+
   const uid = auth.currentUser?.uid;
+
+  const normalizeTemplateNameForCompare = (value: any) =>
+    cleanLimitedText(value, LIMITS.nameChars).toLowerCase();
+
+  const getExerciseBaseComparableKey = (exercise: any) => {
+    const source = exercise?.templateBaseExercise || exercise || {};
+    const stableId = String(
+      source?.id ||
+        source?.originalExerciseId ||
+        exercise?.originalExerciseId ||
+        exercise?.exerciseId ||
+        "",
+    ).trim();
+    const name = String(
+      cleanExerciseNameForAttachments(source) || source?.name || exercise?.name || "",
+    )
+      .trim()
+      .toLowerCase();
+    const unilateral = !!(source?.is_unilateral ?? exercise?.is_unilateral);
+
+    return `${stableId ? `id:${stableId}` : `name:${name}`}|side:${
+      unilateral ? 1 : 0
+    }`;
+  };
+
+  const getExerciseBaseNameComparableKey = (exercise: any) => {
+    const source = exercise?.templateBaseExercise || exercise || {};
+    const name = String(cleanExerciseNameForAttachments(source) || "")
+      .trim()
+      .toLowerCase();
+    const unilateral = !!(source?.is_unilateral ?? exercise?.is_unilateral);
+    return `name:${name}|side:${unilateral ? 1 : 0}`;
+  };
+
+  const isSameExerciseBaseAsTemplateSlot = (
+    workoutExercise: any,
+    templateExercise: any,
+  ) =>
+    getExerciseBaseComparableKey(workoutExercise) ===
+      getExerciseBaseComparableKey(templateExercise) ||
+    getExerciseBaseNameComparableKey(workoutExercise) ===
+      getExerciseBaseNameComparableKey(templateExercise);
+
+  const getExerciseVariantForTemplateCompare = (exercise: any) => {
+    const variationOptions = getExerciseVariationOptions(exercise);
+    const variant = String(
+      exercise?.exerciseVariant || (variationOptions.length > 0 ? "Normal" : ""),
+    ).trim();
+    return variant || "";
+  };
+
+  const getExerciseSelectionCompare = (exercise: any) => ({
+    variant: getExerciseVariantForTemplateCompare(exercise),
+    attachment: getExerciseAttachmentForStorage(exercise) || "",
+  });
+
+  const getExerciseSelectionLabel = (exercise: any) => {
+    const selection = getExerciseSelectionCompare(exercise);
+    const parts = [];
+    if (selection.variant) parts.push(selection.variant);
+    if (selection.attachment) parts.push(selection.attachment);
+    if (!selection.attachment && hasExplicitNoAttachment(exercise)) {
+      parts.push(NO_ATTACHMENT_OPTION_LABEL);
+    }
+    return parts.join(" · ") || "Default";
+  };
+
+  const hasExerciseSelectionChange = (
+    workoutExercise: any,
+    templateExercise: any,
+  ) => {
+    const current = getExerciseSelectionCompare(workoutExercise);
+    const original = getExerciseSelectionCompare(templateExercise);
+    return (
+      current.variant !== original.variant ||
+      current.attachment !== original.attachment
+    );
+  };
+
+  useEffect(() => {
+    let isMounted = true;
+
+    readCustomAttachments(uid).then((attachments) => {
+      if (isMounted) setCustomAttachments(attachments);
+    });
+
+    return () => {
+      isMounted = false;
+    };
+  }, [uid]);
 
   useEffect(() => {
     sessionRestEnabledRef.current = sessionRestEnabled;
@@ -246,33 +600,83 @@ export default function WorkoutScreen({ navigation, route }: any) {
     sessionRestDurationRef.current = sessionRestDuration;
   }, [sessionRestDuration]);
 
-  const buildTemplateExercisesFromWorkout = (sourceExercises: any[]) => {
+  useEffect(() => {
+    sessionWarmupRestEnabledRef.current = sessionWarmupRestEnabled;
+  }, [sessionWarmupRestEnabled]);
+
+  useEffect(() => {
+    sessionWarmupRestDurationRef.current = sessionWarmupRestDuration;
+  }, [sessionWarmupRestDuration]);
+
+  useEffect(() => {
+    activeRestTypeRef.current = activeRestType;
+  }, [activeRestType]);
+
+  const buildTemplateExercisesFromWorkout = (
+    sourceExercises: any[],
+    latestTemplate?: any,
+  ) => {
     return sourceExercises
-      .map((ex, idx) => ({
+      .map((ex) => ({
         ...ex,
         sets: (ex.sets || []).filter((s: any) =>
-          ex.is_unilateral
-            ? s.completed &&
-              String(s.weight || "").trim() !== "" &&
-              String(s.repsL || "").trim() !== "" &&
-              String(s.repsR || "").trim() !== ""
-            : s.completed &&
-              String(s.weight || "").trim() !== "" &&
-              String(s.reps || "").trim() !== "",
+          isValidCompletedSet(ex, s),
         ),
       }))
       .filter((ex) => ex.sets.length > 0)
-      .map((ex, idx) => ({
-        id: genId(`ex-${idx}-`),
-        name: ex.name || "Exercise",
-        reminder: ex.reminder || "",
-        exerciseVariant: ex.exerciseVariant || "Normal",
-        variationOptions: ex.variationOptions,
-        is_unilateral: !!ex.is_unilateral,
-        supersetId: ex.supersetId || null,
-        supersetOrder: ex.supersetOrder,
-        sets: ex.sets.map((s: any) => ({ isWarmup: !!s.isWarmup })),
-      }));
+      .map((ex, idx) => {
+        const base = normalizeExerciseForAttachmentStorage(
+          ex.templateBaseExercise || ex,
+        );
+        const normalizedExercise = normalizeExerciseForAttachmentStorage(ex);
+        const attachmentOptions = getExerciseAttachmentOptions({
+          ...base,
+          attachment: normalizedExercise.attachment || base.attachment,
+        });
+        const baseId = ex.templateBaseExercise
+          ? base.id || base.originalExerciseId || ex.originalExerciseId || null
+          : ex.originalExerciseId || ex.exerciseId || base.id || null;
+        const latestTemplateExercise = (latestTemplate?.exercises || []).find(
+          (templateExercise: any) => templateExercise?.id === baseId,
+        );
+        return {
+          id: baseId || genId(`ex-${idx}-`),
+          name: base.name || ex.name || "Exercise",
+          reminder: base.reminder || ex.reminder || "",
+          muscle: base.muscle || ex.muscle,
+          equipment: base.equipment || ex.equipment,
+          equipmentType: base.equipmentType || ex.equipmentType,
+          machineBrandApplicable:
+            base.machineBrandApplicable ?? ex.machineBrandApplicable,
+          brandApplicable: base.brandApplicable ?? ex.brandApplicable,
+          image: base.image || ex.image,
+          exerciseVariant:
+            base.exerciseVariant || ex.exerciseVariant || "Normal",
+          variationOptions: base.variationOptions || ex.variationOptions,
+          supportsVariants: getExerciseSupportsVariantsForStorage({
+            ...normalizedExercise,
+            ...base,
+          }),
+          attachment:
+            getExerciseAttachmentForSave({
+              ...base,
+              attachment:
+                normalizedExercise.attachment === ""
+                  ? ""
+                  : normalizedExercise.attachment || base.attachment,
+            }),
+          attachmentOptions:
+            attachmentOptions.length > 0 ? attachmentOptions : undefined,
+          supportsAttachments: attachmentOptions.length > 0 ? true : undefined,
+          is_unilateral: !!(base.is_unilateral ?? ex.is_unilateral),
+          supersetId: ex.supersetId || null,
+          supersetOrder: ex.supersetOrder,
+          gymReplacements: normalizeGymReplacements(
+            latestTemplateExercise?.gymReplacements ?? base.gymReplacements,
+          ),
+          sets: ex.sets.map((s: any) => ({ isWarmup: !!s.isWarmup })),
+        };
+      });
   };
 
   const getUniqueTemplateName = (
@@ -304,10 +708,19 @@ export default function WorkoutScreen({ navigation, route }: any) {
   };
 
   const getSuggestedNewTemplateName = () => {
-    const baseName =
-      String(activeTemplate?.name || workoutName || "New Template").trim() ||
-      "New Template";
-    return activeTemplate?.id ? `${baseName} (New)` : baseName;
+    const currentWorkoutName = cleanLimitedText(workoutName, LIMITS.nameChars);
+    const currentTemplateName = cleanLimitedText(
+      activeTemplate?.name,
+      LIMITS.nameChars,
+    );
+    const baseName = currentWorkoutName || currentTemplateName || "New Template";
+    if (!activeTemplate?.id) return baseName;
+
+    return normalizeTemplateNameForCompare(currentWorkoutName) &&
+      normalizeTemplateNameForCompare(currentWorkoutName) !==
+        normalizeTemplateNameForCompare(currentTemplateName)
+      ? currentWorkoutName
+      : `${baseName} (New)`;
   };
 
   const saveWorkoutAsNewTemplate = async (
@@ -320,7 +733,7 @@ export default function WorkoutScreen({ navigation, route }: any) {
       `@workout_templates_${uid}`,
     );
     const existingTemplates = rawTemplates
-      ? JSON.parse(rawTemplates).filter(Boolean)
+      ? safeJsonParse<any[]>(rawTemplates, []).filter(Boolean)
       : [];
     const { name: finalTemplateName, wasAdjusted } = getUniqueTemplateName(
       preferredName || getSuggestedNewTemplateName(),
@@ -340,13 +753,13 @@ export default function WorkoutScreen({ navigation, route }: any) {
     };
 
     const updatedTemplates = [...existingTemplates, newTemplate];
-    await AsyncStorage.setItem(
-      `@workout_templates_${uid}`,
-      JSON.stringify(updatedTemplates),
-    );
     try {
-      await syncTemplatesToCloud(updatedTemplates);
+      await saveTemplatesLocallyAndToCloud(updatedTemplates, uid);
     } catch (e) {
+      await AsyncStorage.setItem(
+        `@workout_templates_${uid}`,
+        JSON.stringify(updatedTemplates),
+      );
       console.log("Cloud routine backup delayed.", e);
     }
 
@@ -359,46 +772,757 @@ export default function WorkoutScreen({ navigation, route }: any) {
     };
   };
 
-  const updateOriginalTemplateFromWorkout = async (sourceExercises: any[]) => {
+  const getTemplateExerciseById = (
+    template: any,
+    templateExerciseId: string | null,
+  ) => {
+    if (!templateExerciseId) return null;
+    return (template?.exercises || []).find(
+      (exercise: any) =>
+        (exercise?.id || exercise?.originalExerciseId) === templateExerciseId,
+    );
+  };
+
+  const buildPendingGymReplacementUpdate = ({
+    templateExerciseId,
+    replacementExercise,
+    gymId,
+    gymName,
+    exerciseIndex,
+  }: {
+    templateExerciseId: string | null;
+    replacementExercise: any | null;
+    gymId: string | null;
+    gymName: string;
+    exerciseIndex: number | null;
+  }) => {
+    if (
+      !activeTemplate?.id ||
+      !templateExerciseId ||
+      !replacementExercise ||
+      !gymId
+    ) {
+      return null;
+    }
+
+    return {
+      id: `${templateExerciseId}:${gymId}`,
+      templateId: activeTemplate.id,
+      templateExerciseId,
+      gymId,
+      gymName: gymName || "this gym",
+      replacementExercise: createGymReplacementEntry(replacementExercise),
+      exerciseIndex,
+      createdAt: Date.now(),
+    };
+  };
+
+  const shouldOfferGymSwapSave = (
+    previousExercise: any,
+    templateExerciseId: string | null,
+    selectedGym: any,
+  ) => {
+    if (isEditing) return false;
+    if (!activeTemplate?.id) return false;
+    if (!selectedGymId || !selectedGym?.id) return false;
+    if (!Array.isArray(gyms) || gyms.length < 2) return false;
+    if (!templateExerciseId) return false;
+
+    const templateSlotExists = (activeTemplate.exercises || []).some(
+      (templateExercise: any) =>
+        (templateExercise?.id || templateExercise?.originalExerciseId) ===
+        templateExerciseId,
+    );
+    if (!templateSlotExists) return false;
+
+    return !!(
+      previousExercise?.templateBaseExercise ||
+      previousExercise?.templateSwapSourceExerciseId ||
+      previousExercise?.originalExerciseId
+    );
+  };
+
+  const queuePendingGymReplacementUpdate = async ({
+    templateExerciseId,
+    replacementExercise,
+    gymId,
+    gymName,
+    exerciseIndex,
+    snapshotExercises,
+  }: {
+    templateExerciseId: string | null;
+    replacementExercise: any | null;
+    gymId: string | null;
+    gymName: string;
+    exerciseIndex: number | null;
+    snapshotExercises?: any[];
+  }) => {
+    const pendingUpdate = buildPendingGymReplacementUpdate({
+      templateExerciseId,
+      replacementExercise,
+      gymId,
+      gymName,
+      exerciseIndex,
+    });
+    if (!pendingUpdate) {
+      return;
+    }
+
+    const nextPendingUpdates = [
+      ...pendingGymReplacementUpdates.filter(
+        (update: any) => update.id !== pendingUpdate.id,
+      ),
+      pendingUpdate,
+    ];
+    setPendingGymReplacementUpdates(nextPendingUpdates);
+
+    await saveActiveSessionSnapshot({
+      exercises: snapshotExercises,
+      pendingGymReplacementUpdates: nextPendingUpdates,
+    });
+  };
+
+  const removePendingGymReplacementUpdate = async ({
+    templateExerciseId,
+    gymId,
+    snapshotExercises,
+  }: {
+    templateExerciseId: string | null;
+    gymId: string | null;
+    snapshotExercises?: any[];
+  }) => {
+    if (!templateExerciseId || !gymId) return;
+
+    const pendingUpdateId = `${templateExerciseId}:${gymId}`;
+    const nextPendingUpdates = pendingGymReplacementUpdates.filter(
+      (update: any) => update.id !== pendingUpdateId,
+    );
+    if (nextPendingUpdates.length === pendingGymReplacementUpdates.length) {
+      return;
+    }
+
+    setPendingGymReplacementUpdates(nextPendingUpdates);
+    await saveActiveSessionSnapshot({
+      exercises: snapshotExercises,
+      pendingGymReplacementUpdates: nextPendingUpdates,
+    });
+  };
+
+  const getTemplateComparableKey = (exercise: any) => {
+    const hasTemplateBase = !!exercise?.templateBaseExercise;
+    const source = hasTemplateBase ? exercise.templateBaseExercise : exercise;
+    if (typeof source === "string") {
+      return `name:${source.trim().toLowerCase()}|variant:Normal|side:0`;
+    }
+
+    const stableId = String(
+      hasTemplateBase
+        ? source?.id ||
+            source?.originalExerciseId ||
+            exercise?.originalExerciseId ||
+            exercise?.exerciseId ||
+            ""
+        : exercise?.originalExerciseId ||
+            exercise?.exerciseId ||
+            source?.id ||
+            source?.originalExerciseId ||
+            "",
+    ).trim();
+    const name = String(source?.name || exercise?.name || "")
+      .trim()
+      .toLowerCase();
+    const variant = String(
+      source?.exerciseVariant || exercise?.exerciseVariant || "Normal",
+    ).trim();
+    const attachment = getExerciseAttachmentForStorage(source);
+    const unilateral = !!(source?.is_unilateral ?? exercise?.is_unilateral);
+
+    return `${stableId ? `id:${stableId}` : `name:${name}`}|variant:${variant}|attachment:${
+      attachment || "None"
+    }|side:${
+      unilateral ? 1 : 0
+    }`;
+  };
+
+  const getTemplateExerciseStableId = (exercise: any) => {
+    const id = exercise?.id || exercise?.originalExerciseId;
+    return id ? String(id) : null;
+  };
+
+  const getWorkoutTemplateSlotId = (exercise: any) => {
+    const id =
+      exercise?.templateSwapSourceExerciseId ||
+      exercise?.templateBaseExercise?.id ||
+      exercise?.templateBaseExercise?.originalExerciseId;
+    return id ? String(id) : null;
+  };
+
+  const getActualExerciseComparableKey = (exercise: any) => {
+    const stableId = String(
+      exercise?.originalExerciseId ||
+        exercise?.exerciseId ||
+        exercise?.id ||
+        "",
+    ).trim();
+    const name = String(exercise?.name || "").trim().toLowerCase();
+    const variant = String(exercise?.exerciseVariant || "Normal").trim();
+    const attachment = getExerciseAttachmentForStorage(exercise);
+    const unilateral = !!exercise?.is_unilateral;
+
+    return `${stableId ? `id:${stableId}` : `name:${name}`}|variant:${variant}|attachment:${
+      attachment || "None"
+    }|side:${
+      unilateral ? 1 : 0
+    }`;
+  };
+
+  const getExerciseNameComparableKey = (exercise: any) => {
+    const source = exercise?.templateBaseExercise || exercise || {};
+    const name = String(
+      cleanExerciseNameForAttachments(source) || source?.name || exercise?.name || "",
+    )
+      .trim()
+      .toLowerCase();
+    const variant = String(
+      source?.exerciseVariant || exercise?.exerciseVariant || "Normal",
+    ).trim();
+    const attachment = getExerciseAttachmentForStorage(source);
+    const unilateral = !!(source?.is_unilateral ?? exercise?.is_unilateral);
+
+    return `name:${name}|variant:${variant}|attachment:${
+      attachment || "None"
+    }|side:${unilateral ? 1 : 0}`;
+  };
+
+  const isSameExerciseAsTemplateSlot = (
+    exercise: any,
+    templateExercise: any,
+  ) =>
+    getActualExerciseComparableKey(exercise) ===
+      getTemplateComparableKey(templateExercise) ||
+    getExerciseNameComparableKey(exercise) ===
+      getExerciseNameComparableKey(templateExercise);
+
+  const getOtherGymSwapCount = (templateExercise: any) => {
+    const replacements = normalizeGymReplacements(templateExercise?.gymReplacements);
+    return Object.keys(replacements).filter((gymId) => gymId !== selectedGymId)
+      .length;
+  };
+
+  const buildTemplateChangeItems = (workoutExercises: any[]) => {
+    if (!activeTemplate?.id) return [];
+
+    const templateExercises = Array.isArray(activeTemplate?.exercises)
+      ? activeTemplate.exercises
+      : [];
+    const usedTemplateExerciseIds = new Set<string>();
+    const pendingUpdatesBySlot = new Map<string, any>();
+    pendingGymReplacementUpdates
+      .filter((update: any) => update?.templateId === activeTemplate.id)
+      .forEach((update: any) => {
+        if (update?.templateExerciseId) {
+          pendingUpdatesBySlot.set(String(update.templateExerciseId), update);
+        }
+    });
+
+    const changes: TemplateChangeItem[] = [];
+    const originalTemplateName = cleanLimitedText(
+      activeTemplate?.name,
+      LIMITS.nameChars,
+    );
+    const currentWorkoutName = cleanLimitedText(workoutName, LIMITS.nameChars);
+
+    if (
+      currentWorkoutName &&
+      normalizeTemplateNameForCompare(currentWorkoutName) !==
+        normalizeTemplateNameForCompare(originalTemplateName)
+    ) {
+      changes.push({
+        id: "name:template",
+        type: "name",
+        templateExerciseId: null,
+        originalExercise: null,
+        workoutExercise: null,
+        workoutIndex: null,
+        canGymSwap: false,
+        hasOtherGymSwaps: false,
+        choice: "dontUpdate",
+        fromLabel: originalTemplateName || "Template",
+        toLabel: currentWorkoutName,
+      });
+    }
+
+    (workoutExercises || []).forEach((workoutExercise: any, index: number) => {
+      const templateExerciseId = getWorkoutTemplateSlotId(workoutExercise);
+      const originalExercise = templateExerciseId
+        ? getTemplateExerciseById(activeTemplate, templateExerciseId)
+        : null;
+
+      if (templateExerciseId && originalExercise) {
+        usedTemplateExerciseIds.add(templateExerciseId);
+        const wasManuallyReplaced = !!workoutExercise?.templateSwapSourceExerciseId;
+        const isExistingGymReplacement =
+          !!workoutExercise?.replacementForGymId && !wasManuallyReplaced;
+        const isBackToOriginal = isSameExerciseAsTemplateSlot(
+          workoutExercise,
+          originalExercise,
+        );
+        const isSameBase = isSameExerciseBaseAsTemplateSlot(
+          workoutExercise,
+          originalExercise,
+        );
+
+        if (
+          !isExistingGymReplacement &&
+          isSameBase &&
+          hasExerciseSelectionChange(workoutExercise, originalExercise)
+        ) {
+          changes.push({
+            id: `variant:${templateExerciseId}`,
+            type: "variant",
+            templateExerciseId,
+            originalExercise,
+            workoutExercise,
+            workoutIndex: index,
+            canGymSwap: false,
+            hasOtherGymSwaps: getOtherGymSwapCount(originalExercise) > 0,
+            choice: "dontUpdate",
+            fromLabel: getExerciseSelectionLabel(originalExercise),
+            toLabel: getExerciseSelectionLabel(workoutExercise),
+          });
+        } else if (wasManuallyReplaced && !isBackToOriginal) {
+          changes.push({
+            id: `replaced:${templateExerciseId}`,
+            type: "replaced",
+            templateExerciseId,
+            originalExercise,
+            workoutExercise,
+            workoutIndex: index,
+            canGymSwap:
+              !!pendingUpdatesBySlot.get(templateExerciseId) &&
+              Array.isArray(gyms) &&
+              gyms.length > 1,
+            hasOtherGymSwaps: getOtherGymSwapCount(originalExercise) > 0,
+            choice: "dontUpdate",
+          });
+        }
+        return;
+      }
+
+      changes.push({
+        id: `added:${workoutExercise?.id || workoutExercise?.originalExerciseId || index}`,
+        type: "added",
+        templateExerciseId: null,
+        originalExercise: null,
+        workoutExercise,
+        workoutIndex: index,
+        canGymSwap: false,
+        hasOtherGymSwaps: false,
+        choice: "dontUpdate",
+      });
+    });
+
+    templateExercises.forEach((templateExercise: any, index: number) => {
+      const templateExerciseId =
+        getTemplateExerciseStableId(templateExercise) || `template-${index}`;
+      if (usedTemplateExerciseIds.has(templateExerciseId)) return;
+
+      changes.push({
+        id: `deleted:${templateExerciseId}`,
+        type: "deleted",
+        templateExerciseId,
+        originalExercise: templateExercise,
+        workoutExercise: null,
+        workoutIndex: null,
+        canGymSwap: false,
+        hasOtherGymSwaps: getOtherGymSwapCount(templateExercise) > 0,
+        choice: "dontUpdate",
+      });
+    });
+
+    return changes;
+  };
+
+  const showTemplateDecisionBeforeSave = (
+    finalExercises: any[],
+    navAction: any,
+    forcedFinishedAt?: number,
+  ) => {
+    if (isEditing || !activeTemplate?.id) return false;
+
+    const detectedChanges = buildTemplateChangeItems(exercises);
+
+    if (detectedChanges.length === 0) {
+      clearPendingGymReplacementUpdatesForActiveTemplate();
+      return false;
+    }
+
+    setTemplateDecisionAlert({
+      visible: true,
+      finalExercises,
+      navAction,
+      forcedFinishedAt: forcedFinishedAt || null,
+      changes: detectedChanges,
+      createNewTemplate: false,
+      newTemplateName: limitText(
+        getSuggestedNewTemplateName(),
+        LIMITS.nameChars,
+      ),
+      newTemplateNameError: "",
+    });
+    finishWorkoutInFlightRef.current = false;
+    setIsFinishing(false);
+    return true;
+  };
+
+  const createExerciseEntryFromWorkoutExercise = (exercise: any = {}) => {
+    const stableId =
+      exercise?.originalExerciseId || exercise?.exerciseId || exercise?.id;
+    return {
+      ...exercise,
+      id: stableId || exercise?.id || null,
+      exerciseId: stableId || exercise?.exerciseId || null,
+    };
+  };
+
+  const getTemplateSetPatternFromWorkoutExercise = (
+    exercise: any,
+    fallbackSets: any[] = [],
+  ) => {
+    const completedSetPattern = (exercise?.sets || [])
+      .filter((set: any) => !!set?.completed)
+      .map((set: any) => ({ isWarmup: !!set.isWarmup }));
+
+    if (completedSetPattern.length > 0) return completedSetPattern;
+
+    const fallbackPattern = (fallbackSets || []).map((set: any) => ({
+      isWarmup: !!set?.isWarmup,
+    }));
+    return fallbackPattern.length > 0 ? fallbackPattern : [{ isWarmup: false }];
+  };
+
+  const buildTemplateExerciseFromWorkoutChange = (
+    workoutExercise: any,
+    existingTemplateExercise?: any,
+  ) => {
+    const entry = normalizeExerciseForAttachmentStorage(
+      createExerciseEntryFromWorkoutExercise(workoutExercise),
+    );
+    const variationOptions = getExerciseVariationOptions(entry);
+    const attachmentOptions = getExerciseAttachmentOptions(entry);
+    const gymReplacements = {
+      ...normalizeGymReplacements(existingTemplateExercise?.gymReplacements),
+    };
+
+    if (selectedGymId) {
+      delete gymReplacements[selectedGymId];
+    }
+
+    return {
+      id: entry.id || genId("ex-"),
+      name: entry.name || "Exercise",
+      reminder: entry.reminder || "",
+      muscle: entry.muscle,
+      equipment: entry.equipment,
+      equipmentType: entry.equipmentType,
+      machineBrandApplicable: entry.machineBrandApplicable,
+      brandApplicable: entry.brandApplicable,
+      image: entry.image,
+      exerciseVariant:
+        entry.exerciseVariant || (variationOptions.length > 0 ? "Normal" : undefined),
+      variationOptions:
+        entry.variationOptions || (variationOptions.length > 0 ? variationOptions : undefined),
+      supportsVariants: getExerciseSupportsVariantsForStorage(entry),
+      attachment: getExerciseAttachmentForSave(entry),
+      attachmentOptions:
+        attachmentOptions.length > 0 ? attachmentOptions : undefined,
+      supportsAttachments: attachmentOptions.length > 0 ? true : undefined,
+      is_unilateral: !!entry.is_unilateral,
+      brand: entry.brand,
+      machineBrand: entry.machineBrand,
+      supersetId: existingTemplateExercise?.supersetId || entry.supersetId || null,
+      supersetOrder:
+        existingTemplateExercise?.supersetOrder ?? entry.supersetOrder,
+      gymReplacements,
+      sets: getTemplateSetPatternFromWorkoutExercise(
+        workoutExercise,
+        existingTemplateExercise?.sets,
+      ),
+    };
+  };
+
+  const getInsertionAnchorForAddedChange = (
+    change: TemplateChangeItem,
+    removedTemplateIds: Set<string>,
+  ) => {
+    if (typeof change.workoutIndex !== "number") return null;
+
+    for (let i = change.workoutIndex - 1; i >= 0; i--) {
+      const candidateId = getWorkoutTemplateSlotId(exercises[i]);
+      if (candidateId && !removedTemplateIds.has(candidateId)) {
+        return candidateId;
+      }
+    }
+
+    return null;
+  };
+
+  const applyTemplateChangeChoicesToTemplate = async (
+    changes: TemplateChangeItem[],
+  ) => {
     if (!uid || !activeTemplate?.id) return null;
+
+    const meaningfulChanges = changes.filter(
+      (change) => change.choice !== "dontUpdate",
+    );
+    const remainingPendingUpdates = pendingGymReplacementUpdates.filter(
+      (update: any) => update?.templateId !== activeTemplate.id,
+    );
+
+    if (meaningfulChanges.length === 0) {
+      setPendingGymReplacementUpdates(remainingPendingUpdates);
+      return null;
+    }
 
     const rawTemplates = await AsyncStorage.getItem(
       `@workout_templates_${uid}`,
     );
     const existingTemplates = rawTemplates
-      ? JSON.parse(rawTemplates).filter(Boolean)
+      ? safeJsonParse<any[]>(rawTemplates, []).filter(Boolean)
       : [];
-    const originalIndex = existingTemplates.findIndex(
-      (t: any) => t.id === activeTemplate.id,
+    const templateIndex = existingTemplates.findIndex(
+      (template: any) => template?.id === activeTemplate.id,
     );
-    if (originalIndex === -1) return null;
+    if (templateIndex === -1) {
+      setPendingGymReplacementUpdates(remainingPendingUpdates);
+      return null;
+    }
 
-    const templateExercises =
-      buildTemplateExercisesFromWorkout(sourceExercises);
-    if (templateExercises.length === 0) return null;
+    const storedTemplate = existingTemplates[templateIndex];
+    const changesByTemplateId = new Map<string, TemplateChangeItem>();
+    const removedTemplateIds = new Set<string>();
+    const additions = changes.filter(
+      (change) => change.type === "added" && change.choice === "updateTemplate",
+    );
+
+    changes.forEach((change) => {
+      if (!change.templateExerciseId || change.choice === "dontUpdate") return;
+      changesByTemplateId.set(change.templateExerciseId, change);
+      if (change.type === "deleted" && change.choice === "updateTemplate") {
+        removedTemplateIds.add(change.templateExerciseId);
+      }
+    });
+
+    const additionsByAnchor = new Map<string | null, TemplateChangeItem[]>();
+    additions.forEach((change) => {
+      const anchorId = getInsertionAnchorForAddedChange(
+        change,
+        removedTemplateIds,
+      );
+      const existing = additionsByAnchor.get(anchorId) || [];
+      additionsByAnchor.set(anchorId, [...existing, change]);
+    });
+
+    const buildAdditionExercises = (anchorId: string | null) =>
+      (additionsByAnchor.get(anchorId) || [])
+        .map((change) =>
+          change.workoutExercise
+            ? buildTemplateExerciseFromWorkoutChange(change.workoutExercise)
+            : null,
+        )
+        .filter(Boolean);
+
+    const nextExercises = [
+      ...buildAdditionExercises(null),
+      ...(storedTemplate.exercises || []).flatMap((templateExercise: any) => {
+        const templateExerciseId =
+          getTemplateExerciseStableId(templateExercise) || "";
+        const change = changesByTemplateId.get(templateExerciseId);
+        let nextTemplateExercise = templateExercise;
+
+        if (change?.type === "deleted" && change.choice === "updateTemplate") {
+          return buildAdditionExercises(templateExerciseId);
+        }
+
+        if (
+          change?.type === "replaced" &&
+          change.choice === "updateTemplate" &&
+          change.workoutExercise
+        ) {
+          nextTemplateExercise = buildTemplateExerciseFromWorkoutChange(
+            change.workoutExercise,
+            templateExercise,
+          );
+        } else if (
+          change?.type === "variant" &&
+          change.choice === "updateTemplate" &&
+          change.workoutExercise
+        ) {
+          const updatedSelection = buildTemplateExerciseFromWorkoutChange(
+            change.workoutExercise,
+            templateExercise,
+          );
+          nextTemplateExercise = {
+            ...updatedSelection,
+            sets: Array.isArray(templateExercise?.sets)
+              ? templateExercise.sets
+              : updatedSelection.sets,
+          };
+        } else if (
+          change?.type === "replaced" &&
+          change.choice === "gymSwap" &&
+          selectedGymId &&
+          change.workoutExercise
+        ) {
+          nextTemplateExercise = {
+            ...templateExercise,
+            gymReplacements: {
+              ...normalizeGymReplacements(templateExercise.gymReplacements),
+              [selectedGymId]: createGymReplacementEntry(
+                createExerciseEntryFromWorkoutExercise(change.workoutExercise),
+              ),
+            },
+          };
+        }
+
+        return [
+          nextTemplateExercise,
+          ...buildAdditionExercises(templateExerciseId),
+        ];
+      }),
+    ];
+
+    const nameChange = changes.find(
+      (change) => change.type === "name" && change.choice === "updateTemplate",
+    );
+    const nextTemplateName =
+      cleanLimitedText(nameChange?.toLabel, LIMITS.nameChars) ||
+      cleanLimitedText(storedTemplate?.name, LIMITS.nameChars) ||
+      "Template";
 
     const updatedTemplate = {
-      ...existingTemplates[originalIndex],
-      name: workoutName.trim() || existingTemplates[originalIndex].name,
-      exercises: templateExercises,
+      ...storedTemplate,
+      name: nextTemplateName,
+      exercises: cleanInvalidSupersets(nextExercises),
       updatedAt: Date.now(),
     };
-
     const updatedTemplates = [...existingTemplates];
-    updatedTemplates[originalIndex] = updatedTemplate;
+    updatedTemplates[templateIndex] = updatedTemplate;
 
-    await AsyncStorage.setItem(
-      `@workout_templates_${uid}`,
-      JSON.stringify(updatedTemplates),
-    );
     try {
-      await syncTemplatesToCloud(updatedTemplates);
-    } catch (e) {
-      console.log("Cloud routine backup delayed.", e);
+      await saveTemplatesLocallyAndToCloud(updatedTemplates, uid);
+    } catch (error) {
+      await AsyncStorage.setItem(
+        `@workout_templates_${uid}`,
+        JSON.stringify(updatedTemplates),
+      );
+      console.log("Cloud routine backup delayed.", error);
     }
 
     setActiveTemplate(updatedTemplate);
+    setPendingGymReplacementUpdates(remainingPendingUpdates);
+    await saveActiveSessionSnapshot({
+      templateData: updatedTemplate,
+      pendingGymReplacementUpdates: remainingPendingUpdates,
+    });
+
     return updatedTemplate;
+  };
+
+  const updateTemplateChangeChoice = (
+    changeId: string,
+    choice: TemplateChangeChoice,
+  ) => {
+    setTemplateDecisionAlert((prev) => ({
+      ...prev,
+      changes: prev.changes.map((change) =>
+        change.id === changeId ? { ...change, choice } : change,
+      ),
+    }));
+  };
+
+  const getUpdatedTemplateNameFromDecision = (
+    changes: TemplateChangeItem[],
+  ) => {
+    const nameChange = changes.find(
+      (change) => change.type === "name" && change.choice === "updateTemplate",
+    );
+    return (
+      cleanLimitedText(nameChange?.toLabel, LIMITS.nameChars) ||
+      cleanLimitedText(activeTemplate?.name, LIMITS.nameChars) ||
+      "Template"
+    );
+  };
+
+  const validateNewTemplateNameForDecision = async (
+    decision: typeof templateDecisionAlert,
+  ) => {
+    if (!decision.createNewTemplate) return "";
+
+    const name = cleanLimitedText(decision.newTemplateName, LIMITS.nameChars);
+    if (!name) return "Enter a template name.";
+
+    const updatedExistingName = getUpdatedTemplateNameFromDecision(
+      decision.changes,
+    );
+    if (
+      normalizeTemplateNameForCompare(name) ===
+      normalizeTemplateNameForCompare(updatedExistingName)
+    ) {
+      return "Use a different name from the existing template.";
+    }
+
+    if (!uid) return "";
+    const rawTemplates = await AsyncStorage.getItem(
+      `@workout_templates_${uid}`,
+    );
+    const existingTemplates = rawTemplates
+      ? safeJsonParse<any[]>(rawTemplates, []).filter(Boolean)
+      : [];
+    const duplicate = existingTemplates.some(
+      (template: any) =>
+        normalizeTemplateNameForCompare(template?.name) ===
+        normalizeTemplateNameForCompare(name),
+    );
+
+    return duplicate ? "A template with this name already exists." : "";
+  };
+
+  const confirmTemplateDecisionChoices = async () => {
+    if (finishWorkoutInFlightRef.current) return;
+
+    const decision = {
+      ...templateDecisionAlert,
+      newTemplateName: cleanLimitedText(
+        templateDecisionAlert.newTemplateName,
+        LIMITS.nameChars,
+      ),
+    };
+    let nameError = "";
+    try {
+      nameError = await validateNewTemplateNameForDecision(decision);
+    } catch (error) {
+      console.log("Could not validate new template name:", error);
+      nameError = "Could not check this name. Please try again.";
+    }
+    if (nameError) {
+      setTemplateDecisionAlert((prev) => ({
+        ...prev,
+        newTemplateName: decision.newTemplateName,
+        newTemplateNameError: nameError,
+      }));
+      return;
+    }
+
+    finishWorkoutInFlightRef.current = true;
+    setIsFinishing(true);
+    setTemplateDecisionAlert((prev) => ({
+      ...prev,
+      visible: false,
+      newTemplateName: decision.newTemplateName,
+      newTemplateNameError: "",
+    }));
+    setTimeout(() => finishAfterTemplateDecision(decision), 250);
   };
 
   const openFinishSummary = () => {
@@ -412,7 +1536,9 @@ export default function WorkoutScreen({ navigation, route }: any) {
     title = "New Template Name",
     message = "Name the new template before saving it.",
   ) => {
-    setTemplateNameInput(getSuggestedNewTemplateName());
+    setTemplateNameInput(
+      limitText(getSuggestedNewTemplateName(), LIMITS.nameChars),
+    );
     setTemplateNamePrompt({
       visible: true,
       title,
@@ -422,7 +1548,7 @@ export default function WorkoutScreen({ navigation, route }: any) {
   };
 
   const confirmTemplateNamePrompt = async () => {
-    const preferredName = templateNameInput.trim();
+    const preferredName = cleanLimitedText(templateNameInput, LIMITS.nameChars);
     if (!preferredName) {
       showInfo(
         "Template Name Required",
@@ -461,24 +1587,43 @@ export default function WorkoutScreen({ navigation, route }: any) {
       }
 
       if (clearAllScheduled) {
-        await Notifications.cancelAllScheduledNotificationsAsync();
+        const scheduledNotifications =
+          await Notifications.getAllScheduledNotificationsAsync();
+        await Promise.all(
+          scheduledNotifications
+            .filter(
+              (notification) =>
+                notification?.content?.data?.type === "REST_TIMER_COMPLETE",
+            )
+            .map((notification) =>
+              Notifications.cancelScheduledNotificationAsync(
+                notification.identifier,
+              ),
+            ),
+        );
       }
     } catch (error) {
       console.log("Unable to clear rest timer notification:", error);
     }
   };
 
-  const scheduleRestNotification = async (seconds: number) => {
+  const scheduleRestNotification = async (
+    seconds: number,
+    restType: RestTimerType = "working",
+  ) => {
     if (isEditing) return;
     await clearRestTimerNotification(true);
     if (seconds <= 0) return;
 
     const notificationId = await Notifications.scheduleNotificationAsync({
       content: {
-        title: "Rest Over!",
-        body: "Time for your next set. Let's go!",
+        title: restType === "warmup" ? "Warm-up Rest Over!" : "Rest Over!",
+        body:
+          restType === "warmup"
+            ? "Ready for your next warm-up or working set."
+            : "Time for your next set. Let's go!",
         sound: true,
-        data: { type: "REST_TIMER_COMPLETE", screen: "Workout" },
+        data: { type: "REST_TIMER_COMPLETE", screen: "Workout", restType },
       },
       trigger: {
         type: Notifications.SchedulableTriggerInputTypes.TIME_INTERVAL,
@@ -516,8 +1661,11 @@ export default function WorkoutScreen({ navigation, route }: any) {
         ex.sets?.map((s: any, sIdx: number) => ({
           ...s,
           id: s.id || genId(`set-${exIdx}-${sIdx}-`),
-          repsL: s.repsL || "",
-          repsR: s.repsR || "",
+          weight: toSetInputValue(s.weight),
+          reps: toSetInputValue(s.reps),
+          repsL: toSetInputValue(s.repsL),
+          repsR: toSetInputValue(s.repsR),
+          rpe: formatRpeValue(s.rpe),
           createdAt: s.createdAt || Date.now() + sIdx,
         })) || [],
     }));
@@ -549,7 +1697,23 @@ export default function WorkoutScreen({ navigation, route }: any) {
         sessionRestEnabled: overrides.sessionRestEnabled ?? sessionRestEnabled,
         sessionRestDuration:
           overrides.sessionRestDuration ?? sessionRestDuration,
+        sessionWarmupRestEnabled:
+          overrides.sessionWarmupRestEnabled ?? sessionWarmupRestEnabled,
+        sessionWarmupRestDuration:
+          overrides.sessionWarmupRestDuration ?? sessionWarmupRestDuration,
         timerEndTime: overrides.timerEndTime ?? timerEndTime,
+        activeRestType: overrides.activeRestType ?? activeRestType,
+        pendingGymReplacementUpdates:
+          overrides.pendingGymReplacementUpdates ??
+          pendingGymReplacementUpdates,
+        isKg,
+        historicalWeightPrefillState:
+          historicalWeightPrefillStateRef.current,
+        rpeTrackingEnabled:
+          overrides.rpeTrackingEnabled ?? rpeTrackingEnabled,
+        totalPausedMs: overrides.totalPausedMs ?? totalPausedMs,
+        pauseStartedAt: overrides.pauseStartedAt ?? pauseStartedAt,
+        isWorkoutPaused: overrides.isWorkoutPaused ?? !!pauseStartedAt,
         timestamp: Date.now(),
       }),
     );
@@ -623,18 +1787,37 @@ export default function WorkoutScreen({ navigation, route }: any) {
   ) => {
     if (isEditing) return;
     if (!sessionRestEnabledRef.current) return;
-    if (completedSet?.isWarmup) return;
+    const restType: RestTimerType = completedSet?.isWarmup
+      ? "warmup"
+      : "working";
+    if (restType === "warmup" && !sessionWarmupRestEnabledRef.current) return;
     if (!shouldStartRestForExercise(exerciseIndex, exerciseList)) return;
 
-    const parsedSeconds = parseInt(sessionRestDurationRef.current || "90", 10);
-    const restSeconds =
-      Number.isFinite(parsedSeconds) && parsedSeconds > 0 ? parsedSeconds : 90;
+    const durationValue =
+      restType === "warmup"
+        ? sessionWarmupRestDurationRef.current
+        : sessionRestDurationRef.current;
+    const fallbackSeconds =
+      restType === "warmup"
+        ? DEFAULT_WARMUP_REST_SECONDS
+        : DEFAULT_WORKING_REST_SECONDS;
+    const parsedSeconds = parseInt(String(durationValue || ""), 10);
+    const restSeconds = clampRestSeconds(
+      Number.isFinite(parsedSeconds) && parsedSeconds > 0
+        ? parsedSeconds
+        : fallbackSeconds,
+    );
     const nextEndTime = Date.now() + restSeconds * 1000;
 
+    activeRestTypeRef.current = restType;
+    setActiveRestType(restType);
     setTimerEndTime(nextEndTime);
     setDisplayRestTime(restSeconds);
-    scheduleRestNotification(restSeconds);
-    saveActiveSessionSnapshot({ timerEndTime: nextEndTime }).catch((error) => {
+    scheduleRestNotification(restSeconds, restType);
+    saveActiveSessionSnapshot({
+      timerEndTime: nextEndTime,
+      activeRestType: restType,
+    }).catch((error) => {
       console.log("Unable to persist rest timer state:", error);
     });
   };
@@ -649,12 +1832,61 @@ export default function WorkoutScreen({ navigation, route }: any) {
     if (!nextEnabled) {
       setTimerEndTime(null);
       setDisplayRestTime(0);
+      activeRestTypeRef.current = null;
+      setActiveRestType(null);
       await clearRestTimerNotification(true);
     }
 
     await saveActiveSessionSnapshot({
       sessionRestEnabled: nextEnabled,
       timerEndTime: nextEnabled ? timerEndTime : null,
+      activeRestType: nextEnabled ? activeRestTypeRef.current : null,
+    });
+  };
+
+  const updateSessionRestDuration = async (seconds: number) => {
+    if (isEditing) return;
+
+    const safeSeconds = clampRestSeconds(seconds);
+    const nextDuration = String(safeSeconds);
+    sessionRestDurationRef.current = nextDuration;
+    setSessionRestDuration(nextDuration);
+    await saveActiveSessionSnapshot({ sessionRestDuration: nextDuration });
+  };
+
+  const toggleSessionWarmupRestTimer = async () => {
+    if (isEditing) return;
+    Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
+    const nextEnabled = !sessionWarmupRestEnabledRef.current;
+    const shouldClearWarmupTimer =
+      !nextEnabled && activeRestTypeRef.current === "warmup";
+    sessionWarmupRestEnabledRef.current = nextEnabled;
+    setSessionWarmupRestEnabled(nextEnabled);
+
+    if (shouldClearWarmupTimer) {
+      setTimerEndTime(null);
+      setDisplayRestTime(0);
+      activeRestTypeRef.current = null;
+      setActiveRestType(null);
+      await clearRestTimerNotification(true);
+    }
+
+    await saveActiveSessionSnapshot({
+      sessionWarmupRestEnabled: nextEnabled,
+      timerEndTime: shouldClearWarmupTimer ? null : timerEndTime,
+      activeRestType: shouldClearWarmupTimer ? null : activeRestTypeRef.current,
+    });
+  };
+
+  const updateSessionWarmupRestDuration = async (seconds: number) => {
+    if (isEditing) return;
+
+    const safeSeconds = clampRestSeconds(seconds);
+    const nextDuration = String(safeSeconds);
+    sessionWarmupRestDurationRef.current = nextDuration;
+    setSessionWarmupRestDuration(nextDuration);
+    await saveActiveSessionSnapshot({
+      sessionWarmupRestDuration: nextDuration,
     });
   };
 
@@ -676,13 +1908,15 @@ export default function WorkoutScreen({ navigation, route }: any) {
 
     const historyRaw = await AsyncStorage.getItem(`@workout_history_${uid}`);
     if (historyRaw) {
-      const historyList = JSON.parse(historyRaw)
+      const historyList = safeJsonParse<any[]>(historyRaw, [])
         .filter((w: any) => w.gymId === gymId)
         .sort((a: any, b: any) => parseInt(b.id) - parseInt(a.id));
 
       for (const pastWorkout of historyList) {
         const pastEx = pastWorkout.fullWorkoutData?.find(
-          (e: any) => e.name === ex.name,
+          (e: any) =>
+            cleanExerciseNameForAttachments(e) ===
+            cleanExerciseNameForAttachments(ex),
         );
         if (pastEx && isMachineBrandApplicable(pastEx) && pastEx.equipmentTag) {
           return { ...ex, equipmentTag: pastEx.equipmentTag };
@@ -699,6 +1933,412 @@ export default function WorkoutScreen({ navigation, route }: any) {
     }
 
     return ex;
+  };
+
+  const getHistoricalEquipmentTagsForGym = (
+    gymId: string | null,
+    allowedBrands: Set<string>,
+  ) => {
+    const tagsByExerciseName = new Map<string, string>();
+    if (!gymId) return tagsByExerciseName;
+
+    const sortedHistory = [...workoutHistory]
+      .filter((workout: any) => String(workout?.gymId || "") === String(gymId))
+      .sort((a: any, b: any) => {
+        const aTime = Number(a?.startedAt || a?.id || 0);
+        const bTime = Number(b?.startedAt || b?.id || 0);
+        return bTime - aTime;
+      });
+
+    for (const pastWorkout of sortedHistory) {
+      const pastExercises = Array.isArray(pastWorkout?.fullWorkoutData)
+        ? pastWorkout.fullWorkoutData
+        : [];
+
+      for (const pastExercise of pastExercises) {
+        const exerciseName = cleanExerciseNameForAttachments(pastExercise);
+        const equipmentTag = String(pastExercise?.equipmentTag || "").trim();
+        if (
+          !exerciseName ||
+          tagsByExerciseName.has(exerciseName) ||
+          !equipmentTag ||
+          !allowedBrands.has(equipmentTag) ||
+          !isMachineBrandApplicable(pastExercise)
+        ) {
+          continue;
+        }
+
+        tagsByExerciseName.set(exerciseName, equipmentTag);
+      }
+    }
+
+    return tagsByExerciseName;
+  };
+
+  const prepareExercisesForGym = (
+    sourceExercises: any[],
+    gymId: string | null,
+  ) => {
+    const selectedGym = gyms.find((g) => g.id === gymId);
+    const newGymVariants = selectedGym?.variants || [];
+    const defaultMachineBrand = selectedGym?.defaultMachineBrand || null;
+    const allowedBrands = new Set([
+      ...DEFAULT_VARIANTS,
+      ...globalVariants,
+      ...newGymVariants,
+    ]);
+    const historicalTags = getHistoricalEquipmentTagsForGym(
+      gymId,
+      allowedBrands,
+    );
+
+    return sourceExercises.map((exercise) => {
+      const preparedExercise =
+        activeTemplate?.id && gymId
+          ? applyGymReplacementToExerciseSlot(exercise, gymId)
+          : { ...exercise };
+
+      if (!isMachineBrandApplicable(preparedExercise)) {
+        const { equipmentTag, machineBrand, ...cleanedExercise } =
+          preparedExercise;
+        return cleanedExercise;
+      }
+
+      const exerciseName = String(
+        cleanExerciseNameForAttachments(preparedExercise || exercise),
+      );
+      const historicalTag = historicalTags.get(exerciseName);
+
+      if (historicalTag && allowedBrands.has(historicalTag)) {
+        return { ...preparedExercise, equipmentTag: historicalTag };
+      }
+
+      if (defaultMachineBrand && allowedBrands.has(defaultMachineBrand)) {
+        return { ...preparedExercise, equipmentTag: defaultMachineBrand };
+      }
+
+      const { equipmentTag, ...cleanedExercise } = preparedExercise;
+      return cleanedExercise;
+    });
+  };
+
+  const handleConfirmPreFlight = async () => {
+    if (isPreFlightConfirming) return;
+
+    if (gyms.length > 0 && !selectedGymId) {
+      Alert.alert("Select Gym", "Choose a gym before starting this workout.");
+      return;
+    }
+
+    const nextGymId = selectedGymId;
+    const shouldMarkUnsaved = isChangingLocation;
+
+    setIsPreFlightConfirming(true);
+    await waitForUiFrame();
+
+    try {
+      Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
+
+      if (!startTimeMs) {
+        const startMs = Date.now();
+        setStartTimeMs(startMs);
+        setTotalPausedMs(0);
+        setPauseStartedAt(null);
+        if (uid) {
+          await AsyncStorage.setItem(
+            `@active_workout_start_${uid}`,
+            startMs.toString(),
+          );
+        }
+      }
+
+      if (nextGymId && uid) {
+        await AsyncStorage.setItem(`@last_used_gym_${uid}`, nextGymId);
+      }
+
+      const preparedExercises = prepareExercisesForGym(exercises, nextGymId);
+      const prefillState = isHistoricalWeightPrefillActive
+        ? historicalWeightPrefillStateRef.current
+        : createHistoricalWeightPrefillState(preparedExercises);
+      const preparedHints = preparedExercises.map((exercise) =>
+        buildBestHistoricalSetPositionHints(exercise, workoutHistory, isKg),
+      );
+      const reconciled = reconcileHistoricalWeightPrefills(
+        preparedExercises,
+        preparedHints,
+        prefillState,
+      );
+      historicalWeightPrefillStateRef.current = reconciled.state;
+      skipNextWeightPrefillReconcileRef.current = true;
+      setIsHistoricalWeightPrefillActive(true);
+      setExercises(reconciled.exercises);
+      if (shouldMarkUnsaved) setHasUnsavedChanges(true);
+      setIsChangingLocation(false);
+      setIsPreFlightVisible(false);
+    } catch (error) {
+      console.error("Failed to prepare workout start:", error);
+      Alert.alert(
+        "Start Failed",
+        "IronVault could not start this workout. Please try again.",
+      );
+    } finally {
+      setIsPreFlightConfirming(false);
+    }
+  };
+
+  const buildWorkoutExerciseFromSelection = async (
+    exData: any,
+    gymId: string | null = selectedGymId,
+  ) => {
+    const attachmentExercise = normalizeExerciseForAttachmentStorage(exData);
+    const variationOptions = getExerciseVariationOptions(attachmentExercise);
+    const attachmentOptions = getExerciseAttachmentOptionsWithCustom(
+      attachmentExercise,
+      customAttachments,
+    );
+    const newExercise = {
+      id: genId("ex-"),
+      originalExerciseId:
+        attachmentExercise.id || attachmentExercise.originalExerciseId || null,
+      name: attachmentExercise.name,
+      reminder: attachmentExercise.reminder || "",
+      remark: "",
+      muscle: attachmentExercise.muscle,
+      exerciseVariant: variationOptions.length > 0 ? "Normal" : undefined,
+      variationOptions,
+      attachment: getExerciseAttachmentForSave(attachmentExercise),
+      attachmentOptions:
+        attachmentOptions.length > 0 ? attachmentOptions : undefined,
+      supportsAttachments: attachmentOptions.length > 0 ? true : undefined,
+      is_unilateral: !!attachmentExercise.is_unilateral,
+      equipment: attachmentExercise.equipment,
+      equipmentType: attachmentExercise.equipmentType,
+      machineBrandApplicable: attachmentExercise.machineBrandApplicable,
+      brandApplicable: attachmentExercise.brandApplicable,
+      brand: attachmentExercise.brand,
+      machineBrand: attachmentExercise.machineBrand,
+      image: attachmentExercise.image,
+      sets: [
+        {
+          id: genId(),
+          weight: "",
+          reps: "",
+          repsL: "",
+          repsR: "",
+          rpe: "",
+          completed: false,
+          isWarmup: false,
+          createdAt: Date.now(),
+        },
+      ],
+    };
+
+    return getAutoFilledExercise(newExercise, gymId);
+  };
+
+  const addExercisesToWorkout = async (exerciseList: any[]) => {
+    const incoming = Array.isArray(exerciseList)
+      ? exerciseList.filter(Boolean)
+      : [];
+    if (incoming.length === 0) return;
+
+    const availableSlots = LIMITS.exercisesPerWorkout - exercises.length;
+    if (availableSlots <= 0) {
+      showInfo(
+        "Exercise Limit Reached",
+        "Each workout can have up to 25 exercises.",
+      );
+      return;
+    }
+
+    const exercisesToAdd = incoming.slice(0, availableSlots);
+    if (incoming.length > availableSlots) {
+      showInfo(
+        "Some Exercises Were Not Added",
+        `This workout only has room for ${availableSlots} more exercise${availableSlots === 1 ? "" : "s"}.`,
+      );
+    }
+
+    const builtExercises = await Promise.all(
+      exercisesToAdd.map((exData) => buildWorkoutExerciseFromSelection(exData)),
+    );
+    setExercises((prev) => [...prev, ...builtExercises]);
+    setHasUnsavedChanges(true);
+  };
+
+  const openCustomAttachmentModal = (exerciseIndex: number) => {
+    setCustomAttachmentModal({
+      visible: true,
+      exerciseIndex,
+      value: "",
+      error: "",
+      editingAttachment: null,
+    });
+  };
+
+  const closeCustomAttachmentModal = () => {
+    setCustomAttachmentModal({
+      visible: false,
+      exerciseIndex: null,
+      value: "",
+      error: "",
+      editingAttachment: null,
+    });
+  };
+
+  const reconcileExerciseCustomAttachment = (
+    exercise: any,
+    previousAttachment: string,
+    nextAttachment: string | null,
+    nextCustomAttachments: string[],
+  ) => {
+    const previousKey = normalizeAttachmentIdentity(previousAttachment);
+    const explicitNoAttachment = hasExplicitNoAttachment(exercise);
+    const currentAttachment = explicitNoAttachment
+      ? ""
+      : getDefaultExerciseAttachment(exercise);
+    const currentKey = normalizeAttachmentIdentity(currentAttachment);
+    const attachmentOptions = Array.isArray(exercise?.attachmentOptions)
+      ? exercise.attachmentOptions
+          .map((attachment: string) =>
+            normalizeAttachmentIdentity(attachment) === previousKey
+              ? nextAttachment
+              : attachment,
+          )
+          .filter(Boolean)
+      : [];
+    const fallbackExercise = {
+      ...exercise,
+      attachment: undefined,
+      attachmentOptions,
+    };
+    const attachment =
+      currentKey === previousKey
+        ? nextAttachment || getDefaultExerciseAttachment(fallbackExercise)
+        : currentAttachment;
+    const savedAttachment =
+      (attachment || explicitNoAttachment) ? attachment : undefined;
+    const options = getExerciseAttachmentOptionsWithCustom(
+      {
+        ...exercise,
+        attachment: savedAttachment,
+        attachmentOptions,
+      },
+      nextCustomAttachments,
+    );
+
+    return {
+      ...exercise,
+      attachment: savedAttachment,
+      attachmentOptions: options.length > 0 ? options : undefined,
+      supportsAttachments: options.length > 0 ? true : undefined,
+    };
+  };
+
+  const editCustomAttachment = (attachment: string) => {
+    setCustomAttachmentModal((prev) => ({
+      ...prev,
+      visible: true,
+      value: attachment,
+      error: "",
+      editingAttachment: attachment,
+    }));
+  };
+
+  const deleteCustomAttachment = async (attachment: string) => {
+    const nextCustomAttachments = await saveCustomAttachments(
+      removeCustomAttachmentFromList(customAttachments, attachment),
+      uid,
+    );
+
+    setCustomAttachments(nextCustomAttachments);
+    setExercises((prev) =>
+      prev.map((exercise) =>
+        reconcileExerciseCustomAttachment(
+          exercise,
+          attachment,
+          null,
+          nextCustomAttachments,
+        ),
+      ),
+    );
+    setCustomAttachmentModal((prev) =>
+      normalizeAttachmentIdentity(prev.editingAttachment) ===
+      normalizeAttachmentIdentity(attachment)
+        ? { ...prev, value: "", error: "", editingAttachment: null }
+        : prev,
+    );
+    setHasUnsavedChanges(true);
+    Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
+  };
+
+  const saveCustomAttachmentForExercise = async () => {
+    const exerciseIndex = customAttachmentModal.exerciseIndex;
+    if (exerciseIndex === null) return;
+
+    const targetExercise = exercises[exerciseIndex];
+    if (!targetExercise) return;
+
+    const { attachment, error } = validateCustomAttachmentName(
+      customAttachmentModal.value,
+      getExerciseAttachmentOptions(targetExercise),
+      customAttachments,
+      customAttachmentModal.editingAttachment,
+    );
+
+    if (error) {
+      setCustomAttachmentModal((prev) => ({ ...prev, error }));
+      return;
+    }
+
+    const isEditingAttachment = !!customAttachmentModal.editingAttachment;
+    const nextCustomAttachments = await saveCustomAttachments(
+      isEditingAttachment
+        ? replaceCustomAttachmentInList(
+            customAttachments,
+            customAttachmentModal.editingAttachment!,
+            attachment,
+          )
+        : [...customAttachments, attachment],
+      uid,
+    );
+
+    setCustomAttachments(nextCustomAttachments);
+    setExercises((prev) => {
+      const up = [...prev];
+      if (!up[exerciseIndex]) return prev;
+      return up.map((exercise, index) => {
+        if (isEditingAttachment) {
+          const reconciled = reconcileExerciseCustomAttachment(
+            exercise,
+            customAttachmentModal.editingAttachment!,
+            attachment,
+            nextCustomAttachments,
+          );
+          return index === exerciseIndex
+            ? {
+                ...reconciled,
+                attachment: sanitizeCustomAttachmentName(attachment),
+              }
+            : reconciled;
+        }
+
+        if (index !== exerciseIndex) return exercise;
+        const nextOptions = mergeAttachmentOptions(
+          [attachment, ...getExerciseAttachmentOptions(exercise)],
+          nextCustomAttachments,
+        );
+        return {
+          ...exercise,
+          attachment: sanitizeCustomAttachmentName(attachment),
+          attachmentOptions: nextOptions,
+          supportsAttachments: true,
+        };
+      });
+    });
+    setHasUnsavedChanges(true);
+    Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
+    closeCustomAttachmentModal();
   };
 
   useEffect(() => {
@@ -720,6 +2360,11 @@ export default function WorkoutScreen({ navigation, route }: any) {
 
       const ac = await AsyncStorage.getItem(`@auto_check_enabled_${uid}`);
       setIsAutoCheckEnabled(ac === "true");
+      const rpePreference = await AsyncStorage.getItem(
+        `@rpe_tracking_enabled_${uid}`,
+      );
+      const loadedRpeTrackingEnabled = rpePreference === "true";
+      setRpeTrackingEnabled(loadedRpeTrackingEnabled);
       const pc = await AsyncStorage.getItem(`@plate_calc_enabled_${uid}`);
       setIsPlateCalcEnabled(pc !== "false");
 
@@ -728,18 +2373,28 @@ export default function WorkoutScreen({ navigation, route }: any) {
       setAvailablePlates(
         usingKg
           ? pkg
-            ? JSON.parse(pkg)
+            ? safeJsonParse(pkg, DEFAULT_PLATES_KG)
             : DEFAULT_PLATES_KG
           : plbs
-            ? JSON.parse(plbs)
+            ? safeJsonParse(plbs, DEFAULT_PLATES_LBS)
             : DEFAULT_PLATES_LBS,
       );
 
       const storedInv = await AsyncStorage.getItem(`@plate_inventory_${uid}`);
-      if (storedInv) setPlateInventory(JSON.parse(storedInv));
+      if (storedInv) setPlateInventory(safeJsonParse(storedInv, {}));
 
       const savedGyms = await AsyncStorage.getItem(`@user_gyms_${uid}`);
-      let loadedGyms = savedGyms ? JSON.parse(savedGyms) : [];
+      let loadedGyms = savedGyms ? safeJsonParse<any[]>(savedGyms, []) : [];
+
+      const savedHistory = await AsyncStorage.getItem(
+        `@workout_history_${uid}`,
+      );
+      const parsedHistory = savedHistory
+        ? safeJsonParse<any[]>(savedHistory, []).filter(
+            (workout: any) => workout && workout.id,
+          )
+        : [];
+      setWorkoutHistory(parsedHistory);
       if (loadedGyms.length === 0) {
         const cloudGyms = await fetchConfigFromCloud("gyms");
         if (cloudGyms) loadedGyms = cloudGyms;
@@ -750,7 +2405,7 @@ export default function WorkoutScreen({ navigation, route }: any) {
         `@global_variants_${uid}`,
       );
       if (savedGlobalVars) {
-        setGlobalVariants(JSON.parse(savedGlobalVars));
+        setGlobalVariants(safeJsonParse(savedGlobalVars, []));
       } else {
         const cloudVars = await fetchConfigFromCloud("global_variants" as any);
         if (cloudVars) setGlobalVariants(cloudVars);
@@ -761,81 +2416,195 @@ export default function WorkoutScreen({ navigation, route }: any) {
       );
 
       if (route.params?.editData) {
+        historicalWeightPrefillStateRef.current = {};
+        skipNextWeightPrefillReconcileRef.current = false;
+        setIsHistoricalWeightPrefillActive(false);
+        setRpeTrackingEnabled(workoutUsesRpeTracking(route.params.editData));
         const loadedEx = initializeSets(
           route.params.editData.fullWorkoutData || [],
         );
         setExercises(loadedEx);
-        setWorkoutName(route.params.editData.workoutName || "Edit Session");
-        setInitialStateStr(
-          JSON.stringify({
-            exercises: loadedEx,
-            workoutName: route.params.editData.workoutName,
-          }),
+        setWorkoutName(
+          limitText(route.params.editData.workoutName || "Edit Session", LIMITS.nameChars),
         );
         setHasUnsavedChanges(false);
         if (route.params.editData.duration)
           setWorkoutDurationStr(route.params.editData.duration);
         setSelectedGymId(route.params.editData.gymId || null);
       } else if (activeSession) {
-        const parsed = JSON.parse(activeSession);
-        setExercises(initializeSets(parsed.exercises || []));
-        setWorkoutName(parsed.workoutName || "New Session");
+        const parsed = safeJsonParse<any>(activeSession, {});
+        const activeSessionUsesKg =
+          typeof parsed.isKg === "boolean" ? parsed.isKg : usingKg;
+        setIsKg(activeSessionUsesKg);
+        setCalcBar(activeSessionUsesKg ? "20" : "45");
+        setAvailablePlates(
+          activeSessionUsesKg
+            ? pkg
+              ? safeJsonParse(pkg, DEFAULT_PLATES_KG)
+              : DEFAULT_PLATES_KG
+            : plbs
+              ? safeJsonParse(plbs, DEFAULT_PLATES_LBS)
+              : DEFAULT_PLATES_LBS,
+        );
+        setRpeTrackingEnabled(
+          workoutUsesRpeTracking({
+            rpeTrackingEnabled: parsed.rpeTrackingEnabled,
+            fullWorkoutData: parsed.exercises,
+          }),
+        );
+        const restoredExercises = initializeSets(parsed.exercises || []);
+        historicalWeightPrefillStateRef.current =
+          restoreHistoricalWeightPrefillState(
+            parsed.historicalWeightPrefillState,
+            restoredExercises,
+          );
+        skipNextWeightPrefillReconcileRef.current = true;
+        setIsHistoricalWeightPrefillActive(true);
+        setExercises(restoredExercises);
+        setWorkoutName(
+          limitText(parsed.workoutName || "New Session", LIMITS.nameChars),
+        );
         if (parsed.templateData) setActiveTemplate(parsed.templateData);
+        if (Array.isArray(parsed.pendingGymReplacementUpdates)) {
+          setPendingGymReplacementUpdates(parsed.pendingGymReplacementUpdates);
+        }
         if (parsed.gymId) setSelectedGymId(parsed.gymId);
         if (typeof parsed.sessionRestEnabled === "boolean") {
           sessionRestEnabledRef.current = parsed.sessionRestEnabled;
           setSessionRestEnabled(parsed.sessionRestEnabled);
         }
         if (parsed.sessionRestDuration) {
-          sessionRestDurationRef.current = parsed.sessionRestDuration;
-          setSessionRestDuration(parsed.sessionRestDuration);
+          const clampedRestDuration = String(
+            clampRestSeconds(parsed.sessionRestDuration),
+          );
+          sessionRestDurationRef.current = clampedRestDuration;
+          setSessionRestDuration(clampedRestDuration);
+        }
+        if (typeof parsed.sessionWarmupRestEnabled === "boolean") {
+          sessionWarmupRestEnabledRef.current =
+            parsed.sessionWarmupRestEnabled;
+          setSessionWarmupRestEnabled(parsed.sessionWarmupRestEnabled);
+        }
+        if (parsed.sessionWarmupRestDuration) {
+          const clampedWarmupRestDuration = String(
+            clampRestSeconds(parsed.sessionWarmupRestDuration),
+          );
+          sessionWarmupRestDurationRef.current = clampedWarmupRestDuration;
+          setSessionWarmupRestDuration(clampedWarmupRestDuration);
         }
         if (parsed.timerEndTime && parsed.timerEndTime > Date.now()) {
+          const restoredRestType =
+            parsed.activeRestType === "warmup" ? "warmup" : "working";
+          activeRestTypeRef.current = restoredRestType;
+          setActiveRestType(restoredRestType);
           setTimerEndTime(parsed.timerEndTime);
           setDisplayRestTime(
             Math.ceil((parsed.timerEndTime - Date.now()) / 1000),
           );
         } else if (parsed.timerEndTime) {
+          activeRestTypeRef.current = null;
+          setActiveRestType(null);
           await clearRestTimerNotification(true);
         }
 
         const startStr = await AsyncStorage.getItem(
           `@active_workout_start_${uid}`,
         );
-        if (startStr) setStartTimeMs(parseInt(startStr, 10));
-      } else {
-        const lastGym = await AsyncStorage.getItem(`@last_used_gym_${uid}`);
-        if (lastGym && loadedGyms.some((g: any) => g.id === lastGym)) {
-          setSelectedGymId(lastGym);
-        } else if (loadedGyms.length > 0) {
-          setSelectedGymId(loadedGyms[0].id);
+        const parsedStartMs = startStr ? parseInt(startStr, 10) : null;
+        if (parsedStartMs) setStartTimeMs(parsedStartMs);
+
+        const savedPausedMs = Math.max(0, Number(parsed.totalPausedMs || 0));
+        let effectivePausedMs = savedPausedMs;
+        if (parsed.isWorkoutPaused && parsed.pauseStartedAt) {
+          const resumedPausedMs =
+            savedPausedMs +
+            Math.max(0, Date.now() - Number(parsed.pauseStartedAt));
+          effectivePausedMs = resumedPausedMs;
+          setTotalPausedMs(resumedPausedMs);
+          setPauseStartedAt(null);
+          await AsyncStorage.setItem(
+            `@active_session_${uid}`,
+            JSON.stringify({
+              ...parsed,
+              totalPausedMs: resumedPausedMs,
+              pauseStartedAt: null,
+              isWorkoutPaused: false,
+              timerEndTime: null,
+              activeRestType: null,
+              timestamp: Date.now(),
+            }),
+          );
+          activeRestTypeRef.current = null;
+          setActiveRestType(null);
+          await clearRestTimerNotification(true);
+        } else {
+          setTotalPausedMs(savedPausedMs);
+          setPauseStartedAt(parsed.pauseStartedAt || null);
         }
+
+        if (
+          parsedStartMs &&
+          !durationLimitNoticeShownRef.current &&
+          Date.now() - parsedStartMs - effectivePausedMs >
+            MAX_WORKOUT_DURATION_MS
+        ) {
+          durationLimitNoticeShownRef.current = true;
+          setTimeout(() => {
+            showInfo(
+              "Workout Over 24h",
+              "When you finish this workout, IronVault will ask you to save it at the 24-hour mark or keep editing.",
+            );
+          }, 500);
+        }
+      } else {
+        historicalWeightPrefillStateRef.current = {};
+        skipNextWeightPrefillReconcileRef.current = false;
+        setIsHistoricalWeightPrefillActive(false);
+        const lastGym = await AsyncStorage.getItem(`@last_used_gym_${uid}`);
+        let initialGymId: string | null = null;
+        if (lastGym && loadedGyms.some((g: any) => g.id === lastGym)) {
+          initialGymId = lastGym;
+        } else if (loadedGyms.length > 0) {
+          initialGymId = loadedGyms[0].id;
+        }
+
+        if (initialGymId) setSelectedGymId(initialGymId);
 
         setIsPreFlightVisible(true);
 
         if (route.params?.templateData) {
           setActiveTemplate(route.params.templateData);
-          setWorkoutName(route.params.templateData.name);
+          setWorkoutName(
+            limitText(route.params.templateData.name || "New Session", LIMITS.nameChars),
+          );
           const mapped = (route.params.templateData.exercises || []).map(
             (exObj: any, exIdx: number) => {
-              const exName = typeof exObj === "string" ? exObj : exObj.name;
-              const isUnilateral = !!exObj.is_unilateral;
-              const brand = exObj.brand;
+              const sourceExercise =
+                typeof exObj === "string" ? { name: exObj } : exObj || {};
+              const attachmentExercise =
+                normalizeExerciseForAttachmentStorage(sourceExercise);
+              const attachmentOptions =
+                getExerciseAttachmentOptions(attachmentExercise);
+              const exName = attachmentExercise.name;
+              const isUnilateral = !!attachmentExercise.is_unilateral;
+              const brand = attachmentExercise.brand;
               let generatedSets: any[] = [];
 
-              if (Array.isArray(exObj.sets)) {
-                generatedSets = exObj.sets.map((s: any, setIdx: number) => ({
+              if (Array.isArray(sourceExercise.sets)) {
+                generatedSets = sourceExercise.sets.map((s: any, setIdx: number) => ({
                   id: genId(`set-${exIdx}-${setIdx}-`),
                   weight: "",
                   reps: "",
                   repsL: "",
                   repsR: "",
+                  rpe: "",
                   completed: false,
                   isWarmup: !!s.isWarmup,
                   createdAt: Date.now() + setIdx,
                 }));
               } else {
-                const numSets = typeof exObj === "string" ? 1 : exObj.sets || 1;
+                const numSets =
+                  typeof exObj === "string" ? 1 : sourceExercise.sets || 1;
                 generatedSets = Array.from({ length: numSets }).map(
                   (_, setIdx) => ({
                     id: genId(`set-${exIdx}-${setIdx}-`),
@@ -843,6 +2612,7 @@ export default function WorkoutScreen({ navigation, route }: any) {
                     reps: "",
                     repsL: "",
                     repsR: "",
+                    rpe: "",
                     completed: false,
                     isWarmup: false,
                     createdAt: Date.now() + setIdx,
@@ -851,18 +2621,51 @@ export default function WorkoutScreen({ navigation, route }: any) {
               }
               return {
                 id: genId(`ex-${exIdx}-`),
+                originalExerciseId:
+                  attachmentExercise.id || attachmentExercise.originalExerciseId,
                 name: exName,
-                reminder: exObj.reminder || "",
+                muscle: attachmentExercise.muscle,
+                equipment: attachmentExercise.equipment,
+                equipmentType: attachmentExercise.equipmentType,
+                machineBrandApplicable:
+                  attachmentExercise.machineBrandApplicable,
+                brandApplicable: attachmentExercise.brandApplicable,
+                image: attachmentExercise.image,
+                reminder: attachmentExercise.reminder || "",
                 remark: "",
-                exerciseVariant: exObj.exerciseVariant || "Normal",
-                variationOptions: exObj.variationOptions,
+                exerciseVariant: attachmentExercise.exerciseVariant || "Normal",
+                variationOptions: attachmentExercise.variationOptions,
+                attachment: getExerciseAttachmentForSave(attachmentExercise),
+                attachmentOptions:
+                  attachmentOptions.length > 0 ? attachmentOptions : undefined,
+                supportsAttachments:
+                  attachmentOptions.length > 0 ? true : undefined,
                 is_unilateral: isUnilateral,
                 brand: brand,
+                machineBrand: attachmentExercise.machineBrand,
+                supersetId: attachmentExercise.supersetId || null,
+                supersetOrder: attachmentExercise.supersetOrder,
+                gymReplacements: normalizeGymReplacements(
+                  attachmentExercise.gymReplacements,
+                ),
+                templateBaseExercise: {
+                  ...attachmentExercise,
+                  sets: undefined,
+                  gymReplacements: normalizeGymReplacements(
+                    attachmentExercise.gymReplacements,
+                  ),
+                },
                 sets: generatedSets,
               };
             },
           );
           setExercises(initializeSets(mapped));
+        } else if (route.params?.initialExercise) {
+          const seededExercise = await buildWorkoutExerciseFromSelection(
+            route.params.initialExercise,
+            initialGymId,
+          );
+          setExercises(initializeSets([seededExercise]));
         }
       }
       setIsLoaded(true);
@@ -870,14 +2673,50 @@ export default function WorkoutScreen({ navigation, route }: any) {
   }, [route.params, uid]);
 
   useEffect(() => {
+    let isMounted = true;
+
+    const loadNextSessionNotes = async () => {
+      if (!uid || isEditing || !activeTemplate?.id) {
+        if (isMounted) setNextSessionNotesEnabled(false);
+        if (isMounted) setNextSessionNotes({});
+        return;
+      }
+
+      const enabled = await readNextSessionNotesEnabled(uid);
+      if (isMounted) setNextSessionNotesEnabled(enabled);
+      if (!enabled) {
+        if (isMounted) setNextSessionNotes({});
+        return;
+      }
+
+      const notes = await readTemplateNextSessionNotes(uid, activeTemplate.id);
+      if (isMounted) setNextSessionNotes(notes);
+    };
+
+    loadNextSessionNotes();
+
+    return () => {
+      isMounted = false;
+    };
+  }, [activeTemplate?.id, isEditing, uid]);
+
+  useEffect(() => {
     if (!startTimeMs || isEditing || isSummaryVisible || isPreFlightVisible)
       return;
-    const interval = setInterval(
-      () => setWorkoutDurationStr(formatDuration(startTimeMs, Date.now())),
-      1000,
-    );
+    const updateWorkoutTimer = () => {
+      setWorkoutDurationStr(formatDurationFromMs(getActiveWorkoutDurationMs()));
+    };
+    updateWorkoutTimer();
+    const interval = setInterval(updateWorkoutTimer, 1000);
     return () => clearInterval(interval);
-  }, [startTimeMs, isEditing, isSummaryVisible, isPreFlightVisible]);
+  }, [
+    startTimeMs,
+    totalPausedMs,
+    pauseStartedAt,
+    isEditing,
+    isSummaryVisible,
+    isPreFlightVisible,
+  ]);
 
   useEffect(() => {
     if (!isLoaded || !uid || isEditing || isFinishing || isPreFlightVisible) {
@@ -897,9 +2736,16 @@ export default function WorkoutScreen({ navigation, route }: any) {
     workoutName,
     selectedGymId,
     activeTemplate,
+    pendingGymReplacementUpdates,
     sessionRestEnabled,
     sessionRestDuration,
+    sessionWarmupRestEnabled,
+    sessionWarmupRestDuration,
+    rpeTrackingEnabled,
     timerEndTime,
+    activeRestType,
+    totalPausedMs,
+    pauseStartedAt,
     isEditing,
     isLoaded,
     isFinishing,
@@ -915,6 +2761,8 @@ export default function WorkoutScreen({ navigation, route }: any) {
         restNotificationIdRef.current = null;
         setTimerEndTime(null);
         setDisplayRestTime(0);
+        activeRestTypeRef.current = null;
+        setActiveRestType(null);
         Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
       } else {
         setDisplayRestTime(remaining);
@@ -954,42 +2802,60 @@ export default function WorkoutScreen({ navigation, route }: any) {
     },
   );
 
-  const moveExercise = (
-    index: number,
-    direction: "up" | "down" | "top" | "bottom",
-  ) => {
-    Haptics.selectionAsync();
-    setExercises((prev) => {
-      const up = [...prev];
-      const [movedItem] = up.splice(index, 1);
-      if (direction === "up") up.splice(Math.max(0, index - 1), 0, movedItem);
-      else if (direction === "down")
-        up.splice(Math.min(up.length, index + 1), 0, movedItem);
-      else if (direction === "top") up.unshift(movedItem);
-      else if (direction === "bottom") up.push(movedItem);
-      return up;
-    });
-    setHasUnsavedChanges(true);
-  };
-
   const handleReplaceExercise = (index: number) => {
     setSelectedExerciseIndex(index);
     setIsExerciseMenuVisible(false);
     navigation.navigate("Search", {
+      mode: "replace",
       existingExercises: exercises
         .filter((_, i) => i !== index)
         .map((e) => e.name),
       onSelect: async (exData: any) => {
         const previousExercise = exercises[index];
-        const variationOptions = getExerciseVariationOptions(exData);
+        const templateExerciseId =
+          previousExercise?.templateSwapSourceExerciseId ||
+          previousExercise?.templateBaseExercise?.id ||
+          previousExercise?.templateBaseExercise?.originalExerciseId ||
+          null;
+        const templateBaseExercise = getTemplateExerciseById(
+          activeTemplate,
+          templateExerciseId,
+        );
+        const attachmentExercise = normalizeExerciseForAttachmentStorage(exData);
+        const variationOptions = getExerciseVariationOptions(attachmentExercise);
+        const attachmentOptions = getExerciseAttachmentOptions(attachmentExercise);
         let newEx = {
-          name: exData.name,
-          reminder: exData.reminder || "",
+          name: attachmentExercise.name,
+          originalExerciseId:
+            attachmentExercise.id || attachmentExercise.originalExerciseId || null,
+          reminder: attachmentExercise.reminder || "",
           remark: "",
+          muscle: attachmentExercise.muscle,
           exerciseVariant: variationOptions.length > 0 ? "Normal" : undefined,
           variationOptions,
-          is_unilateral: !!exData.is_unilateral,
-          brand: exData.brand,
+          attachment: getExerciseAttachmentForSave(attachmentExercise),
+          attachmentOptions:
+            attachmentOptions.length > 0 ? attachmentOptions : undefined,
+          supportsAttachments: attachmentOptions.length > 0 ? true : undefined,
+          is_unilateral: !!attachmentExercise.is_unilateral,
+          equipment: attachmentExercise.equipment,
+          equipmentType: attachmentExercise.equipmentType,
+          machineBrandApplicable: attachmentExercise.machineBrandApplicable,
+          brandApplicable: attachmentExercise.brandApplicable,
+          brand: attachmentExercise.brand,
+          machineBrand: attachmentExercise.machineBrand,
+          image: attachmentExercise.image,
+          supersetId: previousExercise?.supersetId || null,
+          supersetOrder: previousExercise?.supersetOrder,
+          ...(templateBaseExercise && templateExerciseId
+            ? {
+                templateSwapSourceExerciseId: templateExerciseId,
+                replacedOriginalName:
+                  templateBaseExercise.name ||
+                  previousExercise?.replacedOriginalName ||
+                  previousExercise?.name,
+              }
+            : {}),
           id: previousExercise?.id || genId("ex-"),
           sets:
             previousExercise?.sets?.length > 0
@@ -1000,6 +2866,7 @@ export default function WorkoutScreen({ navigation, route }: any) {
                   reps: set.reps ?? "",
                   repsL: set.repsL ?? "",
                   repsR: set.repsR ?? "",
+                  rpe: formatRpeValue(set.rpe),
                   completed: !!set.completed,
                   isWarmup: !!set.isWarmup,
                   createdAt: set.createdAt || Date.now(),
@@ -1011,6 +2878,7 @@ export default function WorkoutScreen({ navigation, route }: any) {
                     reps: "",
                     repsL: "",
                     repsR: "",
+                    rpe: "",
                     completed: false,
                     isWarmup: false,
                     createdAt: Date.now(),
@@ -1019,12 +2887,43 @@ export default function WorkoutScreen({ navigation, route }: any) {
         };
         newEx = await getAutoFilledExercise(newEx, selectedGymId);
 
-        setExercises((prev) => {
-          const up = [...prev];
-          up[index] = newEx;
-          return up;
-        });
+        const updatedExercises = cleanInvalidSupersets(
+          exercises.map((exercise, exerciseIndex) =>
+            exerciseIndex === index ? newEx : exercise,
+          ),
+        );
+        setExercises(updatedExercises);
         setHasUnsavedChanges(true);
+
+        const selectedGym = gyms.find((gym: any) => gym.id === selectedGymId);
+        if (
+          shouldOfferGymSwapSave(
+            previousExercise,
+            templateExerciseId,
+            selectedGym,
+          )
+        ) {
+          const isBackToTemplateExercise =
+            templateBaseExercise &&
+            isSameExerciseAsTemplateSlot(newEx, templateBaseExercise);
+
+          if (isBackToTemplateExercise) {
+            await removePendingGymReplacementUpdate({
+              templateExerciseId,
+              gymId: selectedGymId,
+              snapshotExercises: updatedExercises,
+            });
+          } else {
+            await queuePendingGymReplacementUpdate({
+              templateExerciseId,
+              replacementExercise: attachmentExercise,
+              gymId: selectedGymId,
+              gymName: selectedGym?.name || "this gym",
+              exerciseIndex: index,
+              snapshotExercises: updatedExercises,
+            });
+          }
+        }
       },
     });
   };
@@ -1038,7 +2937,15 @@ export default function WorkoutScreen({ navigation, route }: any) {
 
   const isSameHistoryExercise = (loggedExercise: any, targetExercise: any) => {
     if (!loggedExercise || !targetExercise) return false;
-    if (loggedExercise.name !== targetExercise.name) return false;
+    if (
+      cleanExerciseNameForAttachments(loggedExercise) !==
+      cleanExerciseNameForAttachments(targetExercise)
+    )
+      return false;
+
+    const targetAttachment = getExerciseAttachmentForStorage(targetExercise);
+    const loggedAttachment = getExerciseAttachmentForStorage(loggedExercise);
+    if (targetAttachment !== loggedAttachment) return false;
 
     const targetVariant = getHistoryExerciseVariant(targetExercise);
     if (!targetVariant) return true;
@@ -1053,7 +2960,7 @@ export default function WorkoutScreen({ navigation, route }: any) {
     try {
       const savedGyms = await AsyncStorage.getItem(`@user_gyms_${uid}`);
       if (savedGyms) {
-        const parsedGyms = JSON.parse(savedGyms);
+        const parsedGyms = safeJsonParse(savedGyms, []);
         if (Array.isArray(parsedGyms)) {
           setGyms(parsedGyms);
           return parsedGyms;
@@ -1082,7 +2989,7 @@ export default function WorkoutScreen({ navigation, route }: any) {
       return;
     }
 
-    const parsed = JSON.parse(raw)
+    const parsed = safeJsonParse<any[]>(raw, [])
       .filter((w: any) => w && w.id)
       .sort((a: any, b: any) => parseInt(b.id) - parseInt(a.id));
 
@@ -1099,9 +3006,7 @@ export default function WorkoutScreen({ navigation, route }: any) {
       if (!found?.sets) continue;
 
       const completedSets = found.sets.filter((s: any) =>
-        found.is_unilateral
-          ? s.completed && s.weight && s.repsL && s.repsR
-          : s.completed && s.weight && s.reps,
+        isValidCompletedSet(found, s),
       );
       if (completedSets.length === 0) continue;
 
@@ -1180,15 +3085,11 @@ export default function WorkoutScreen({ navigation, route }: any) {
     );
     if (!currentExercise || !currentSet || currentSet.completed) return;
 
-    const isComplete = currentExercise.is_unilateral
-      ? String(currentSet.weight || "").trim() !== "" &&
-        String(currentSet.repsL || "").trim() !== "" &&
-        String(currentSet.repsR || "").trim() !== ""
-      : String(currentSet.weight || "").trim() !== "" &&
-        String(currentSet.reps || "").trim() !== "";
+    const isComplete = hasValidSetInputs(currentExercise, currentSet);
 
     if (!isComplete) return;
 
+    markSetWeightManual(setId);
     const completedSet = { ...currentSet, completed: true };
     const nextExercises = exercises.map(
       (exercise: any, exerciseIndex: number) => {
@@ -1207,33 +3108,20 @@ export default function WorkoutScreen({ navigation, route }: any) {
     startRestTimerForCompletedSet(exIdx, completedSet, nextExercises);
   };
 
+  const hasIncompleteSetsForFinish = (items: any[]) =>
+    items.some((ex) =>
+      Array.isArray(ex?.sets)
+        ? ex.sets.some((s: any) => !isValidCompletedSet(ex, s))
+        : true,
+    );
+
   const handleFinishWorkout = (navAction?: any) => {
     if (finishWorkoutInFlightRef.current) return;
 
     finishWorkoutInFlightRef.current = true;
     setIsFinishing(true);
 
-    let hasIncomplete = false;
-    exercises.forEach((ex) => {
-      ex.sets.forEach((s: any) => {
-        if (ex.is_unilateral) {
-          if (
-            !s.completed ||
-            s.weight.trim() === "" ||
-            (s.repsL || "").trim() === "" ||
-            (s.repsR || "").trim() === ""
-          )
-            hasIncomplete = true;
-        } else {
-          if (
-            !s.completed ||
-            s.weight.trim() === "" ||
-            (s.reps || "").trim() === ""
-          )
-            hasIncomplete = true;
-        }
-      });
-    });
+    const hasIncomplete = hasIncompleteSetsForFinish(exercises);
 
     if (hasIncomplete) {
       setIncompleteFinishAlert({ visible: true, navAction });
@@ -1242,9 +3130,23 @@ export default function WorkoutScreen({ navigation, route }: any) {
     }
   };
 
+  const requestFinishWorkout = (navAction?: any) => {
+    if (finishWorkoutInFlightRef.current) return;
+
+    if (!isEditing && !hasIncompleteSetsForFinish(exercises)) {
+      Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
+      setFinishConfirmAlert({ visible: true, navAction });
+      return;
+    }
+
+    handleFinishWorkout(navAction);
+  };
+
   const finishWorkout = async (
     finalExercisesToSave: any[],
     navAction?: any,
+    forcedFinishedAt?: number,
+    options: { skipTemplateDecision?: boolean } = {},
   ) => {
     if (!uid) {
       finishWorkoutInFlightRef.current = false;
@@ -1252,219 +3154,298 @@ export default function WorkoutScreen({ navigation, route }: any) {
       return;
     }
 
-    workoutFinalizedRef.current = true;
-    if (saveTimeoutRef.current) {
-      clearTimeout(saveTimeoutRef.current);
-      saveTimeoutRef.current = null;
-    }
-    setTimerEndTime(null);
-    setDisplayRestTime(0);
-    await clearRestTimerNotification(true);
-
-    if (finalExercisesToSave.length === 0) {
-      showInfo(
-        "Empty Session",
-        "No completed sets were found. Workout discarded.",
-        async () => {
-          finishWorkoutInFlightRef.current = false;
-          setIsFinishing(false);
-          setIsEditable(false);
-          if (!isEditing) {
-            await AsyncStorage.removeItem(`@active_session_${uid}`);
-            await AsyncStorage.removeItem(`@active_workout_start_${uid}`);
-            await AsyncStorage.setItem(`@last_search_filter_${uid}`, "All");
-          }
-          if (navAction) navigation.dispatch(navAction);
-          else navigation.reset({ index: 0, routes: [{ name: "Home" }] });
-        },
-      );
-      return;
-    }
-
-    let vol = 0;
-    let totalSets = 0;
-    const raw = await AsyncStorage.getItem(`@workout_history_${uid}`);
-    const list = raw ? JSON.parse(raw).filter((w: any) => w && w.id) : [];
-
-    finalExercisesToSave.forEach((ex) => {
-      if (ex && ex.sets) {
-        ex.sets.forEach((s: any) => {
-          if (s && s.completed && !s.isWarmup) {
-            if (ex.is_unilateral && s.weight && s.repsL && s.repsR) {
-              vol +=
-                parseFloat(s.weight) * parseInt(s.repsL) +
-                parseFloat(s.weight) * parseInt(s.repsR);
-              totalSets += 1;
-            } else if (!ex.is_unilateral && s.weight && s.reps) {
-              vol += parseFloat(s.weight) * parseInt(s.reps);
-              totalSets += 1;
-            }
-          }
-        });
-      }
-    });
-
-    const finishedAt = Date.now();
-    const workoutStartedAt = isEditing
-      ? Number(
-          route.params?.editData?.startedAt ||
-            route.params?.editData?.id ||
-            Date.now(),
-        )
-      : startTimeMs || Date.now();
-
-    let finalDuration = "0m 0s";
-    if (!isEditing && workoutStartedAt) {
-      finalDuration = formatDuration(workoutStartedAt, finishedAt);
-    } else if (isEditing && route.params?.editData?.duration) {
-      finalDuration = route.params.editData.duration;
-    }
-
-    if (!isEditing) {
-      setStartTimeMs(null);
-      setWorkoutDurationStr(finalDuration);
-    }
-
-    const detectedPRs = !isEditing
-      ? detectWorkoutPRs(finalExercisesToSave, list, { isKg })
-      : [];
-
-    const detectedPRDisplayCount = getWorkoutPRDisplayCount(detectedPRs);
-    const calculatedPrType =
-      detectedPRDisplayCount > 0
-        ? `${detectedPRDisplayCount} PR${detectedPRDisplayCount === 1 ? "" : "s"}`
-        : null;
-
-    const gymObj = gyms.find((g) => g.id === selectedGymId);
-
-    const session = {
-      id: route.params?.editData?.id || finishedAt.toString(),
-      startedAt: workoutStartedAt,
-      finishedAt: isEditing
-        ? route.params?.editData?.finishedAt || finishedAt
-        : finishedAt,
-      date:
-        route.params?.editData?.date || formatWorkoutLogDate(workoutStartedAt),
-      workoutName,
-      templateId:
-        activeTemplate?.id || route.params?.editData?.templateId || null,
-      volume: vol,
-      isKg,
-      gymId: selectedGymId,
-      gymName: gymObj ? gymObj.name : null,
-      fullWorkoutData: finalExercisesToSave,
-      duration: finalDuration,
-      prType: calculatedPrType,
-      prs: detectedPRs,
-    };
-
-    await AsyncStorage.setItem(
-      `@workout_history_${uid}`,
-      JSON.stringify(
-        route.params?.editData
-          ? list.map((w: any) => (w?.id === session.id ? session : w))
-          : [...list, session],
-      ),
-    );
-
     try {
-      await pushWorkoutToCloud(session);
-    } catch (e) {
-      console.log("Cloud backup delayed: saved locally.");
-    }
+      const requestedFinishedAt = forcedFinishedAt || Date.now();
+      const workoutStartedAt = isEditing
+        ? Number(
+            route.params?.editData?.startedAt ||
+              route.params?.editData?.id ||
+              requestedFinishedAt,
+          )
+        : startTimeMs || requestedFinishedAt;
+      const pausedMsForSession = isEditing
+        ? Number(route.params?.editData?.totalPausedMs || 0)
+        : totalPausedMs;
 
-    if (!isEditing) {
-      await AsyncStorage.removeItem(`@active_session_${uid}`);
-      await AsyncStorage.removeItem(`@active_workout_start_${uid}`);
-      await AsyncStorage.setItem(`@last_search_filter_${uid}`, "All");
+      if (
+        !forcedFinishedAt &&
+        !isEditing &&
+        workoutStartedAt &&
+        requestedFinishedAt - workoutStartedAt - pausedMsForSession >
+          MAX_WORKOUT_DURATION_MS
+      ) {
+        setDurationLimitAlert({
+          visible: true,
+          finalExercises: finalExercisesToSave,
+          navAction,
+          cappedFinishedAt:
+            workoutStartedAt + pausedMsForSession + MAX_WORKOUT_DURATION_MS,
+        });
+        finishWorkoutInFlightRef.current = false;
+        setIsFinishing(false);
+        return;
+      }
 
-      const exercisesForSummary = finalExercisesToSave
-        .map((ex) => ({ ...ex, sets: ex.sets.filter((s: any) => !s.isWarmup) }))
-        .filter((ex) => ex.sets.length > 0);
-      setCompletedWorkoutData({
-        id: session.id,
-        name: workoutName,
-        date: session.date,
-        startedAt: session.startedAt,
-        finishedAt: session.finishedAt,
-        gymName: session.gymName,
-        volume: vol,
-        totalSets: totalSets,
-        duration: finalDuration,
-        prType: calculatedPrType,
-        prs: detectedPRs,
-        exercises: exercisesForSummary,
+      if (
+        finalExercisesToSave.length > 0 &&
+        !options.skipTemplateDecision &&
+        showTemplateDecisionBeforeSave(
+          finalExercisesToSave,
+          navAction,
+          forcedFinishedAt,
+        )
+      ) {
+        return;
+      }
+
+      workoutFinalizedRef.current = true;
+      if (saveTimeoutRef.current) {
+        clearTimeout(saveTimeoutRef.current);
+        saveTimeoutRef.current = null;
+      }
+      setTimerEndTime(null);
+      setDisplayRestTime(0);
+      activeRestTypeRef.current = null;
+      setActiveRestType(null);
+      await clearRestTimerNotification(true);
+
+      if (finalExercisesToSave.length === 0) {
+        showInfo(
+          "Empty Session",
+          "No completed sets were found. Workout discarded.",
+          async () => {
+            finishWorkoutInFlightRef.current = false;
+            setIsFinishing(false);
+            setIsEditable(false);
+            if (!isEditing) {
+              await AsyncStorage.removeItem(`@active_session_${uid}`);
+              await AsyncStorage.removeItem(`@active_workout_start_${uid}`);
+              await AsyncStorage.setItem(`@last_search_filter_${uid}`, "All");
+            }
+            if (navAction) navigation.dispatch(navAction);
+            else navigation.reset({ index: 0, routes: [{ name: "Home" }] });
+          },
+        );
+        return;
+      }
+
+      let vol = 0;
+      let totalSets = 0;
+      const raw = await AsyncStorage.getItem(`@workout_history_${uid}`);
+      const list = raw
+        ? safeJsonParse<any[]>(raw, []).filter((w: any) => w && w.id)
+        : [];
+
+      finalExercisesToSave.forEach((ex) => {
+        if (ex && ex.sets) {
+          ex.sets.forEach((s: any) => {
+            if (isValidCompletedSet(ex, s, { includeWarmup: false })) {
+              if (ex.is_unilateral) {
+                vol +=
+                  parseFloat(s.weight) * parseInt(s.repsL) +
+                  parseFloat(s.weight) * parseInt(s.repsR);
+                totalSets += 1;
+              } else {
+                vol += parseFloat(s.weight) * parseInt(s.reps);
+                totalSets += 1;
+              }
+            }
+          });
+        }
       });
 
-      if (activeTemplate) {
-        let hasStructuralChanges = false;
-        if (finalExercisesToSave.length !== activeTemplate.exercises.length) {
-          hasStructuralChanges = true;
-        } else {
-          for (let i = 0; i < finalExercisesToSave.length; i++) {
-            const curEx = finalExercisesToSave[i];
-            const tplEx = activeTemplate.exercises[i];
-            if (
-              curEx.name !== (typeof tplEx === "string" ? tplEx : tplEx.name) ||
-              (curEx.exerciseVariant || "Normal") !==
-                ((typeof tplEx === "string"
-                  ? "Normal"
-                  : tplEx.exerciseVariant) || "Normal") ||
-              !!curEx.is_unilateral !== !!tplEx.is_unilateral
-            ) {
-              hasStructuralChanges = true;
-              break;
-            }
-            if (
-              curEx.sets.filter((s: any) => s.isWarmup).length !==
-                (tplEx.sets?.filter((s: any) => s.isWarmup).length || 0) ||
-              curEx.sets.filter((s: any) => !s.isWarmup).length !==
-                (tplEx.sets?.filter((s: any) => !s.isWarmup).length ||
-                  tplEx.sets?.length ||
-                  1)
-            ) {
-              hasStructuralChanges = true;
-              break;
-            }
+      const finishedAt = requestedFinishedAt;
+
+      let finalDuration = "0m 0s";
+      let finalDurationSeconds = 0;
+      if (!isEditing && workoutStartedAt) {
+        finalDurationSeconds = Math.max(
+          0,
+          Math.floor((finishedAt - workoutStartedAt - pausedMsForSession) / 1000),
+        );
+        finalDuration = formatDurationFromMs(finalDurationSeconds * 1000);
+      } else if (isEditing && route.params?.editData?.duration) {
+        finalDuration = route.params.editData.duration;
+        finalDurationSeconds = Number(
+          route.params?.editData?.durationSeconds || 0,
+        );
+      }
+
+      if (!isEditing) {
+        setStartTimeMs(null);
+        setTotalPausedMs(0);
+        setPauseStartedAt(null);
+        setWorkoutDurationStr(finalDuration);
+      }
+
+      const detectedPRs = !isEditing
+        ? detectWorkoutPRs(finalExercisesToSave, list, { isKg })
+        : [];
+
+      const detectedPRDisplayCount = getWorkoutPRDisplayCount(detectedPRs);
+      const calculatedPrType =
+        detectedPRDisplayCount > 0
+          ? `${detectedPRDisplayCount} PR${
+              detectedPRDisplayCount === 1 ? "" : "s"
+            }`
+          : null;
+
+      const gymObj = gyms.find((g) => g.id === selectedGymId);
+
+      const session = {
+        id: route.params?.editData?.id || finishedAt.toString(),
+        startedAt: workoutStartedAt,
+        finishedAt: isEditing
+          ? route.params?.editData?.finishedAt || finishedAt
+          : finishedAt,
+        date:
+          route.params?.editData?.date || formatWorkoutLogDate(workoutStartedAt),
+        workoutName,
+        templateId:
+          activeTemplate?.id || route.params?.editData?.templateId || null,
+        volume: vol,
+        isKg,
+        gymId: selectedGymId,
+        gymName: gymObj ? gymObj.name : null,
+        fullWorkoutData: finalExercisesToSave,
+        duration: finalDuration,
+        durationSeconds: finalDurationSeconds,
+        totalPausedMs: isEditing
+          ? Number(route.params?.editData?.totalPausedMs || 0)
+          : pausedMsForSession,
+        rpeTrackingEnabled,
+        prType: calculatedPrType,
+        prs: detectedPRs,
+      };
+
+      await AsyncStorage.setItem(
+        `@workout_history_${uid}`,
+        JSON.stringify(
+          route.params?.editData
+            ? list.map((w: any) => (w?.id === session.id ? session : w))
+            : [...list, session],
+        ),
+      );
+
+      pushWorkoutToCloud(session).catch((error) => {
+        console.log("Workout cloud backup delayed: saved locally.", error);
+      });
+
+      if (!isEditing) {
+        await AsyncStorage.removeItem(`@active_session_${uid}`);
+        await AsyncStorage.removeItem(`@active_workout_start_${uid}`);
+        await AsyncStorage.setItem(`@last_search_filter_${uid}`, "All");
+        if (activeTemplate?.id) {
+          try {
+            await deleteTemplateNextSessionNotes(uid, activeTemplate.id);
+            setNextSessionNotes({});
+          } catch (error) {
+            console.log("Could not clear next session notes", error);
           }
         }
 
-        if (hasStructuralChanges) {
-          finishWorkoutInFlightRef.current = false;
-          setIsFinishing(false);
-          setDiffAlertVisible(true);
-          return;
-        } else {
-          finishWorkoutInFlightRef.current = false;
-          setIsFinishing(false);
+        const exercisesForSummary = finalExercisesToSave
+          .map((ex) => ({
+            ...ex,
+            sets: ex.sets.filter((s: any) =>
+              isValidCompletedSet(ex, s, { includeWarmup: false }),
+            ),
+          }))
+          .filter((ex) => ex.sets.length > 0);
+        setCompletedWorkoutData({
+          id: session.id,
+          name: workoutName,
+          date: session.date,
+          startedAt: session.startedAt,
+          finishedAt: session.finishedAt,
+          gymName: session.gymName,
+          volume: vol,
+          totalSets: totalSets,
+          duration: finalDuration,
+          durationSeconds: finalDurationSeconds,
+          totalPausedMs: session.totalPausedMs,
+          prType: calculatedPrType,
+          prs: detectedPRs,
+          exercises: exercisesForSummary,
+        });
+
+        finishWorkoutInFlightRef.current = false;
+        setIsFinishing(false);
+        if (activeTemplate) {
           setSummaryType("finish");
           setIsSummaryVisible(true);
-          return;
+        } else {
+          setTemplateAlertVisible(true);
+        }
+      } else {
+        if (navAction) {
+          setIsEditable(false);
+          finishWorkoutInFlightRef.current = false;
+          setIsFinishing(false);
+          navigation.dispatch(navAction);
+        } else {
+          setIsEditable(false);
+          setHasUnsavedChanges(false);
+          Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
+          finishWorkoutInFlightRef.current = false;
+          setIsFinishing(false);
+          showInfo(
+            "Workout Updated!",
+            "Your changes have been saved successfully.",
+          );
         }
       }
+    } catch (error) {
+      console.error("Failed to finish workout:", error);
+      workoutFinalizedRef.current = false;
       finishWorkoutInFlightRef.current = false;
       setIsFinishing(false);
-      setTemplateAlertVisible(true);
-    } else {
-      if (navAction) {
-        setIsEditable(false);
-        finishWorkoutInFlightRef.current = false;
-        setIsFinishing(false);
-        navigation.dispatch(navAction);
-      } else {
-        setIsEditable(false);
-        setHasUnsavedChanges(false);
-        setInitialStateStr(
-          JSON.stringify({ exercises: finalExercisesToSave, workoutName }),
-        );
-        Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
-        finishWorkoutInFlightRef.current = false;
-        setIsFinishing(false);
-        showInfo(
-          "Workout Updated!",
-          "Your changes have been saved successfully.",
+      Alert.alert(
+        "Finish Failed",
+        "IronVault could not finish this workout. Your session is still on this device, so please try again.",
+      );
+    }
+  };
+
+  const clearPendingGymReplacementUpdatesForActiveTemplate = () => {
+    if (!activeTemplate?.id) return;
+    setPendingGymReplacementUpdates((prev) =>
+      prev.filter((update: any) => update?.templateId !== activeTemplate.id),
+    );
+  };
+
+  const finishAfterTemplateDecision = async (
+    decisionOverride?: typeof templateDecisionAlert,
+  ) => {
+    const decision = decisionOverride || templateDecisionAlert;
+    finishWorkoutInFlightRef.current = true;
+    setIsFinishing(true);
+
+    try {
+      await applyTemplateChangeChoicesToTemplate(decision.changes);
+      if (decision.createNewTemplate) {
+        await saveWorkoutAsNewTemplate(
+          decision.finalExercises,
+          decision.newTemplateName,
         );
       }
+      clearPendingGymReplacementUpdatesForActiveTemplate();
+
+      await finishWorkout(
+        decision.finalExercises,
+        decision.navAction,
+        decision.forcedFinishedAt || undefined,
+        { skipTemplateDecision: true },
+      );
+    } catch (error) {
+      console.error("Failed to apply template finish choices:", error);
+      setTemplateDecisionAlert({ ...decision, visible: true });
+      finishWorkoutInFlightRef.current = false;
+      setIsFinishing(false);
+      Alert.alert(
+        "Could Not Finish",
+        "IronVault could not apply those template choices. Your workout is still here, so please try again.",
+      );
     }
   };
 
@@ -1475,20 +3456,7 @@ export default function WorkoutScreen({ navigation, route }: any) {
       .map((ex) => ({
         ...ex,
         sets: ex.sets.filter((s: any) => {
-          if (ex.is_unilateral)
-            return (
-              s.completed &&
-              s.weight.trim() !== "" &&
-              (s.repsL || "").trim() !== "" &&
-              (s.repsR || "").trim() !== "" &&
-              !s.isWarmup
-            );
-          return (
-            s.completed &&
-            s.weight.trim() !== "" &&
-            (s.reps || "").trim() !== "" &&
-            !s.isWarmup
-          );
+          return isValidCompletedSet(ex, s, { includeWarmup: false });
         }),
       }))
       .filter((ex) => ex.sets.length > 0);
@@ -1520,7 +3488,121 @@ export default function WorkoutScreen({ navigation, route }: any) {
     };
   };
 
-  const handleSaveImage = async () => {
+  const getTemplateChangeCounts = (changes: TemplateChangeItem[]) => ({
+    added: changes.filter((change) => change.type === "added").length,
+    deleted: changes.filter((change) => change.type === "deleted").length,
+    replaced: changes.filter((change) => change.type === "replaced").length,
+    variant: changes.filter((change) => change.type === "variant").length,
+    name: changes.filter((change) => change.type === "name").length,
+  });
+
+  const formatTemplateChangeCount = (
+    label: string,
+    count: number,
+  ) => `${count} ${label}${count === 1 ? "" : "s"}`;
+
+  const getTemplateReviewSummary = (changes: TemplateChangeItem[]) => {
+    const counts = getTemplateChangeCounts(changes);
+    return [
+      counts.replaced > 0
+        ? formatTemplateChangeCount("Replaced Exercise", counts.replaced)
+        : null,
+      counts.added > 0
+        ? formatTemplateChangeCount("Added Exercise", counts.added)
+        : null,
+      counts.deleted > 0
+        ? formatTemplateChangeCount("Deleted Exercise", counts.deleted)
+        : null,
+      counts.variant > 0
+        ? formatTemplateChangeCount("Selection Change", counts.variant)
+        : null,
+      counts.name > 0 ? "Name Change" : null,
+    ]
+      .filter(Boolean)
+      .join("  •  ");
+  };
+
+  const getTemplateChangeTitle = (change: TemplateChangeItem) => {
+    if (change.type === "name") {
+      return change.toLabel || "New template name";
+    }
+    if (change.type === "variant") {
+      return formatExerciseDisplayName(change.workoutExercise || change.originalExercise);
+    }
+    if (change.type === "added") {
+      return change.workoutExercise
+        ? formatExerciseDisplayName(change.workoutExercise)
+        : "Added exercise";
+    }
+    if (change.type === "deleted") {
+      return change.originalExercise
+        ? formatExerciseDisplayName(change.originalExercise)
+        : "Deleted exercise";
+    }
+    return change.workoutExercise
+      ? formatExerciseDisplayName(change.workoutExercise)
+      : "Replacement";
+  };
+
+  const getTemplateChangeSubtitle = (change: TemplateChangeItem) => {
+    if (change.type === "name") {
+      return `Rename from ${change.fromLabel || "Template"}`;
+    }
+    if (change.type === "variant") {
+      return `${change.fromLabel || "Default"} → ${change.toLabel || "Default"}`;
+    }
+    if (change.type === "added") return "Added during this workout";
+    if (change.type === "deleted") return "Removed from this workout";
+    return "Replaced during this workout";
+  };
+
+  const getTemplateChangeKicker = (change: TemplateChangeItem) => {
+    if (change.type === "name") return "NAME";
+    if (change.type === "variant") return "SELECTION";
+    if (change.type === "added") return "ADDED";
+    if (change.type === "deleted") return "DELETED";
+    return "REPLACED";
+  };
+
+  const getTemplateChangeOptions = (change: TemplateChangeItem) => {
+    if (change.type === "name") {
+      return [
+        { value: "dontUpdate" as const, label: "Don't Update" },
+        { value: "updateTemplate" as const, label: "Rename" },
+      ];
+    }
+
+    if (change.type === "variant") {
+      return [
+        { value: "dontUpdate" as const, label: "Don't Update" },
+        { value: "updateTemplate" as const, label: "Update Template" },
+      ];
+    }
+
+    if (change.type === "added") {
+      return [
+        { value: "dontUpdate" as const, label: "Don't Update" },
+        { value: "updateTemplate" as const, label: "Add" },
+      ];
+    }
+
+    if (change.type === "deleted") {
+      return [
+        { value: "dontUpdate" as const, label: "Don't Update" },
+        { value: "updateTemplate" as const, label: "Remove" },
+      ];
+    }
+
+    return [
+      { value: "dontUpdate" as const, label: "Don't Update" },
+      ...(change.canGymSwap
+        ? [{ value: "gymSwap" as const, label: "Gym Swap" }]
+        : []),
+      { value: "updateTemplate" as const, label: "Update Template" },
+    ];
+  };
+
+	  const handleSaveImage = async () => {
     try {
       const { status } = await MediaLibrary.requestPermissionsAsync();
       if (status !== "granted") {
@@ -1601,8 +3683,79 @@ export default function WorkoutScreen({ navigation, route }: any) {
     gyms.find((g) => g.id === selectedGymId)?.name ||
     (selectedGymId ? "Selected Gym" : "No gym selected");
 
+  const setHintExerciseIdentityKey = getWeightPrefillIdentityKey(exercises);
+
+  const previousSetHints = useMemo(() => {
+    return exercises.map((exercise) =>
+      buildBestHistoricalSetPositionHints(exercise, workoutHistory, isKg),
+    );
+  }, [setHintExerciseIdentityKey, workoutHistory, isKg]);
+
+  const getPreviousSetPlaceholder = (
+    exerciseIndex: number,
+    set: any,
+    setTypeIndex: number,
+    field: "reps" | "repsL" | "repsR",
+  ) => {
+    const hint = previousSetHints[exerciseIndex];
+    const bucket = set?.isWarmup ? hint?.warmup : hint?.working;
+    const pastSet = bucket?.[setTypeIndex];
+    const value = pastSet?.[field];
+    if (value === undefined || value === null || String(value).trim() === "")
+      return "0";
+    return String(value);
+  };
+
+  const setPrefillStructureKey = getWeightPrefillStructureKey(exercises);
+
+  useEffect(() => {
+    if (
+      !isLoaded ||
+      !isHistoricalWeightPrefillActive ||
+      isEditing ||
+      isPreFlightVisible
+    ) {
+      return;
+    }
+
+    if (skipNextWeightPrefillReconcileRef.current) {
+      skipNextWeightPrefillReconcileRef.current = false;
+      return;
+    }
+
+    setExercises((currentExercises) => {
+      if (
+        getWeightPrefillIdentityKey(currentExercises) !==
+          setHintExerciseIdentityKey ||
+        getWeightPrefillStructureKey(currentExercises) !==
+          setPrefillStructureKey
+      ) {
+        return currentExercises;
+      }
+      const reconciled = reconcileHistoricalWeightPrefills(
+        currentExercises,
+        previousSetHints,
+        historicalWeightPrefillStateRef.current,
+      );
+      historicalWeightPrefillStateRef.current = reconciled.state;
+      return reconciled.changed ? reconciled.exercises : currentExercises;
+    });
+  }, [
+    isLoaded,
+    isHistoricalWeightPrefillActive,
+    isEditing,
+    isPreFlightVisible,
+    setHintExerciseIdentityKey,
+    setPrefillStructureKey,
+    previousSetHints,
+  ]);
+
   const workoutStats = useMemo(() => {
     const totalExercises = exercises.length;
+    const totalWarmupSets = exercises.reduce(
+      (sum, ex) => sum + (ex.sets || []).filter((s: any) => s.isWarmup).length,
+      0,
+    );
     const totalSets = exercises.reduce(
       (sum, ex) => sum + (ex.sets || []).filter((s: any) => !s.isWarmup).length,
       0,
@@ -1610,12 +3763,90 @@ export default function WorkoutScreen({ navigation, route }: any) {
     const completedSets = exercises.reduce(
       (sum, ex) =>
         sum +
-        (ex.sets || []).filter((s: any) => s.completed && !s.isWarmup).length,
+        (ex.sets || []).filter((s: any) =>
+          isValidCompletedSet(ex, s, { includeWarmup: false }),
+        ).length,
       0,
     );
 
-    return { totalExercises, totalSets, completedSets };
+    return {
+      totalExercises,
+      totalSets,
+      completedSets,
+      totalWarmupSets,
+      hasAnySet: totalExercises > 0 && totalSets + totalWarmupSets > 0,
+    };
   }, [exercises]);
+
+  const renderRestDurationControls = (
+    label: string,
+    duration: string,
+    updateDuration: (seconds: number) => Promise<void>,
+    presets = REST_TIMER_PRESETS,
+  ) => (
+    <>
+      <View style={styles.restDurationRow}>
+        <Text style={styles.restDurationLabel}>{label}</Text>
+        <View style={styles.restDurationStepper}>
+          <TouchableOpacity
+            onPress={async () => {
+              Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
+              await updateDuration(parseInt(duration || "0", 10) - 10);
+            }}
+            style={styles.restDurationStepButton}
+          >
+            <Text style={styles.restDurationStepText}>−</Text>
+          </TouchableOpacity>
+          <Text style={styles.restDurationValue}>{duration}s</Text>
+          <TouchableOpacity
+            onPress={async () => {
+              Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
+              await updateDuration(parseInt(duration || "0", 10) + 10);
+            }}
+            style={styles.restDurationStepButton}
+          >
+            <Text style={styles.restDurationStepText}>+</Text>
+          </TouchableOpacity>
+        </View>
+      </View>
+
+      <View style={styles.restPresetRow}>
+        {presets.map((preset) => {
+          const active =
+            String(parseInt(duration || "0", 10)) === String(preset.value);
+          return (
+            <TouchableOpacity
+              key={`${label}-${preset.value}`}
+              activeOpacity={0.8}
+              style={[
+                styles.restPresetChip,
+                active && styles.restPresetChipActive,
+              ]}
+              onPress={async () => {
+                Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
+                await updateDuration(preset.value);
+              }}
+            >
+              <Text
+                style={[
+                  styles.restPresetChipText,
+                  active && styles.restPresetChipTextActive,
+                ]}
+              >
+                {preset.label}
+              </Text>
+            </TouchableOpacity>
+          );
+        })}
+      </View>
+    </>
+  );
+
+  const fallbackFooterHeight = displayRestTime > 0 ? 188 : 112;
+  const workoutListBottomPadding =
+    isEditable && !isKeyboardVisible
+      ? Math.max(footerHeight, fallbackFooterHeight, 96) + 12
+      : 40;
 
   return (
     <View style={styles.screen}>
@@ -1685,7 +3916,19 @@ export default function WorkoutScreen({ navigation, route }: any) {
                   {
                     text: "Pause Workout",
                     onPress: async () => {
-                      await saveActiveSessionSnapshot();
+                      const pausedAt = Date.now();
+                      setPauseStartedAt(pausedAt);
+                      setTimerEndTime(null);
+                      setDisplayRestTime(0);
+                      activeRestTypeRef.current = null;
+                      setActiveRestType(null);
+                      await clearRestTimerNotification(true);
+                      await saveActiveSessionSnapshot({
+                        pauseStartedAt: pausedAt,
+                        isWorkoutPaused: true,
+                        timerEndTime: null,
+                        activeRestType: null,
+                      });
                       setIsEditable(false);
                       setNavAlert((prev) => ({ ...prev, visible: false }));
                       navigation.navigate("Home");
@@ -1717,6 +3960,22 @@ export default function WorkoutScreen({ navigation, route }: any) {
       />
 
       <CustomAlert
+        visible={finishConfirmAlert.visible}
+        title="Finish Workout?"
+        message="This will save the session to History. You can still edit it later if something looks off."
+        buttons={[
+          { text: "Cancel", style: "cancel" },
+          {
+            text: "Finish Workout",
+            onPress: () => handleFinishWorkout(finishConfirmAlert.navAction),
+          },
+        ]}
+        onClose={() =>
+          setFinishConfirmAlert({ visible: false, navAction: null })
+        }
+      />
+
+      <CustomAlert
         visible={incompleteFinishAlert.visible}
         title="Incomplete Sets Detected"
         message="You have empty or unchecked sets left. What would you like to do?"
@@ -1739,14 +3998,7 @@ export default function WorkoutScreen({ navigation, route }: any) {
                 .map((ex) => ({
                   ...ex,
                   sets: ex.sets.filter((s: any) =>
-                    ex.is_unilateral
-                      ? s.completed &&
-                        s.weight.trim() !== "" &&
-                        (s.repsL || "").trim() !== "" &&
-                        (s.repsR || "").trim() !== ""
-                      : s.completed &&
-                        s.weight.trim() !== "" &&
-                        (s.reps || "").trim() !== "",
+                    isValidCompletedSet(ex, s),
                   ),
                 }))
                 .filter((ex) => ex.sets.length > 0);
@@ -1771,12 +4023,39 @@ export default function WorkoutScreen({ navigation, route }: any) {
         }}
       />
       <CustomAlert
+        visible={durationLimitAlert.visible}
+        title="Workout Over 24h"
+        message="This workout has been running for more than 24 hours. Save it as a 24-hour session or keep editing for now."
+        buttons={[
+          { text: "Keep Editing", style: "cancel" },
+          {
+            text: "End at 24h",
+            onPress: () => {
+              if (!durationLimitAlert.cappedFinishedAt) return;
+              const finalExercises = durationLimitAlert.finalExercises;
+              const navAction = durationLimitAlert.navAction;
+              const cappedFinishedAt = durationLimitAlert.cappedFinishedAt;
+              finishWorkoutInFlightRef.current = true;
+              setIsFinishing(true);
+              setTimeout(
+                () =>
+                  finishWorkout(finalExercises, navAction, cappedFinishedAt),
+                250,
+              );
+            },
+          },
+        ]}
+        onClose={() =>
+          setDurationLimitAlert((prev) => ({ ...prev, visible: false }))
+        }
+      />
+      <CustomAlert
         visible={templateAlertVisible}
-        title="Save Workout as Template?"
-        message="Create a reusable template from the completed exercises and set structure? Weights and reps will not be saved into the template."
+        title="Want to repeat this workout?"
+        message="Save this session as a reusable template so you can start it faster next time. Weights and reps will not be saved into the template."
         buttons={[
           {
-            text: "No",
+            text: "Not Now",
             style: "cancel",
             onPress: () => {
               templateActionTaken.current = true;
@@ -1784,7 +4063,7 @@ export default function WorkoutScreen({ navigation, route }: any) {
             },
           },
           {
-            text: "Save Template",
+            text: "Save as Template",
             onPress: () => {
               templateActionTaken.current = true;
               setTimeout(
@@ -1807,51 +4086,520 @@ export default function WorkoutScreen({ navigation, route }: any) {
           templateActionTaken.current = false;
         }}
       />
-      <CustomAlert
-        visible={diffAlertVisible}
-        title="Template Changed"
-        message="This saved session no longer matches the original template structure. How should IronVault handle the template?"
-        buttons={[
-          {
-            text: "Keep Session Only",
-            style: "cancel",
-            onPress: () => {
-              diffActionTaken.current = true;
-              setTimeout(openFinishSummary, 400);
-            },
-          },
-          {
-            text: "Save as New Template",
-            onPress: () => {
-              diffActionTaken.current = true;
-              setTimeout(
-                () =>
-                  openTemplateNamePrompt(
-                    exercises,
-                    "New Template Name",
-                    "Save this changed workout as a separate template.",
-                  ),
-                400,
-              );
-            },
-          },
-          {
-            text: "Update Original",
-            onPress: async () => {
-              diffActionTaken.current = true;
-              await updateOriginalTemplateFromWorkout(exercises);
-              setTimeout(openFinishSummary, 400);
-            },
-          },
-        ]}
-        onClose={() => {
-          setDiffAlertVisible(false);
-          if (!diffActionTaken.current) {
-            setTimeout(openFinishSummary, 400);
-          }
-          diffActionTaken.current = false;
+      <Modal
+        visible={templateDecisionAlert.visible}
+        transparent
+        animationType="slide"
+        onRequestClose={() => {
+          setTemplateDecisionAlert((prev) => ({ ...prev, visible: false }));
+          finishWorkoutInFlightRef.current = false;
+          setIsFinishing(false);
         }}
-      />
+      >
+        <KeyboardAvoidingView
+          behavior={Platform.OS === "ios" ? "padding" : undefined}
+          style={{
+            flex: 1,
+            backgroundColor: "rgba(0,0,0,0.86)",
+            justifyContent: "flex-end",
+          }}
+        >
+          <View
+            style={{
+              backgroundColor: "#1C1C1E",
+              borderTopLeftRadius: 28,
+              borderTopRightRadius: 28,
+              borderWidth: 1,
+              borderColor: "#2C2C2E",
+              paddingTop: 18,
+              paddingHorizontal: 18,
+              paddingBottom: Math.max(insets.bottom + 14, 24),
+              maxHeight: Math.min(
+                windowHeight * 0.86,
+                windowHeight - insets.top - 18,
+              ),
+            }}
+          >
+            <View
+              style={{
+                flexDirection: "row",
+                alignItems: "flex-start",
+                justifyContent: "space-between",
+                gap: 14,
+                marginBottom: 14,
+              }}
+            >
+              <View style={{ flex: 1 }}>
+                <Text
+                  style={{
+                    color: "#32D74B",
+                    fontSize: 13,
+                    fontWeight: "900",
+                    letterSpacing: 0,
+                    marginBottom: 6,
+                    textTransform: "uppercase",
+                  }}
+                >
+                  Changes Detected
+                </Text>
+                <Text
+                  style={{
+                    color: "#FFF",
+                    fontSize: 24,
+                    fontWeight: "900",
+                    marginBottom: 6,
+                  }}
+                >
+                  Review Template Changes
+                </Text>
+                <Text
+                  style={{
+                    color: "#A1A1A6",
+                    fontSize: 14,
+                    fontWeight: "800",
+                    lineHeight: 20,
+                  }}
+                >
+                  {getTemplateReviewSummary(templateDecisionAlert.changes)}
+                </Text>
+              </View>
+              <TouchableOpacity
+                onPress={() => {
+                  setTemplateDecisionAlert((prev) => ({
+                    ...prev,
+                    visible: false,
+                  }));
+                  finishWorkoutInFlightRef.current = false;
+                  setIsFinishing(false);
+                }}
+                style={{
+                  width: 38,
+                  height: 38,
+                  borderRadius: 19,
+                  backgroundColor: "#2C2C2E",
+                  alignItems: "center",
+                  justifyContent: "center",
+                }}
+              >
+                <Ionicons name="close" size={20} color="#A1A1A6" />
+              </TouchableOpacity>
+            </View>
+
+            <ScrollView
+              showsVerticalScrollIndicator={false}
+              keyboardShouldPersistTaps="handled"
+              style={{ maxHeight: Math.min(windowHeight * 0.58, 560) }}
+              contentContainerStyle={{ paddingBottom: 12, gap: 12 }}
+            >
+              <View
+                style={{
+                  backgroundColor: "#111113",
+                  borderRadius: 18,
+                  borderWidth: 1,
+                  borderColor: templateDecisionAlert.createNewTemplate
+                    ? "#32D74B"
+                    : "#2C2C2E",
+                  padding: 14,
+                }}
+              >
+                <TouchableOpacity
+                  activeOpacity={0.86}
+                  onPress={() => {
+                    Haptics.selectionAsync();
+                    setTemplateDecisionAlert((prev) => {
+                      const nextCreateNew = !prev.createNewTemplate;
+                      return {
+                        ...prev,
+                        createNewTemplate: nextCreateNew,
+                        newTemplateName:
+                          nextCreateNew && !prev.newTemplateName
+                            ? limitText(
+                                getSuggestedNewTemplateName(),
+                                LIMITS.nameChars,
+                              )
+                            : prev.newTemplateName,
+                        newTemplateNameError: "",
+                      };
+                    });
+                  }}
+                  style={{
+                    flexDirection: "row",
+                    alignItems: "center",
+                    gap: 12,
+                  }}
+                >
+                  <View
+                    style={{
+                      width: 38,
+                      height: 38,
+                      borderRadius: 19,
+                      backgroundColor: templateDecisionAlert.createNewTemplate
+                        ? "#32D74B"
+                        : "#2C2C2E",
+                      alignItems: "center",
+                      justifyContent: "center",
+                    }}
+                  >
+                    <Ionicons
+                      name={
+                        templateDecisionAlert.createNewTemplate
+                          ? "checkmark"
+                          : "copy-outline"
+                      }
+                      size={20}
+                      color={
+                        templateDecisionAlert.createNewTemplate
+                          ? "#000"
+                          : "#32D74B"
+                      }
+                    />
+                  </View>
+                  <View style={{ flex: 1 }}>
+                    <Text
+                      style={{
+                        color: "#FFF",
+                        fontSize: 17,
+                        fontWeight: "900",
+                      }}
+                    >
+                      Create New Template
+                    </Text>
+                    <Text
+                      style={{
+                        color: "#8E8E93",
+                        fontSize: 12,
+                        fontWeight: "800",
+                        lineHeight: 17,
+                        marginTop: 3,
+                      }}
+                    >
+                      Save this finished workout as a separate template.
+                    </Text>
+                  </View>
+                </TouchableOpacity>
+
+                {templateDecisionAlert.createNewTemplate && (
+                  <View style={{ marginTop: 14 }}>
+                    <TextInput
+                      value={templateDecisionAlert.newTemplateName}
+                      onChangeText={(text) =>
+                        setTemplateDecisionAlert((prev) => ({
+                          ...prev,
+                          newTemplateName: limitText(text, LIMITS.nameChars),
+                          newTemplateNameError: "",
+                        }))
+                      }
+                      maxLength={LIMITS.nameChars}
+                      placeholder="Template name"
+                      placeholderTextColor="#6B7280"
+                      selectTextOnFocus
+                      style={{
+                        minHeight: 50,
+                        borderRadius: 16,
+                        borderWidth: 1,
+                        borderColor: templateDecisionAlert.newTemplateNameError
+                          ? "#FF453A"
+                          : "#3A3A3C",
+                        backgroundColor: "#1C1C1E",
+                        color: "#FFFFFF",
+                        paddingHorizontal: 14,
+                        fontSize: 15,
+                        fontWeight: "800",
+                      }}
+                      returnKeyType="done"
+                    />
+                    {!!templateDecisionAlert.newTemplateNameError && (
+                      <Text
+                        style={{
+                          color: "#FF453A",
+                          fontSize: 12,
+                          fontWeight: "800",
+                          marginTop: 8,
+                        }}
+                      >
+                        {templateDecisionAlert.newTemplateNameError}
+                      </Text>
+                    )}
+                  </View>
+                )}
+              </View>
+
+              {templateDecisionAlert.changes.map((change) => {
+                const options = getTemplateChangeOptions(change);
+                const selectedGymName =
+                  gyms.find((gym) => gym.id === selectedGymId)?.name ||
+                  "this gym";
+                const showOtherGymSwapNotice =
+                  change.hasOtherGymSwaps &&
+                  change.choice === "updateTemplate" &&
+                  change.type === "replaced";
+                const showRemoveSwapNotice =
+                  change.hasOtherGymSwaps &&
+                  change.choice === "updateTemplate" &&
+                  change.type === "deleted";
+
+                return (
+                  <View
+                    key={change.id}
+                    style={{
+                      backgroundColor: "#111113",
+                      borderRadius: 18,
+                      borderWidth: 1,
+                      borderColor: "#2C2C2E",
+                      padding: 14,
+                    }}
+                  >
+                    <View
+                      style={{
+                        flexDirection: "row",
+                        alignItems: "flex-start",
+                        gap: 12,
+                        marginBottom: 12,
+                      }}
+                    >
+                      <View
+                        style={{
+                          width: 38,
+                          height: 38,
+                          borderRadius: 19,
+                          backgroundColor:
+                            change.type === "deleted"
+                              ? "rgba(255,69,58,0.16)"
+                              : "rgba(50,215,75,0.14)",
+                          alignItems: "center",
+                          justifyContent: "center",
+                        }}
+                      >
+                        <Ionicons
+                          name={
+                            change.type === "added"
+                              ? "add"
+                              : change.type === "deleted"
+                                ? "remove"
+                                : change.type === "name"
+                                  ? "create-outline"
+                                  : change.type === "variant"
+                                    ? "options-outline"
+                                    : "swap-horizontal"
+                          }
+                          size={20}
+                          color={change.type === "deleted" ? "#FF453A" : "#32D74B"}
+                        />
+                      </View>
+                      <View style={{ flex: 1 }}>
+                        <Text
+                          style={{
+                            color:
+                              change.type === "deleted" ? "#FF453A" : "#32D74B",
+                            fontSize: 12,
+                            fontWeight: "900",
+                            letterSpacing: 0,
+                            marginBottom: 4,
+                          }}
+                        >
+                          {getTemplateChangeKicker(change)}
+                        </Text>
+                        {change.type === "replaced" && (
+                          <Text
+                            style={{
+                              color: "#8E8E93",
+                              fontSize: 14,
+                              fontWeight: "800",
+                              lineHeight: 19,
+                              marginBottom: 4,
+                            }}
+                            numberOfLines={2}
+                          >
+                            {change.originalExercise
+                              ? formatExerciseDisplayName(change.originalExercise)
+                              : "Template exercise"}
+                          </Text>
+                        )}
+                        {change.type === "replaced" && (
+                          <View
+                            style={{
+                              flexDirection: "row",
+                              alignItems: "center",
+                              gap: 5,
+                              marginBottom: 4,
+                            }}
+                          >
+                            <Ionicons
+                              name="arrow-down"
+                              size={13}
+                              color="#32D74B"
+                            />
+                            <Text
+                              style={{
+                                color: "#32D74B",
+                                fontSize: 11,
+                                fontWeight: "900",
+                                textTransform: "uppercase",
+                              }}
+                            >
+                              Changed to
+                            </Text>
+                          </View>
+                        )}
+                        <Text
+                          style={{
+                            color: "#FFF",
+                            fontSize: 18,
+                            fontWeight: "900",
+                            lineHeight: 23,
+                          }}
+                          numberOfLines={3}
+                          adjustsFontSizeToFit
+                          minimumFontScale={0.82}
+                        >
+                          {getTemplateChangeTitle(change)}
+                        </Text>
+                        <Text
+                          style={{
+                            color: "#8E8E93",
+                            fontSize: 13,
+                            fontWeight: "800",
+                            marginTop: 4,
+                          }}
+                        >
+                          {getTemplateChangeSubtitle(change)}
+                        </Text>
+                      </View>
+                    </View>
+
+                    <View
+                      style={{
+                        flexDirection: "row",
+                        flexWrap: "wrap",
+                        gap: 8,
+                      }}
+                    >
+                      {options.map((option) => {
+                        const isSelected = change.choice === option.value;
+                        return (
+                          <TouchableOpacity
+                            key={option.value}
+                            onPress={() => {
+                              Haptics.selectionAsync();
+                              updateTemplateChangeChoice(change.id, option.value);
+                            }}
+                            style={{
+                              minHeight: 38,
+                              borderRadius: 19,
+                              paddingHorizontal: 13,
+                              alignItems: "center",
+                              justifyContent: "center",
+                              backgroundColor: isSelected
+                                ? "#32D74B"
+                                : "#1C1C1E",
+                              borderWidth: 1,
+                              borderColor: isSelected ? "#32D74B" : "#3A3A3C",
+                            }}
+                          >
+                            <Text
+                              style={{
+                                color: isSelected ? "#000" : "#A1A1A6",
+                                fontSize: 13,
+                                fontWeight: "900",
+                              }}
+                              numberOfLines={1}
+                            >
+                              {option.label}
+                            </Text>
+                          </TouchableOpacity>
+                        );
+                      })}
+                    </View>
+
+                    {change.choice === "gymSwap" && (
+                      <Text
+                        style={{
+                          color: "#32D74B",
+                          fontSize: 12,
+                          fontWeight: "800",
+                          lineHeight: 18,
+                          marginTop: 10,
+                        }}
+                      >
+                        Saves this replacement only for {selectedGymName}.
+                      </Text>
+                    )}
+                    {showOtherGymSwapNotice && (
+                      <Text
+                        style={{
+                          color: "#FFD60A",
+                          fontSize: 12,
+                          fontWeight: "800",
+                          lineHeight: 18,
+                          marginTop: 10,
+                        }}
+                      >
+                        Other gym swaps for this exercise stay saved.
+                      </Text>
+                    )}
+                    {showRemoveSwapNotice && (
+                      <Text
+                        style={{
+                          color: "#FFD60A",
+                          fontSize: 12,
+                          fontWeight: "800",
+                          lineHeight: 18,
+                          marginTop: 10,
+                        }}
+                      >
+                        Removing this exercise also removes its gym swaps.
+                      </Text>
+                    )}
+                  </View>
+                );
+              })}
+            </ScrollView>
+
+            <View style={{ flexDirection: "row", gap: 10, marginTop: 12 }}>
+              <TouchableOpacity
+                onPress={() => {
+                  setTemplateDecisionAlert((prev) => ({
+                    ...prev,
+                    visible: false,
+                  }));
+                  finishWorkoutInFlightRef.current = false;
+                  setIsFinishing(false);
+                }}
+                style={{
+                  flex: 1,
+                  minHeight: 52,
+                  borderRadius: 18,
+                  backgroundColor: "#2C2C2E",
+                  alignItems: "center",
+                  justifyContent: "center",
+                }}
+              >
+                <Text style={{ color: "#A1A1A6", fontSize: 16, fontWeight: "900" }}>
+                  Cancel
+                </Text>
+              </TouchableOpacity>
+              <TouchableOpacity
+                disabled={isFinishing}
+                onPress={() => {
+                  confirmTemplateDecisionChoices();
+                }}
+                style={{
+                  flex: 1.45,
+                  minHeight: 52,
+                  borderRadius: 18,
+                  backgroundColor: isFinishing ? "#1F8F35" : "#32D74B",
+                  alignItems: "center",
+                  justifyContent: "center",
+                }}
+              >
+                <Text style={{ color: "#000", fontSize: 16, fontWeight: "900" }}>
+                  Confirm Choices
+                </Text>
+              </TouchableOpacity>
+            </View>
+          </View>
+        </KeyboardAvoidingView>
+      </Modal>
       <CustomAlert
         visible={removeSetAlert.visible}
         title="Remove Set"
@@ -1926,6 +4674,7 @@ export default function WorkoutScreen({ navigation, route }: any) {
                 {gyms.map((gym) => (
                   <TouchableOpacity
                     key={gym.id}
+                    disabled={isPreFlightConfirming}
                     style={{
                       padding: 16,
                       backgroundColor:
@@ -1964,106 +4713,29 @@ export default function WorkoutScreen({ navigation, route }: any) {
                 borderRadius: 12,
                 alignItems: "center",
                 marginBottom: 12,
+                opacity: isPreFlightConfirming ? 0.8 : 1,
               }}
-              onPress={async () => {
-                Haptics.notificationAsync(
-                  Haptics.NotificationFeedbackType.Success,
-                );
-                setIsPreFlightVisible(false);
-
-                if (!startTimeMs) {
-                  const startMs = Date.now();
-                  setStartTimeMs(startMs);
-                  await AsyncStorage.setItem(
-                    `@active_workout_start_${uid}`,
-                    startMs.toString(),
-                  );
-                }
-
-                if (selectedGymId) {
-                  await AsyncStorage.setItem(
-                    `@last_used_gym_${uid}`,
-                    selectedGymId,
-                  );
-                }
-
-                const selectedGym = gyms.find((g) => g.id === selectedGymId);
-                const newGymVariants = selectedGym?.variants || [];
-                const defaultMachineBrand =
-                  selectedGym?.defaultMachineBrand || null;
-                const allowed = new Set([
-                  ...DEFAULT_VARIANTS,
-                  ...globalVariants,
-                  ...newGymVariants,
-                ]);
-
-                const updated = await Promise.all(
-                  exercises.map(async (ex) => {
-                    let tempEx = { ...ex };
-
-                    if (!isMachineBrandApplicable(tempEx)) {
-                      delete tempEx.equipmentTag;
-                      delete tempEx.machineBrand;
-                      return tempEx;
-                    }
-
-                    let historicalTag = null;
-                    const historyRaw = await AsyncStorage.getItem(
-                      `@workout_history_${uid}`,
-                    );
-                    if (historyRaw && selectedGymId) {
-                      const historyList = JSON.parse(historyRaw)
-                        .filter((w: any) => w.gymId === selectedGymId)
-                        .sort(
-                          (a: any, b: any) => parseInt(b.id) - parseInt(a.id),
-                        );
-                      for (const pastWorkout of historyList) {
-                        const pastEx = pastWorkout.fullWorkoutData?.find(
-                          (e: any) => e.name === ex.name,
-                        );
-                        if (
-                          pastEx &&
-                          isMachineBrandApplicable(pastEx) &&
-                          pastEx.equipmentTag
-                        ) {
-                          historicalTag = pastEx.equipmentTag;
-                          break;
-                        }
-                      }
-                    }
-
-                    // When changing gyms, do not carry over the machine tag from
-                    // the previous gym. Use this gym's saved/manual tag for the
-                    // exercise if it exists in history; otherwise fall back to the
-                    // gym default machine brand. This keeps gym-specific machines
-                    // separate while still respecting tags manually used at this gym.
-                    if (historicalTag && allowed.has(historicalTag)) {
-                      tempEx.equipmentTag = historicalTag;
-                    } else if (
-                      defaultMachineBrand &&
-                      allowed.has(defaultMachineBrand)
-                    ) {
-                      tempEx.equipmentTag = defaultMachineBrand;
-                    } else {
-                      delete tempEx.equipmentTag;
-                    }
-
-                    return tempEx;
-                  }),
-                );
-
-                setExercises(updated);
-                if (isChangingLocation) setHasUnsavedChanges(true);
-                setIsChangingLocation(false);
-              }}
+              disabled={isPreFlightConfirming}
+              onPress={handleConfirmPreFlight}
             >
-              <Text style={{ color: "#000", fontSize: 18, fontWeight: "900" }}>
-                Confirm
-              </Text>
+              {isPreFlightConfirming ? (
+                <ActivityIndicator color="#000" size="small" />
+              ) : (
+                <Text
+                  style={{ color: "#000", fontSize: 18, fontWeight: "900" }}
+                >
+                  Confirm
+                </Text>
+              )}
             </TouchableOpacity>
 
             <TouchableOpacity
-              style={{ alignItems: "center", paddingVertical: 10 }}
+              style={{
+                alignItems: "center",
+                paddingVertical: 10,
+                opacity: isPreFlightConfirming ? 0.45 : 1,
+              }}
+              disabled={isPreFlightConfirming}
               onPress={() => {
                 if (isChangingLocation) {
                   setIsPreFlightVisible(false);
@@ -2107,23 +4779,66 @@ export default function WorkoutScreen({ navigation, route }: any) {
               { justifyContent: "center", alignItems: "center" },
             ]}
           >
-            <TextInput
-              style={[
-                styles.headerTitleInput,
-                { flex: 0, height: "auto", fontSize: 17, marginBottom: 6 },
-              ]}
-              value={workoutName}
-              editable={isEditable && !isReorderMode}
-              onChangeText={(t) => {
-                setWorkoutName(t);
-                setHasUnsavedChanges(true);
+            <View
+              style={{
+                width: "100%",
+                minHeight: isEditable && !isReorderMode ? 34 : undefined,
+                alignItems: "center",
+                justifyContent: "center",
+                backgroundColor:
+                  isEditable && !isReorderMode ? "#1C1C1E" : "transparent",
+                borderWidth: isEditable && !isReorderMode ? 1 : 0,
+                borderColor: "#2C2C2E",
+                borderRadius: 17,
+                paddingHorizontal: isEditable && !isReorderMode ? 10 : 0,
+                marginBottom: 6,
               }}
-              placeholder="Workout Name"
-              placeholderTextColor="#48484A"
-              selectTextOnFocus
-              textAlign="center"
-              selectionColor="#FFF"
-            />
+            >
+              {isEditable && !isReorderMode && (
+                <TouchableOpacity
+                  style={{
+                    position: "absolute",
+                    left: 10,
+                    width: 22,
+                    height: 26,
+                    alignItems: "center",
+                    justifyContent: "center",
+                  }}
+                  activeOpacity={0.75}
+                  onPress={() => workoutNameInputRef.current?.focus()}
+                  hitSlop={{ top: 6, right: 6, bottom: 6, left: 6 }}
+                >
+                  <Ionicons name="create-outline" size={15} color="#8E8E93" />
+                </TouchableOpacity>
+              )}
+              <TextInput
+                ref={workoutNameInputRef}
+                style={[
+                  styles.headerTitleInput,
+                  {
+                    flex: 0,
+                    width: "100%",
+                    height: "auto",
+                    fontSize: 17,
+                    padding: 0,
+                    paddingHorizontal: isEditable && !isReorderMode ? 36 : 0,
+                    textAlign: "center",
+                  },
+                ]}
+                value={workoutName}
+                editable={isEditable && !isReorderMode}
+                onChangeText={(t) => {
+                  setWorkoutName(limitText(t, LIMITS.nameChars));
+                  setHasUnsavedChanges(true);
+                }}
+                maxLength={LIMITS.nameChars}
+                placeholder="Workout Name"
+                placeholderTextColor="#48484A"
+                selectTextOnFocus
+                textAlign="center"
+                selectionColor="#FFF"
+              />
+            </View>
             {!isEditing && (
               <View
                 style={{
@@ -2223,7 +4938,24 @@ export default function WorkoutScreen({ navigation, route }: any) {
           activeOpacity={1}
           onPress={() => setIsSessionMenuVisible(false)}
         >
-          <TouchableOpacity activeOpacity={1} style={styles.actionMenuContent}>
+          <TouchableOpacity
+            activeOpacity={1}
+            style={[
+              styles.actionMenuContent,
+              {
+                maxHeight: Math.max(
+                  360,
+                  windowHeight - insets.top - insets.bottom - 32,
+                ),
+              },
+            ]}
+          >
+            <ScrollView
+              style={{ width: "100%" }}
+              contentContainerStyle={{ alignItems: "center" }}
+              showsVerticalScrollIndicator={false}
+              keyboardShouldPersistTaps="handled"
+            >
             <Text style={styles.actionMenuTitle}>Session Options</Text>
             <Text style={styles.actionMenuSubtitle} numberOfLines={1}>
               {workoutName} · {selectedGymName}
@@ -2314,53 +5046,91 @@ export default function WorkoutScreen({ navigation, route }: any) {
               </View>
             )}
 
+            {!isEditing &&
+              sessionRestEnabled &&
+              renderRestDurationControls(
+                "Working Rest",
+                sessionRestDuration,
+                updateSessionRestDuration,
+              )}
+
             {!isEditing && sessionRestEnabled && (
-              <View style={styles.restDurationRow}>
-                <Text style={styles.restDurationLabel}>Duration</Text>
-                <View style={styles.restDurationStepper}>
-                  <TouchableOpacity
-                    onPress={() => {
-                      Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
-                      setSessionRestDuration(
-                        String(
-                          Math.max(
-                            0,
-                            parseInt(sessionRestDuration || "0") - 10,
-                          ),
-                        ),
-                      );
-                    }}
-                    style={styles.restDurationStepButton}
-                  >
-                    <Text style={styles.restDurationStepText}>−</Text>
-                  </TouchableOpacity>
-                  <Text style={styles.restDurationValue}>
-                    {sessionRestDuration}s
-                  </Text>
-                  <TouchableOpacity
-                    onPress={() => {
-                      Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
-                      setSessionRestDuration(
-                        String(parseInt(sessionRestDuration || "0") + 10),
-                      );
-                    }}
-                    style={styles.restDurationStepButton}
-                  >
-                    <Text style={styles.restDurationStepText}>+</Text>
-                  </TouchableOpacity>
+              <View style={styles.actionSheetRow}>
+                <View style={styles.actionSheetIconCircle}>
+                  <Ionicons
+                    name="flame-outline"
+                    size={20}
+                    color="#32D74B"
+                  />
                 </View>
+                <View style={styles.actionSheetTextBlock}>
+                  <Text style={styles.actionSheetRowTitle}>Warm-up Rest</Text>
+                  <Text style={styles.actionSheetRowSubtitle}>
+                    Use a separate timer after warm-up sets
+                  </Text>
+                </View>
+                <TouchableOpacity
+                  style={[
+                    styles.compactTogglePill,
+                    {
+                      backgroundColor: sessionWarmupRestEnabled
+                        ? "#32D74B"
+                        : "#3A3A3C",
+                    },
+                  ]}
+                  onPress={toggleSessionWarmupRestTimer}
+                >
+                  <Text
+                    style={[
+                      styles.compactToggleText,
+                      { color: sessionWarmupRestEnabled ? "#000" : "#FFF" },
+                    ]}
+                  >
+                    {sessionWarmupRestEnabled ? "ON" : "OFF"}
+                  </Text>
+                </TouchableOpacity>
               </View>
             )}
+
+            {!isEditing &&
+              sessionRestEnabled &&
+              sessionWarmupRestEnabled &&
+              renderRestDurationControls(
+                "Warm-up Rest",
+                sessionWarmupRestDuration,
+                updateSessionWarmupRestDuration,
+                WARMUP_REST_TIMER_PRESETS,
+              )}
 
             <TouchableOpacity
               style={styles.actionMenuBtnCancel}
               onPress={() => setIsSessionMenuVisible(false)}
             >
-              <Text style={styles.actionMenuBtnTextCancel}>Cancel</Text>
+              <Text style={styles.actionMenuBtnTextCancel}>Close</Text>
             </TouchableOpacity>
+            </ScrollView>
           </TouchableOpacity>
         </TouchableOpacity>
       </Modal>
+
+      <CustomAttachmentModal
+        visible={customAttachmentModal.visible}
+        value={customAttachmentModal.value}
+        error={customAttachmentModal.error}
+        customAttachments={customAttachments}
+        editingAttachment={customAttachmentModal.editingAttachment}
+        onChangeText={(value) =>
+          setCustomAttachmentModal((prev) => ({
+            ...prev,
+            value,
+            error: "",
+          }))
+        }
+        onCancel={closeCustomAttachmentModal}
+        onSave={saveCustomAttachmentForExercise}
+        onEditAttachment={editCustomAttachment}
+        onDeleteAttachment={deleteCustomAttachment}
+      />
 
       <Modal visible={isReorderModalVisible} transparent animationType="fade">
         <GestureHandlerRootView style={{ flex: 1 }}>
@@ -2727,7 +5497,10 @@ export default function WorkoutScreen({ navigation, route }: any) {
             </Text>
             <TextInput
               value={templateNameInput}
-              onChangeText={setTemplateNameInput}
+              onChangeText={(t) =>
+                setTemplateNameInput(limitText(t, LIMITS.nameChars))
+              }
+              maxLength={LIMITS.nameChars}
               placeholder="Template name"
               placeholderTextColor="#6B7280"
               autoFocus
@@ -2791,15 +5564,6 @@ export default function WorkoutScreen({ navigation, route }: any) {
             const data = getSummaryData();
             if (!data) return null;
 
-            const formatShareVolume = (value: number) => {
-              const rounded = Math.round(value || 0);
-              if (rounded >= 1000) {
-                const compact = rounded / 1000;
-                return `${compact % 1 === 0 ? compact.toFixed(0) : compact.toFixed(1)}k`;
-              }
-              return `${rounded}`;
-            };
-
             const formatFullVolume = (value: number) => {
               const rounded = Math.round(value || 0);
               return rounded.toLocaleString();
@@ -2823,11 +5587,16 @@ export default function WorkoutScreen({ navigation, route }: any) {
               return `${set.reps || 0}`;
             };
 
+            const formatSummaryWeight = (value: number) => {
+              if (!Number.isFinite(value)) return "0";
+              return Number.isInteger(value)
+                ? value.toFixed(0)
+                : value.toFixed(2);
+            };
+
             const formatBestSet = (ex: any, set: any) => {
               const weight = parseFloat(set.weight || "0") || 0;
-              const weightLabel = Number.isInteger(weight)
-                ? weight.toFixed(0)
-                : weight.toFixed(1);
+              const weightLabel = formatSummaryWeight(weight);
               return `${weightLabel}${isKg ? "kg" : "lbs"} × ${getSetRepsLabel(ex, set)}`;
             };
 
@@ -2869,15 +5638,23 @@ export default function WorkoutScreen({ navigation, route }: any) {
             );
 
             const topSets = rankedTopSets.slice(0, 5);
-            const shareTopSets = rankedTopSets.slice(0, 3);
-
             const exerciseBreakdown = data.exercises.map((ex: any) => {
               const completedSets = ex.sets || [];
-              const bestSet = completedSets
-                .slice()
-                .sort(
-                  (a: any, b: any) => getSetVolume(ex, b) - getSetVolume(ex, a),
-                )[0];
+              const bestSet = completedSets.slice().sort((a: any, b: any) => {
+                const strengthDiff =
+                  getSetStrengthScore(ex, b) - getSetStrengthScore(ex, a);
+                if (strengthDiff !== 0) return strengthDiff;
+
+                const weightDiff =
+                  (parseFloat(b?.weight || "0") || 0) -
+                  (parseFloat(a?.weight || "0") || 0);
+                if (weightDiff !== 0) return weightDiff;
+
+                return (
+                  getSetRepsForStrengthScore(ex, b) -
+                  getSetRepsForStrengthScore(ex, a)
+                );
+              })[0];
               const totalExerciseVolume = completedSets.reduce(
                 (sum: number, set: any) => sum + getSetVolume(ex, set),
                 0,
@@ -2890,7 +5667,6 @@ export default function WorkoutScreen({ navigation, route }: any) {
               };
             });
 
-            const exercisePreview = data.exercises.slice(0, 6);
             const summaryPRGroups = getGroupedWorkoutPRs(
               Array.isArray(data.prs) ? data.prs : [],
               4,
@@ -2924,14 +5700,20 @@ export default function WorkoutScreen({ navigation, route }: any) {
 
             const ShareCard = ({ capture = false }: { capture?: boolean }) => {
               const unitLabel = isKg ? "kg" : "lbs";
-              const statItems = [
-                {
-                  label: "Volume",
-                  value: `${formatFullVolume(data.volume)} ${unitLabel.toUpperCase()}`,
-                },
-                { label: "Exercises", value: `${data.exercises.length}` },
-                { label: "Sets", value: `${data.totalSets}` },
-              ];
+              const visibleExerciseLimit = 6;
+
+              const getSetWeight = (set: any) =>
+                parseFloat(set?.weight || "0") || 0;
+
+              const getDisplayRepCount = (ex: any, set: any) => {
+                if (ex.is_unilateral) {
+                  return (
+                    (parseInt(set?.repsL || "0") || 0) +
+                    (parseInt(set?.repsR || "0") || 0)
+                  );
+                }
+                return parseInt(set?.reps || "0") || 0;
+              };
 
               const getBestStrengthSetForExercise = (ex: any) => {
                 const completedSets = Array.isArray(ex.sets) ? ex.sets : [];
@@ -2939,82 +5721,53 @@ export default function WorkoutScreen({ navigation, route }: any) {
                   const strengthDiff =
                     getSetStrengthScore(ex, b) - getSetStrengthScore(ex, a);
                   if (strengthDiff !== 0) return strengthDiff;
-                  return getSetVolume(ex, b) - getSetVolume(ex, a);
+
+                  const weightDiff = getSetWeight(b) - getSetWeight(a);
+                  if (weightDiff !== 0) return weightDiff;
+
+                  return (
+                    getSetRepsForStrengthScore(ex, b) -
+                    getSetRepsForStrengthScore(ex, a)
+                  );
                 })[0];
               };
 
-              const exerciseSetGroups = data.exercises
+              const exerciseBreakdownRows = data.exercises
                 .map((ex: any) => {
                   const completedSets = Array.isArray(ex.sets) ? ex.sets : [];
                   const bestSet = getBestStrengthSetForExercise(ex);
+                  const totalExerciseVolume = completedSets.reduce(
+                    (sum: number, set: any) => sum + getSetVolume(ex, set),
+                    0,
+                  );
+                  const totalExerciseReps = completedSets.reduce(
+                    (sum: number, set: any) =>
+                      sum + getDisplayRepCount(ex, set),
+                    0,
+                  );
+
                   return {
                     name: formatExerciseDisplayName(ex),
-                    exercise: ex,
-                    sets: completedSets,
-                    bestSet,
-                    bestSetLabel: bestSet ? formatBestSet(ex, bestSet) : "—",
                     setCount: completedSets.length,
+                    repCount: totalExerciseReps,
+                    bestSetLabel: bestSet ? formatBestSet(ex, bestSet) : "—",
+                    volume: totalExerciseVolume,
                   };
                 })
                 .filter((item: any) => item.setCount > 0);
 
-              const exerciseCount = exerciseSetGroups.length;
-              const isSingleExercise = exerciseCount === 1;
-              const isDenseWorkout = exerciseCount >= 6;
-              const maxVisibleExercises =
-                exerciseCount >= 9 ? 8 : exerciseCount;
-              const visibleExerciseGroups = exerciseSetGroups.slice(
+              const totalReps = exerciseBreakdownRows.reduce(
+                (sum: number, item: any) => sum + item.repCount,
                 0,
-                maxVisibleExercises,
+              );
+              const visibleExerciseRows = exerciseBreakdownRows.slice(
+                0,
+                visibleExerciseLimit,
               );
               const hiddenExerciseCount = Math.max(
-                exerciseCount - visibleExerciseGroups.length,
+                exerciseBreakdownRows.length - visibleExerciseRows.length,
                 0,
               );
-              const setsPerExercise =
-                exerciseCount <= 3 ? 3 : exerciseCount <= 5 ? 2 : 1;
-              const singleExercise = isSingleExercise
-                ? exerciseSetGroups[0]
-                : null;
-              const singleSets = singleExercise ? singleExercise.sets : [];
-              const visibleSingleSets = singleSets.slice(0, 10);
-              const hiddenSingleSetCount = Math.max(
-                singleSets.length - visibleSingleSets.length,
-                0,
-              );
-
-              const getRangeLabel = (
-                items: any[],
-                mapper: (set: any) => number,
-              ) => {
-                const values = items
-                  .map(mapper)
-                  .filter(
-                    (value: number) => Number.isFinite(value) && value > 0,
-                  );
-                if (values.length === 0) return "—";
-                const min = Math.min(...values);
-                const max = Math.max(...values);
-                const format = (value: number) =>
-                  Number.isInteger(value) ? value.toFixed(0) : value.toFixed(1);
-                return min === max
-                  ? format(max)
-                  : `${format(min)}–${format(max)}`;
-              };
-
-              const singleWeightRange = singleExercise
-                ? `${getRangeLabel(singleSets, (set: any) => parseFloat(set.weight || "0") || 0)} ${unitLabel}`
-                : "—";
-              const singleRepRange = singleExercise
-                ? getRangeLabel(singleSets, (set: any) =>
-                    getSetRepsForStrengthScore(singleExercise.exercise, set),
-                  )
-                : "—";
-
-              const getVisibleSetsForGroup = (item: any) => {
-                if (isDenseWorkout) return item.bestSet ? [item.bestSet] : [];
-                return item.sets.slice(0, setsPerExercise);
-              };
 
               return (
                 <View
@@ -3022,7 +5775,6 @@ export default function WorkoutScreen({ navigation, route }: any) {
                     width: capture ? 380 : "100%",
                     maxWidth: 380,
                     minHeight: capture ? 0 : 520,
-                    maxHeight: 380 * (16 / 9),
                     backgroundColor: "#0B0B0D",
                     borderRadius: capture ? 0 : 30,
                     padding: 26,
@@ -3033,173 +5785,89 @@ export default function WorkoutScreen({ navigation, route }: any) {
                   collapsable={false}
                 >
                   <View>
-                    <View>
-                      <Text
-                        style={{
-                          color: "#FFFFFF",
-                          fontSize: 31,
-                          lineHeight: 35,
-                          fontWeight: "900",
-                          letterSpacing: -0.9,
-                        }}
-                        numberOfLines={2}
-                        adjustsFontSizeToFit
-                      >
-                        {data.name}
-                      </Text>
-                      <Text
-                        style={{
-                          color: "#8E8E93",
-                          fontSize: 13,
-                          fontWeight: "800",
-                          marginTop: 10,
-                        }}
-                        numberOfLines={1}
-                      >
-                        {data.date} · {data.duration}
-                      </Text>
-                    </View>
+                    <Text
+                      style={{
+                        color: "#FFFFFF",
+                        fontSize: 30,
+                        lineHeight: 35,
+                        fontWeight: "900",
+                        letterSpacing: -0.9,
+                      }}
+                      numberOfLines={2}
+                      adjustsFontSizeToFit
+                    >
+                      {data.name}
+                    </Text>
+                    <Text
+                      style={{
+                        color: "#8E8E93",
+                        fontSize: 13,
+                        fontWeight: "800",
+                        marginTop: 10,
+                      }}
+                      numberOfLines={1}
+                    >
+                      {data.date} | {data.duration}
+                    </Text>
 
                     <View
                       style={{
-                        flexDirection: "row",
                         marginTop: 24,
                         marginHorizontal: -5,
                       }}
                     >
-                      {statItems.map((item) => (
+                      {[
+                        [
+                          {
+                            label: "Total Volume",
+                            value: `${formatFullVolume(data.volume)} ${unitLabel}`,
+                          },
+                          { label: "Sets", value: `${data.totalSets}` },
+                        ],
+                        [
+                          { label: "Reps", value: `${totalReps}` },
+                          {
+                            label: "Exercises",
+                            value: `${exerciseBreakdownRows.length}`,
+                          },
+                        ],
+                      ].map((row, rowIndex) => (
                         <View
-                          key={item.label}
-                          style={{ flex: 1, paddingHorizontal: 5 }}
-                        >
-                          <View
-                            style={{
-                              backgroundColor: "rgba(28, 28, 30, 0.62)",
-                              borderRadius: 18,
-                              paddingVertical: 14,
-                              paddingHorizontal: 10,
-                              borderWidth: 1,
-                              borderColor: "rgba(255, 255, 255, 0.07)",
-                            }}
-                          >
-                            <Text
-                              style={{
-                                color: "#FFFFFF",
-                                fontSize: 16,
-                                fontWeight: "900",
-                                textAlign: "center",
-                              }}
-                              numberOfLines={1}
-                              adjustsFontSizeToFit
-                              minimumFontScale={0.7}
-                            >
-                              {item.value}
-                            </Text>
-                            <Text
-                              style={{
-                                color: "#8E8E93",
-                                fontSize: 9,
-                                fontWeight: "900",
-                                letterSpacing: 0.75,
-                                textTransform: "uppercase",
-                                marginTop: 6,
-                                textAlign: "center",
-                              }}
-                              numberOfLines={1}
-                            >
-                              {item.label}
-                            </Text>
-                          </View>
-                        </View>
-                      ))}
-                    </View>
-
-                    {isSingleExercise && singleExercise ? (
-                      <>
-                        <View
-                          style={{
-                            marginTop: 22,
-                            backgroundColor: "rgba(28, 28, 30, 0.58)",
-                            borderRadius: 22,
-                            padding: 17,
-                            borderWidth: 1,
-                            borderColor: "rgba(255, 255, 255, 0.08)",
-                          }}
-                        >
-                          <Text
-                            style={{
-                              color: "#8E8E93",
-                              fontSize: 10,
-                              fontWeight: "900",
-                              letterSpacing: 1,
-                              textTransform: "uppercase",
-                            }}
-                            numberOfLines={1}
-                          >
-                            Top Set
-                          </Text>
-                          <Text
-                            style={{
-                              color: "#FFFFFF",
-                              fontSize: 29,
-                              lineHeight: 34,
-                              fontWeight: "900",
-                              letterSpacing: -0.9,
-                              marginTop: 8,
-                            }}
-                            numberOfLines={1}
-                            adjustsFontSizeToFit
-                            minimumFontScale={0.75}
-                          >
-                            {singleExercise.bestSetLabel}
-                          </Text>
-                          <Text
-                            style={{
-                              color: "#8E8E93",
-                              fontSize: 13,
-                              fontWeight: "800",
-                              marginTop: 8,
-                            }}
-                            numberOfLines={1}
-                          >
-                            {singleExercise.name}
-                          </Text>
-                        </View>
-
-                        <View
+                          key={`share-stat-row-${rowIndex}`}
                           style={{
                             flexDirection: "row",
-                            marginTop: 12,
-                            marginHorizontal: -5,
+                            marginTop: rowIndex === 0 ? 0 : 10,
                           }}
                         >
-                          {[
-                            { label: "Weight Range", value: singleWeightRange },
-                            { label: "Rep Range", value: singleRepRange },
-                          ].map((item) => (
+                          {row.map((item) => (
                             <View
                               key={item.label}
                               style={{ flex: 1, paddingHorizontal: 5 }}
                             >
                               <View
                                 style={{
-                                  backgroundColor: "rgba(28, 28, 30, 0.46)",
-                                  borderRadius: 18,
-                                  paddingVertical: 13,
+                                  minHeight: 78,
+                                  justifyContent: "center",
+                                  backgroundColor: "rgba(28, 28, 30, 0.54)",
+                                  borderRadius: 20,
+                                  paddingVertical: 14,
                                   paddingHorizontal: 12,
                                   borderWidth: 1,
-                                  borderColor: "rgba(255, 255, 255, 0.065)",
+                                  borderColor: "rgba(255, 255, 255, 0.07)",
                                 }}
                               >
                                 <Text
                                   style={{
                                     color: "#FFFFFF",
-                                    fontSize: 16,
+                                    fontSize: 20,
+                                    lineHeight: 24,
                                     fontWeight: "900",
+                                    textAlign: "center",
+                                    letterSpacing: -0.35,
                                   }}
                                   numberOfLines={1}
                                   adjustsFontSizeToFit
-                                  minimumFontScale={0.76}
+                                  minimumFontScale={0.68}
                                 >
                                   {item.value}
                                 </Text>
@@ -3210,9 +5878,12 @@ export default function WorkoutScreen({ navigation, route }: any) {
                                     fontWeight: "900",
                                     letterSpacing: 0.75,
                                     textTransform: "uppercase",
-                                    marginTop: 5,
+                                    marginTop: 6,
+                                    textAlign: "center",
                                   }}
                                   numberOfLines={1}
+                                  adjustsFontSizeToFit
+                                  minimumFontScale={0.78}
                                 >
                                   {item.label}
                                 </Text>
@@ -3220,207 +5891,93 @@ export default function WorkoutScreen({ navigation, route }: any) {
                             </View>
                           ))}
                         </View>
+                      ))}
+                    </View>
 
+                    <View
+                      style={{
+                        marginTop: 22,
+                        backgroundColor: "rgba(28, 28, 30, 0.58)",
+                        borderRadius: 22,
+                        padding: 16,
+                        borderWidth: 1,
+                        borderColor: "rgba(255, 255, 255, 0.08)",
+                      }}
+                    >
+                      <Text
+                        style={{
+                          color: "#FFFFFF",
+                          fontSize: 14,
+                          fontWeight: "900",
+                          letterSpacing: 0.2,
+                          marginBottom: 10,
+                        }}
+                      >
+                        Exercise Breakdown
+                      </Text>
+
+                      {visibleExerciseRows.map((item: any, index: number) => (
                         <View
+                          key={`${item.name}-${index}`}
                           style={{
-                            marginTop: 16,
-                            backgroundColor: "rgba(28, 28, 30, 0.46)",
-                            borderRadius: 22,
-                            padding: 16,
-                            borderWidth: 1,
-                            borderColor: "rgba(255, 255, 255, 0.07)",
+                            paddingVertical: 9,
+                            borderTopWidth: index === 0 ? 0 : 1,
+                            borderTopColor: "rgba(255, 255, 255, 0.065)",
                           }}
                         >
                           <Text
                             style={{
                               color: "#FFFFFF",
-                              fontSize: 14,
+                              fontSize: 13,
                               fontWeight: "900",
-                              letterSpacing: 0.2,
-                              marginBottom: 10,
-                            }}
-                          >
-                            Working Sets
-                          </Text>
-
-                          {visibleSingleSets.map((set: any, index: number) => (
-                            <View
-                              key={`single-set-${index}`}
-                              style={{
-                                flexDirection: "row",
-                                alignItems: "center",
-                                paddingVertical: 6,
-                                borderTopWidth: index === 0 ? 0 : 1,
-                                borderTopColor: "rgba(255, 255, 255, 0.06)",
-                              }}
-                            >
-                              <Text
-                                style={{
-                                  color: "#8E8E93",
-                                  fontSize: 11,
-                                  fontWeight: "900",
-                                  width: 24,
-                                }}
-                              >
-                                {index + 1}
-                              </Text>
-                              <Text
-                                style={{
-                                  color: "#FFFFFF",
-                                  fontSize: 13,
-                                  fontWeight: "800",
-                                  flex: 1,
-                                }}
-                                numberOfLines={1}
-                              >
-                                {formatBestSet(singleExercise.exercise, set)}
-                              </Text>
-                            </View>
-                          ))}
-
-                          {hiddenSingleSetCount > 0 ? (
-                            <Text
-                              style={{
-                                color: "#8E8E93",
-                                fontSize: 12,
-                                fontWeight: "900",
-                                marginTop: 9,
-                              }}
-                              numberOfLines={1}
-                            >
-                              +{hiddenSingleSetCount} more set
-                              {hiddenSingleSetCount === 1 ? "" : "s"}
-                            </Text>
-                          ) : null}
-                        </View>
-                      </>
-                    ) : (
-                      <View
-                        style={{
-                          marginTop: 24,
-                          backgroundColor: "rgba(28, 28, 30, 0.58)",
-                          borderRadius: 22,
-                          padding: exerciseCount <= 5 ? 17 : 16,
-                          borderWidth: 1,
-                          borderColor: "rgba(255, 255, 255, 0.08)",
-                        }}
-                      >
-                        <Text
-                          style={{
-                            color: "#FFFFFF",
-                            fontSize: 14,
-                            fontWeight: "900",
-                            letterSpacing: 0.2,
-                            marginBottom: exerciseCount <= 5 ? 12 : 10,
-                          }}
-                        >
-                          Working Sets
-                        </Text>
-
-                        {visibleExerciseGroups.map(
-                          (item: any, index: number) => {
-                            const visibleSets = getVisibleSetsForGroup(item);
-                            const compact = exerciseCount >= 6;
-
-                            return (
-                              <View
-                                key={`${item.name}-${index}`}
-                                style={{
-                                  paddingVertical: compact ? 7 : 10,
-                                  borderTopWidth: index === 0 ? 0 : 1,
-                                  borderTopColor: "rgba(255, 255, 255, 0.065)",
-                                }}
-                              >
-                                <View
-                                  style={{
-                                    flexDirection: "row",
-                                    alignItems: "center",
-                                    marginBottom: compact ? 0 : 7,
-                                  }}
-                                >
-                                  <Text
-                                    style={{
-                                      color: "#FFFFFF",
-                                      fontSize: compact ? 12 : 13,
-                                      fontWeight: "900",
-                                      flex: 1,
-                                      paddingRight: 10,
-                                    }}
-                                    numberOfLines={1}
-                                  >
-                                    {item.name}
-                                  </Text>
-                                  {compact ? (
-                                    <Text
-                                      style={{
-                                        color: "#32D74B",
-                                        fontSize: 12,
-                                        fontWeight: "900",
-                                      }}
-                                      numberOfLines={1}
-                                      adjustsFontSizeToFit
-                                      minimumFontScale={0.78}
-                                    >
-                                      {item.bestSetLabel}
-                                    </Text>
-                                  ) : (
-                                    <Text
-                                      style={{
-                                        color: "#8E8E93",
-                                        fontSize: 10,
-                                        fontWeight: "900",
-                                      }}
-                                      numberOfLines={1}
-                                    >
-                                      {item.setCount} set
-                                      {item.setCount === 1 ? "" : "s"}
-                                    </Text>
-                                  )}
-                                </View>
-
-                                {!compact
-                                  ? visibleSets.map(
-                                      (set: any, setIndex: number) => (
-                                        <Text
-                                          key={`${item.name}-set-${setIndex}`}
-                                          style={{
-                                            color:
-                                              setIndex === 0
-                                                ? "#32D74B"
-                                                : "#D1D1D6",
-                                            fontSize: 12,
-                                            fontWeight:
-                                              setIndex === 0 ? "900" : "800",
-                                            lineHeight: 18,
-                                          }}
-                                          numberOfLines={1}
-                                        >
-                                          {formatBestSet(item.exercise, set)}
-                                        </Text>
-                                      ),
-                                    )
-                                  : null}
-                              </View>
-                            );
-                          },
-                        )}
-
-                        {hiddenExerciseCount > 0 ? (
-                          <Text
-                            style={{
-                              color: "#8E8E93",
-                              fontSize: 12,
-                              fontWeight: "900",
-                              marginTop: 10,
+                              lineHeight: 17,
                             }}
                             numberOfLines={1}
                           >
-                            +{hiddenExerciseCount} more exercise
-                            {hiddenExerciseCount === 1 ? "" : "s"}
+                            {item.name}
                           </Text>
-                        ) : null}
-                      </View>
-                    )}
+                          <Text
+                            style={{
+                              color: "#32D74B",
+                              fontSize: 12,
+                              fontWeight: "900",
+                              lineHeight: 18,
+                              marginTop: 3,
+                            }}
+                            numberOfLines={1}
+                          >
+                            Top {item.bestSetLabel}
+                          </Text>
+                          <Text
+                            style={{
+                              color: "#8E8E93",
+                              fontSize: 11,
+                              fontWeight: "800",
+                              lineHeight: 16,
+                            }}
+                            numberOfLines={1}
+                          >
+                            {item.setCount} set{item.setCount === 1 ? "" : "s"}{" "}
+                            · {formatFullVolume(item.volume)} {unitLabel} volume
+                          </Text>
+                        </View>
+                      ))}
+
+                      {hiddenExerciseCount > 0 ? (
+                        <Text
+                          style={{
+                            color: "#8E8E93",
+                            fontSize: 12,
+                            fontWeight: "900",
+                            marginTop: 10,
+                          }}
+                          numberOfLines={1}
+                        >
+                          +{hiddenExerciseCount} more exercise
+                          {hiddenExerciseCount === 1 ? "" : "s"}
+                        </Text>
+                      ) : null}
+                    </View>
                   </View>
                 </View>
               );
@@ -3776,9 +6333,7 @@ export default function WorkoutScreen({ navigation, route }: any) {
                                   }}
                                   numberOfLines={1}
                                 >
-                                  {Number.isInteger(set.weight)
-                                    ? set.weight.toFixed(0)
-                                    : set.weight.toFixed(1)}{" "}
+                                  {formatSummaryWeight(set.weight)}{" "}
                                   {isKg ? "kg" : "lbs"} × {set.repsLabel}
                                 </Text>
                               </View>
@@ -4084,13 +6639,24 @@ export default function WorkoutScreen({ navigation, route }: any) {
                   (set: any) => !!set.completed,
                 ).length;
 
-                const deleteExercise = () => {
+                const deleteExercise = async () => {
                   Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Heavy);
-                  setExercises((prev) =>
-                    prev.filter(
+                  const templateExerciseId =
+                    exerciseToDelete?.templateSwapSourceExerciseId ||
+                    exerciseToDelete?.templateBaseExercise?.id ||
+                    exerciseToDelete?.templateBaseExercise?.originalExerciseId ||
+                    null;
+                  const updatedExercises = cleanInvalidSupersets(
+                    exercises.filter(
                       (_: any, i: number) => i !== selectedExerciseIndex,
                     ),
                   );
+                  setExercises(updatedExercises);
+                  await removePendingGymReplacementUpdate({
+                    templateExerciseId,
+                    gymId: selectedGymId,
+                    snapshotExercises: updatedExercises,
+                  });
                   setIsExerciseMenuVisible(false);
                   setHasUnsavedChanges(true);
                 };
@@ -4382,34 +6948,57 @@ export default function WorkoutScreen({ navigation, route }: any) {
                         alignItems: "center",
                         marginBottom: 16,
                       }}
-                      onPress={async () => {
-                        Haptics.notificationAsync(
-                          Haptics.NotificationFeedbackType.Success,
-                        );
-                        const newVariant = tagSearchQuery.trim();
-                        const updatedGyms = gyms.map((g) =>
-                          g.id === selectedGymId
-                            ? {
-                                ...g,
-                                variants: [...(g.variants || []), newVariant],
-                              }
-                            : g,
-                        );
-                        setGyms(updatedGyms);
-                        await AsyncStorage.setItem(
-                          `@user_gyms_${uid}`,
-                          JSON.stringify(updatedGyms),
-                        );
-                        await syncGymsToCloud(updatedGyms);
-                        setExercises((prev) => {
-                          const up = [...prev];
-                          up[tagExIdx!].equipmentTag = newVariant;
-                          return up;
-                        });
-                        setHasUnsavedChanges(true);
-                        setIsTagModalVisible(false);
-                        setTagSearchQuery("");
-                      }}
+                      onPress={() =>
+                        runWorkoutBlockingAction(
+                          "Saving brand...",
+                          async () => {
+                            Haptics.notificationAsync(
+                              Haptics.NotificationFeedbackType.Success,
+                            );
+                            const newVariant = cleanLimitedText(
+                              tagSearchQuery,
+                              LIMITS.nameChars,
+                            );
+                            if (!newVariant) return;
+                            const updatedGyms = sanitizeGymsForStorage(
+                              gyms.map((g) =>
+                                g.id === selectedGymId
+                                  ? {
+                                      ...g,
+                                      variants: [
+                                        ...(Array.isArray(g.variants)
+                                          ? g.variants
+                                          : []),
+                                        newVariant,
+                                      ],
+                                    }
+                                  : g,
+                              ),
+                            );
+                            await clearGymVariantsDeletedLocally(
+                              String(selectedGymId || ""),
+                              [newVariant],
+                              uid,
+                            );
+                            setGyms(updatedGyms);
+                            await AsyncStorage.setItem(
+                              `@user_gyms_${uid}`,
+                              JSON.stringify(updatedGyms),
+                            );
+                            syncGymsToCloud(updatedGyms).catch((error) =>
+                              console.log("Gym brand cloud sync delayed:", error),
+                            );
+                            setExercises((prev) => {
+                              const up = [...prev];
+                              up[tagExIdx!].equipmentTag = newVariant;
+                              return up;
+                            });
+                            setHasUnsavedChanges(true);
+                            setIsTagModalVisible(false);
+                            setTagSearchQuery("");
+                          },
+                        )
+                      }
                     >
                       <Ionicons
                         name="add-circle"
@@ -4509,23 +7098,30 @@ export default function WorkoutScreen({ navigation, route }: any) {
                                     {
                                       text: "Delete",
                                       style: "destructive",
-                                      onPress: async () => {
-                                        const updatedGyms = gyms.map((g) =>
-                                          g.id === selectedGymId
-                                            ? {
-                                                ...g,
-                                                variants: g.variants.filter(
-                                                  (v: string) => v !== variant,
-                                                ),
-                                              }
-                                            : g,
+                                      onPress: () => {
+                                        const updatedGyms =
+                                          sanitizeGymsForStorage(
+                                            gyms.map((g) =>
+                                              g.id === selectedGymId
+                                                ? {
+                                                    ...g,
+                                                    variants: Array.isArray(
+                                                      g.variants,
+                                                    )
+                                                      ? g.variants.filter(
+                                                          (v: string) =>
+                                                            v !== variant,
+                                                        )
+                                                      : [],
+                                                  }
+                                                : g,
+                                            ),
+                                          );
+
+                                        Haptics.impactAsync(
+                                          Haptics.ImpactFeedbackStyle.Heavy,
                                         );
                                         setGyms(updatedGyms);
-                                        await AsyncStorage.setItem(
-                                          `@user_gyms_${uid}`,
-                                          JSON.stringify(updatedGyms),
-                                        );
-                                        await syncGymsToCloud(updatedGyms);
 
                                         if (
                                           exercises[tagExIdx || 0]
@@ -4537,6 +7133,33 @@ export default function WorkoutScreen({ navigation, route }: any) {
                                             return up;
                                           });
                                         }
+
+                                        Promise.resolve()
+                                          .then(async () => {
+                                            if (!uid) return;
+                                            await markGymVariantsDeletedLocally(
+                                              String(selectedGymId || ""),
+                                              [variant],
+                                              uid,
+                                            );
+                                            await AsyncStorage.setItem(
+                                              `@user_gyms_${uid}`,
+                                              JSON.stringify(updatedGyms),
+                                            );
+                                            syncGymsToCloud(updatedGyms).catch(
+                                              (error) =>
+                                                console.log(
+                                                  "Gym brand cloud sync delayed:",
+                                                  error,
+                                                ),
+                                            );
+                                          })
+                                          .catch((error) => {
+                                            console.log(
+                                              "Gym brand delete persistence delayed:",
+                                              error,
+                                            );
+                                          });
                                       },
                                     },
                                   ],
@@ -4586,7 +7209,8 @@ export default function WorkoutScreen({ navigation, route }: any) {
                 { textAlign: "left", minHeight: 80, fontSize: 16 },
               ]}
               value={currentRemark}
-              onChangeText={setCurrentRemark}
+              onChangeText={(t) => setCurrentRemark(limitText(t, LIMITS.noteChars))}
+              maxLength={LIMITS.noteChars}
               placeholder="e.g., Felt sick, lowered weight."
               placeholderTextColor="#48484A"
               selectionColor="#FFF"
@@ -4604,7 +7228,7 @@ export default function WorkoutScreen({ navigation, route }: any) {
                       const up = [...prev];
                       up[selectedExerciseIndex] = {
                         ...up[selectedExerciseIndex],
-                        remark: currentRemark.trim(),
+                        remark: cleanLimitedText(currentRemark, LIMITS.noteChars),
                       };
                       return up;
                     });
@@ -4838,10 +7462,16 @@ export default function WorkoutScreen({ navigation, route }: any) {
                           <Text style={{ color: "#32D74B", fontWeight: "800" }}>
                             {s.weight} {isKg ? "kg" : "lbs"} × {s.repsL}L /{" "}
                             {s.repsR}R
+                            {parseRpeValue(s.rpe) !== null
+                              ? ` · RPE ${formatRpeValue(s.rpe)}`
+                              : ""}
                           </Text>
                         ) : (
                           <Text style={{ color: "#32D74B", fontWeight: "800" }}>
                             {s.weight} {isKg ? "kg" : "lbs"} × {s.reps}
+                            {parseRpeValue(s.rpe) !== null
+                              ? ` · RPE ${formatRpeValue(s.rpe)}`
+                              : ""}
                           </Text>
                         )}
                       </View>
@@ -4897,7 +7527,7 @@ export default function WorkoutScreen({ navigation, route }: any) {
           keyExtractor={(item: any, index: number) => String(item.id || index)}
           contentContainerStyle={[
             styles.scrollContent,
-            !isEditable && { paddingBottom: 40 },
+            { paddingBottom: workoutListBottomPadding },
           ]}
           keyboardShouldPersistTaps="handled"
           keyboardDismissMode={
@@ -4948,8 +7578,7 @@ export default function WorkoutScreen({ navigation, route }: any) {
                       </TouchableOpacity>
                     )}
 
-                    {((!isEditing && isPlateCalcEnabled) ||
-                      (isEditable && exercises.length > 1)) && (
+                    {isEditable && workoutStats.hasAnySet && (
                       <TouchableOpacity
                         style={styles.workoutOverviewAction}
                         onPress={() => setIsSessionMenuVisible(true)}
@@ -5014,9 +7643,16 @@ export default function WorkoutScreen({ navigation, route }: any) {
               </View>
             </>
           }
-          renderItem={({ item: ex, getIndex, drag, isActive }) => {
+          renderItem={({ item: ex, getIndex, isActive }) => {
             const exIdx = getIndex() ?? 0;
             const exerciseVariationOptions = getExerciseVariationOptions(ex);
+            const exerciseAttachmentOptions =
+              getExerciseAttachmentOptionsWithCustom(ex, customAttachments);
+            const exerciseAttachmentSelectionOptions =
+              getExerciseAttachmentSelectionOptions(ex, customAttachments);
+            const nextSessionNote = nextSessionNotesEnabled
+              ? nextSessionNotes[getTemplateExerciseNoteKey(ex)] || ""
+              : "";
 
             const supersetInfo = getSupersetInfo(exercises, ex.supersetId);
             const supersetLabel = supersetInfo?.label || "A";
@@ -5152,6 +7788,98 @@ export default function WorkoutScreen({ navigation, route }: any) {
                                 </TouchableOpacity>
                               );
                             })}
+                          </ScrollView>
+                        )}
+
+                        {isEditable &&
+                          exerciseAttachmentSelectionOptions.length > 0 && (
+                          <ScrollView
+                            horizontal
+                            showsHorizontalScrollIndicator={false}
+                            contentContainerStyle={{
+                              paddingTop: 8,
+                              paddingRight: 12,
+                            }}
+                          >
+                            {exerciseAttachmentSelectionOptions.map((attachment) => {
+                              const isNoAttachment =
+                                attachment === NO_ATTACHMENT_OPTION_LABEL;
+                              const currentAttachment =
+                                getExerciseAttachmentForStorage(ex);
+                              const isActive = isNoAttachment
+                                ? !currentAttachment
+                                : currentAttachment === attachment;
+                              return (
+                                <TouchableOpacity
+                                  key={attachment}
+                                  style={{
+                                    paddingHorizontal: 10,
+                                    paddingVertical: 6,
+                                    borderRadius: 999,
+                                    marginRight: 8,
+                                    backgroundColor: isActive
+                                      ? "#32D74B"
+                                      : "#2C2C2E",
+                                    borderWidth: 1,
+                                    borderColor: isActive
+                                      ? "#32D74B"
+                                      : "#3A3A3C",
+                                  }}
+                                  onPress={() => {
+                                    Haptics.impactAsync(
+                                      Haptics.ImpactFeedbackStyle.Light,
+                                    );
+                                    setExercises((prev) => {
+                                      const up = [...prev];
+                                      up[exIdx] = {
+                                        ...up[exIdx],
+                                        attachment: isNoAttachment
+                                          ? ""
+                                          : attachment,
+                                        attachmentOptions:
+                                          exerciseAttachmentOptions,
+                                        supportsAttachments: true,
+                                      };
+                                      return up;
+                                    });
+                                    setHasUnsavedChanges(true);
+                                  }}
+                                >
+                                  <Text
+                                    style={{
+                                      color: isActive ? "#000" : "#D1D1D6",
+                                      fontSize: 11,
+                                      fontWeight: "900",
+                                    }}
+                                  >
+                                    {attachment}
+                                  </Text>
+                                </TouchableOpacity>
+                              );
+                            })}
+                            <TouchableOpacity
+                              key="custom-attachment"
+                              style={{
+                                paddingHorizontal: 10,
+                                paddingVertical: 6,
+                                borderRadius: 999,
+                                marginRight: 8,
+                                backgroundColor: "#111113",
+                                borderWidth: 1,
+                                borderColor: "#32D74B",
+                              }}
+                              onPress={() => openCustomAttachmentModal(exIdx)}
+                            >
+                              <Text
+                                style={{
+                                  color: "#32D74B",
+                                  fontSize: 11,
+                                  fontWeight: "900",
+                                }}
+                              >
+                                + Custom
+                              </Text>
+                            </TouchableOpacity>
                           </ScrollView>
                         )}
 
@@ -5300,6 +8028,55 @@ export default function WorkoutScreen({ navigation, route }: any) {
                     </View>
                   </View>
 
+                  {nextSessionNote ? (
+                    <View
+                      style={{
+                        marginBottom: 14,
+                        paddingHorizontal: 13,
+                        paddingVertical: 11,
+                        borderRadius: 14,
+                        backgroundColor: "rgba(50, 215, 75, 0.1)",
+                        borderWidth: 1,
+                        borderColor: "rgba(50, 215, 75, 0.24)",
+                      }}
+                    >
+                      <View
+                        style={{
+                          flexDirection: "row",
+                          alignItems: "center",
+                          marginBottom: 5,
+                        }}
+                      >
+                        <Ionicons
+                          name="document-text-outline"
+                          size={14}
+                          color="#32D74B"
+                          style={{ marginRight: 6 }}
+                        />
+                        <Text
+                          style={{
+                            color: "#32D74B",
+                            fontSize: 10,
+                            fontWeight: "900",
+                            letterSpacing: 1.2,
+                          }}
+                        >
+                          NEXT SESSION NOTE
+                        </Text>
+                      </View>
+                      <Text
+                        style={{
+                          color: "#D1D1D6",
+                          fontSize: 13,
+                          fontWeight: "700",
+                          lineHeight: 18,
+                        }}
+                      >
+                        {nextSessionNote}
+                      </Text>
+                    </View>
+                  ) : null}
+
                   {/* COLUMN HEADERS — gap:6 is the only spacing primitive.
                     No marginHorizontal on any cell. Flat siblings only.   */}
                   {ex.sets && ex.sets.length > 0 && (
@@ -5389,6 +8166,21 @@ export default function WorkoutScreen({ navigation, route }: any) {
                         </View>
                       )}
 
+                      {rpeTrackingEnabled && (
+                        <View style={{ flex: 0.65, alignItems: "center" }}>
+                          <Text
+                            style={{
+                              color: "#8E8E93",
+                              fontSize: 11,
+                              fontWeight: "700",
+                              textAlign: "center",
+                            }}
+                          >
+                            RPE
+                          </Text>
+                        </View>
+                      )}
+
                       <View style={{ flex: 0.5, alignItems: "center" }}>
                         <Text
                           style={{
@@ -5407,10 +8199,14 @@ export default function WorkoutScreen({ navigation, route }: any) {
                   {/* 🌟 COHESIVE 4-COLUMN INPUT BOX ROWS */}
                   {ex.sets &&
                     ex.sets.map((s: any, sIdx: number) => {
-                      const GAP = 4;
                       const workingSetNum = ex.sets
                         .slice(0, sIdx + 1)
                         .filter((set: any) => !set.isWarmup).length;
+                      const setTypeIndex =
+                        ex.sets
+                          .slice(0, sIdx + 1)
+                          .filter((set: any) => !!set.isWarmup === !!s.isWarmup)
+                          .length - 1;
                       return (
                         <View key={s.id} style={[styles.tableRow, { gap: 6 }]}>
                           {/* SET */}
@@ -5422,6 +8218,33 @@ export default function WorkoutScreen({ navigation, route }: any) {
                             }}
                             disabled={!isEditable}
                             onPress={() => {
+                              const targetIsWarmup = !s.isWarmup;
+                              const warmupSetCount = (ex.sets || []).filter(
+                                (set: any) => set.isWarmup,
+                              ).length;
+                              const workingSetCount = (ex.sets || []).filter(
+                                (set: any) => !set.isWarmup,
+                              ).length;
+                              if (
+                                targetIsWarmup &&
+                                warmupSetCount >= LIMITS.warmupSetsPerExercise
+                              ) {
+                                showInfo(
+                                  "Set Limit Reached",
+                                  "Each exercise can have up to 10 warm-up sets.",
+                                );
+                                return;
+                              }
+                              if (
+                                !targetIsWarmup &&
+                                workingSetCount >= LIMITS.workingSetsPerExercise
+                              ) {
+                                showInfo(
+                                  "Set Limit Reached",
+                                  "Each exercise can have up to 10 working sets.",
+                                );
+                                return;
+                              }
                               Haptics.selectionAsync();
                               setExercises((prev) => {
                                 const up = [...prev];
@@ -5488,7 +8311,14 @@ export default function WorkoutScreen({ navigation, route }: any) {
                             placeholder="0"
                             placeholderTextColor="#48484A"
                             editable={isEditable}
+                            selectTextOnFocus
+                            maxLength={7}
                             onChangeText={(t) => {
+                              markSetWeightManual(s.id);
+                              const nextWeight = sanitizeSetWeightInput(
+                                t,
+                                s.weight,
+                              );
                               setExercises((prev) => {
                                 const up = [...prev];
                                 const newSets = [...up[exIdx].sets];
@@ -5498,7 +8328,7 @@ export default function WorkoutScreen({ navigation, route }: any) {
                                 if (setIndex !== -1) {
                                   newSets[setIndex] = {
                                     ...newSets[setIndex],
-                                    weight: t,
+                                    weight: nextWeight,
                                   };
                                   up[exIdx] = { ...up[exIdx], sets: newSets };
                                 }
@@ -5506,7 +8336,11 @@ export default function WorkoutScreen({ navigation, route }: any) {
                               });
                               setHasUnsavedChanges(true);
                             }}
-                            onBlur={() => handleSetBlur(exIdx, s.id)}
+                            onBlur={() => {
+                              if (!rpeTrackingEnabled) {
+                                handleSetBlur(exIdx, s.id);
+                              }
+                            }}
                           />
 
                           {/* L / R (unilateral) or REPS (bilateral) — flat siblings, no wrapper */}
@@ -5530,10 +8364,17 @@ export default function WorkoutScreen({ navigation, route }: any) {
                                 spellCheck={false}
                                 autoComplete="off"
                                 value={s.repsL}
-                                placeholder="L"
+                                placeholder={getPreviousSetPlaceholder(
+                                  exIdx,
+                                  s,
+                                  setTypeIndex,
+                                  "repsL",
+                                )}
                                 placeholderTextColor="#48484A"
                                 editable={isEditable}
+                                maxLength={2}
                                 onChangeText={(t) => {
+                                  const nextReps = sanitizeRepsInput(t);
                                   setExercises((prev) => {
                                     const up = [...prev];
                                     const newSets = [...up[exIdx].sets];
@@ -5543,7 +8384,7 @@ export default function WorkoutScreen({ navigation, route }: any) {
                                     if (setIndex !== -1) {
                                       newSets[setIndex] = {
                                         ...newSets[setIndex],
-                                        repsL: t,
+                                        repsL: nextReps,
                                       };
                                       up[exIdx] = {
                                         ...up[exIdx],
@@ -5554,7 +8395,11 @@ export default function WorkoutScreen({ navigation, route }: any) {
                                   });
                                   setHasUnsavedChanges(true);
                                 }}
-                                onBlur={() => handleSetBlur(exIdx, s.id)}
+                                onBlur={() => {
+                                  if (!rpeTrackingEnabled) {
+                                    handleSetBlur(exIdx, s.id);
+                                  }
+                                }}
                               />
                               <TextInput
                                 style={[
@@ -5574,10 +8419,17 @@ export default function WorkoutScreen({ navigation, route }: any) {
                                 spellCheck={false}
                                 autoComplete="off"
                                 value={s.repsR}
-                                placeholder="R"
+                                placeholder={getPreviousSetPlaceholder(
+                                  exIdx,
+                                  s,
+                                  setTypeIndex,
+                                  "repsR",
+                                )}
                                 placeholderTextColor="#48484A"
                                 editable={isEditable}
+                                maxLength={2}
                                 onChangeText={(t) => {
+                                  const nextReps = sanitizeRepsInput(t);
                                   setExercises((prev) => {
                                     const up = [...prev];
                                     const newSets = [...up[exIdx].sets];
@@ -5587,7 +8439,7 @@ export default function WorkoutScreen({ navigation, route }: any) {
                                     if (setIndex !== -1) {
                                       newSets[setIndex] = {
                                         ...newSets[setIndex],
-                                        repsR: t,
+                                        repsR: nextReps,
                                       };
                                       up[exIdx] = {
                                         ...up[exIdx],
@@ -5598,7 +8450,11 @@ export default function WorkoutScreen({ navigation, route }: any) {
                                   });
                                   setHasUnsavedChanges(true);
                                 }}
-                                onBlur={() => handleSetBlur(exIdx, s.id)}
+                                onBlur={() => {
+                                  if (!rpeTrackingEnabled) {
+                                    handleSetBlur(exIdx, s.id);
+                                  }
+                                }}
                               />
                             </>
                           ) : (
@@ -5618,10 +8474,17 @@ export default function WorkoutScreen({ navigation, route }: any) {
                               spellCheck={false}
                               autoComplete="off"
                               value={s.reps}
-                              placeholder="0"
+                              placeholder={getPreviousSetPlaceholder(
+                                exIdx,
+                                s,
+                                setTypeIndex,
+                                "reps",
+                              )}
                               placeholderTextColor="#48484A"
                               editable={isEditable}
+                              maxLength={2}
                               onChangeText={(t) => {
+                                const nextReps = sanitizeRepsInput(t);
                                 setExercises((prev) => {
                                   const up = [...prev];
                                   const newSets = [...up[exIdx].sets];
@@ -5631,7 +8494,7 @@ export default function WorkoutScreen({ navigation, route }: any) {
                                   if (setIndex !== -1) {
                                     newSets[setIndex] = {
                                       ...newSets[setIndex],
-                                      reps: t,
+                                      reps: nextReps,
                                     };
                                     up[exIdx] = { ...up[exIdx], sets: newSets };
                                   }
@@ -5639,7 +8502,76 @@ export default function WorkoutScreen({ navigation, route }: any) {
                                 });
                                 setHasUnsavedChanges(true);
                               }}
-                              onBlur={() => handleSetBlur(exIdx, s.id)}
+                              onBlur={() => {
+                                if (!rpeTrackingEnabled) {
+                                  handleSetBlur(exIdx, s.id);
+                                }
+                              }}
+                            />
+                          )}
+
+                          {rpeTrackingEnabled && (
+                            <TextInput
+                              style={[
+                                styles.setInput,
+                                {
+                                  flex: 0.65,
+                                  fontSize: 14,
+                                  color: s.isWarmup ? "#FFD700" : "#FFF",
+                                },
+                              ]}
+                              keyboardType={
+                                Platform.OS === "ios" ? "decimal-pad" : "numeric"
+                              }
+                              keyboardAppearance="dark"
+                              autoCorrect={false}
+                              spellCheck={false}
+                              autoComplete="off"
+                              value={s.rpe || ""}
+                              placeholder="—"
+                              placeholderTextColor="#48484A"
+                              editable={isEditable}
+                              maxLength={4}
+                              onChangeText={(value) => {
+                                const nextRpe = sanitizeRpeInput(value, s.rpe || "");
+                                setExercises((prev) => {
+                                  const up = [...prev];
+                                  const newSets = [...up[exIdx].sets];
+                                  const setIndex = newSets.findIndex(
+                                    (set: any) => set.id === s.id,
+                                  );
+                                  if (setIndex !== -1) {
+                                    newSets[setIndex] = {
+                                      ...newSets[setIndex],
+                                      rpe: nextRpe,
+                                    };
+                                    up[exIdx] = { ...up[exIdx], sets: newSets };
+                                  }
+                                  return up;
+                                });
+                                setHasUnsavedChanges(true);
+                              }}
+                              onBlur={() => {
+                                const normalizedRpe = formatRpeValue(s.rpe);
+                                if (normalizedRpe !== (s.rpe || "")) {
+                                  setExercises((prev) => {
+                                    const up = [...prev];
+                                    const newSets = [...up[exIdx].sets];
+                                    const setIndex = newSets.findIndex(
+                                      (set: any) => set.id === s.id,
+                                    );
+                                    if (setIndex !== -1) {
+                                      newSets[setIndex] = {
+                                        ...newSets[setIndex],
+                                        rpe: normalizedRpe,
+                                      };
+                                      up[exIdx] = { ...up[exIdx], sets: newSets };
+                                    }
+                                    return up;
+                                  });
+                                }
+                                handleSetBlur(exIdx, s.id);
+                              }}
                             />
                           )}
 
@@ -5658,17 +8590,7 @@ export default function WorkoutScreen({ navigation, route }: any) {
                               { flex: 0.5, opacity: isEditable ? 1 : 0.8 },
                             ]}
                             onPress={async () => {
-                              let isComplete = false;
-                              if (ex.is_unilateral) {
-                                isComplete =
-                                  s.weight.trim() !== "" &&
-                                  (s.repsL || "").trim() !== "" &&
-                                  (s.repsR || "").trim() !== "";
-                              } else {
-                                isComplete =
-                                  s.weight.trim() !== "" &&
-                                  (s.reps || "").trim() !== "";
-                              }
+                              const isComplete = hasValidSetInputs(ex, s);
 
                               if (!s.completed && !isComplete) {
                                 Haptics.notificationAsync(
@@ -5676,11 +8598,12 @@ export default function WorkoutScreen({ navigation, route }: any) {
                                 );
                                 showInfo(
                                   "Incomplete Set",
-                                  "Please fill out all weight and rep fields before marking this set as done.",
+                                  "Weight and reps must be greater than 0 before marking this set as done.",
                                 );
                                 return;
                               }
 
+                              markSetWeightManual(s.id);
                               Haptics.impactAsync(
                                 Haptics.ImpactFeedbackStyle.Light,
                               );
@@ -5738,6 +8661,16 @@ export default function WorkoutScreen({ navigation, route }: any) {
                     <TouchableOpacity
                       style={styles.addSetRow}
                       onPress={() => {
+                        const workingSetCount = (ex.sets || []).filter(
+                          (set: any) => !set.isWarmup,
+                        ).length;
+                        if (workingSetCount >= LIMITS.workingSetsPerExercise) {
+                          showInfo(
+                            "Set Limit Reached",
+                            "Each exercise can have up to 10 working sets.",
+                          );
+                          return;
+                        }
                         setExercises((prev) => {
                           const up = [...prev];
                           up[exIdx] = {
@@ -5750,6 +8683,7 @@ export default function WorkoutScreen({ navigation, route }: any) {
                                 reps: "",
                                 repsL: "",
                                 repsR: "",
+                                rpe: "",
                                 completed: false,
                                 isWarmup: false,
                                 createdAt: Date.now(),
@@ -5803,46 +8737,25 @@ export default function WorkoutScreen({ navigation, route }: any) {
               {isEditable && (
                 <TouchableOpacity
                   style={styles.addExerciseCard}
-                  onPress={() =>
+                  onPress={() => {
+                    if (exercises.length >= LIMITS.exercisesPerWorkout) {
+                      showInfo(
+                        "Exercise Limit Reached",
+                        "Each workout can have up to 25 exercises.",
+                      );
+                      return;
+                    }
                     navigation.navigate("Search", {
+                      multiSelect: true,
+                      selectionContext: "workout",
+                      maxSelectable: LIMITS.exercisesPerWorkout - exercises.length,
                       existingExercises: exercises.map((e) => e.name),
-                      onSelect: async (exData: any) => {
-                        let newEx = {
-                          id: genId("ex-"),
-                          name: exData.name,
-                          reminder: exData.reminder || "",
-                          remark: "",
-                          exerciseVariant:
-                            getExerciseVariationOptions(exData).length > 0
-                              ? "Normal"
-                              : undefined,
-                          variationOptions: getExerciseVariationOptions(exData),
-                          is_unilateral: !!exData.is_unilateral,
-                          brand: exData.brand,
-                          sets: [
-                            {
-                              id: genId(),
-                              weight: "",
-                              reps: "",
-                              repsL: "",
-                              repsR: "",
-                              completed: false,
-                              isWarmup: false,
-                              createdAt: Date.now(),
-                            },
-                          ],
-                        };
-
-                        newEx = await getAutoFilledExercise(
-                          newEx,
-                          selectedGymId,
-                        );
-
-                        setExercises((prev) => [...prev, newEx]);
-                        setHasUnsavedChanges(true);
-                      },
-                    })
-                  }
+                      onSelect: async (exData: any) =>
+                        addExercisesToWorkout([exData]),
+                      onSelectMany: async (exerciseList: any[]) =>
+                        addExercisesToWorkout(exerciseList),
+                    });
+                  }}
                 >
                   <View style={styles.addExerciseIconCircle}>
                     <Ionicons name="add" size={24} color="#32D74B" />
@@ -5868,11 +8781,21 @@ export default function WorkoutScreen({ navigation, route }: any) {
                     : Math.max(insets.bottom + 10, 30),
               },
             ]}
+            onLayout={(event) => {
+              const nextHeight = Math.ceil(event.nativeEvent.layout.height);
+              setFooterHeight((prev) =>
+                prev === nextHeight ? prev : nextHeight,
+              );
+            }}
           >
             {!isEditing && displayRestTime > 0 && (
               <View style={styles.timerBar}>
                 <View style={styles.timerInfo}>
-                  <Text style={styles.timerLabel}>REST TIMER</Text>
+                  <Text style={styles.timerLabel}>
+                    {activeRestType === "warmup"
+                      ? "WARM-UP REST"
+                      : "WORKING REST"}
+                  </Text>
                   <Text style={styles.timerTime}>
                     {formatRestClock(displayRestTime)}
                   </Text>
@@ -5882,15 +8805,30 @@ export default function WorkoutScreen({ navigation, route }: any) {
                     style={styles.timerBtn}
                     onPress={() => {
                       Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
-                      setTimerEndTime((prev) => {
-                        const newTime = prev
-                          ? prev + 30000
-                          : Date.now() + 30000;
-                        const newRemainingSeconds = Math.ceil(
-                          (newTime - Date.now()) / 1000,
+                      const currentRemainingSeconds = timerEndTime
+                        ? Math.max(
+                            0,
+                            Math.ceil((timerEndTime - Date.now()) / 1000),
+                          )
+                        : 0;
+                      const newRemainingSeconds = Math.min(
+                        LIMITS.restSecondsMax,
+                        currentRemainingSeconds + 30,
+                      );
+                      const newTime =
+                        Date.now() + newRemainingSeconds * 1000;
+                      const restType = activeRestTypeRef.current ?? "working";
+                      setTimerEndTime(newTime);
+                      setDisplayRestTime(newRemainingSeconds);
+                      scheduleRestNotification(newRemainingSeconds, restType);
+                      saveActiveSessionSnapshot({
+                        timerEndTime: newTime,
+                        activeRestType: restType,
+                      }).catch((error) => {
+                        console.log(
+                          "Unable to persist rest timer state:",
+                          error,
                         );
-                        scheduleRestNotification(newRemainingSeconds);
-                        return newTime;
                       });
                     }}
                   >
@@ -5902,7 +8840,13 @@ export default function WorkoutScreen({ navigation, route }: any) {
                       Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
                       setTimerEndTime(null);
                       setDisplayRestTime(0);
+                      activeRestTypeRef.current = null;
+                      setActiveRestType(null);
                       await clearRestTimerNotification(true);
+                      await saveActiveSessionSnapshot({
+                        timerEndTime: null,
+                        activeRestType: null,
+                      });
                     }}
                   >
                     <Text style={styles.timerBtnText}>Skip</Text>
@@ -5919,7 +8863,7 @@ export default function WorkoutScreen({ navigation, route }: any) {
                   Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
                   setIsReorderMode(false);
                 } else {
-                  setTimeout(() => handleFinishWorkout(), 100);
+                  setTimeout(() => requestFinishWorkout(), 100);
                 }
               }}
             >
@@ -5934,6 +8878,11 @@ export default function WorkoutScreen({ navigation, route }: any) {
           </View>
         )}
       </View>
+
+      <BlockingOverlay
+        visible={isWorkoutBlocking}
+        message={workoutBlockingMessage}
+      />
     </View>
   );
 }

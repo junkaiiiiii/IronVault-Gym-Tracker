@@ -6,6 +6,9 @@
     "start": "expo start",
     "android": "expo run:android",
     "ios": "expo run:ios",
+    "typecheck": "tsc --noEmit",
+    "test:rules": "firebase emulators:exec --only firestore \"node scripts/firestore-rules-tests.js\"",
+    "test:smoke": "node scripts/smoke-tests.js",
     "web": "expo start --web"
   },
   "dependencies": {
@@ -25,7 +28,6 @@
     "expo-font": "~14.0.12",
     "expo-haptics": "~15.0.8",
     "expo-image": "~3.0.11",
-    "expo-image-picker": "~17.0.11",
     "expo-media-library": "~18.2.1",
     "expo-notifications": "~0.32.17",
     "expo-sharing": "~14.0.8",
@@ -45,9 +47,15 @@
     "zod": "^4.4.3"
   },
   "devDependencies": {
+    "@firebase/rules-unit-testing": "^5.0.1",
     "@types/react": "~19.1.0",
     "babel-preset-expo": "~54.0.10",
     "typescript": "~5.9.2"
+  },
+  "overrides": {
+    "js-yaml": "5.2.0",
+    "postcss": "8.5.10",
+    "uuid": "11.1.1"
   },
   "private": true
 }
