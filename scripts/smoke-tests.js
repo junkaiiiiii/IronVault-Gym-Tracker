@@ -162,6 +162,7 @@ test("template review treats Default and Normal as the same default variant", ()
     getTemplateVariantForStorage,
     getTemplateVariantLabel,
     normalizeTemplateVariantForComparison,
+    resolveWorkoutTemplateVariantForStorage,
   } = require(
     fromRoot("src/utils/templateChanges.ts"),
   );
@@ -181,6 +182,14 @@ test("template review treats Default and Normal as the same default variant", ()
   assert.equal(getTemplateVariantLabel("Normal", false), "");
   assert.equal(getTemplateVariantLabel(undefined, true), "Normal");
   assert.equal(getTemplateVariantLabel("Paused", true), "Paused");
+  assert.equal(
+    resolveWorkoutTemplateVariantForStorage("Tempo", "Paused", true),
+    "Tempo",
+  );
+  assert.equal(
+    resolveWorkoutTemplateVariantForStorage("Normal", "Paused", true),
+    "Normal",
+  );
 });
 
 test("remote exercise data strips undeclared fields", () => {
