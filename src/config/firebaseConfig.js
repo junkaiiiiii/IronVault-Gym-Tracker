@@ -4,7 +4,7 @@ import { getFirestore } from "firebase/firestore";
 import AsyncStorage from "@react-native-async-storage/async-storage";
 
 const firebaseConfig = {
-  apiKey: "AIzaSyDf-C6_YPR8m7-H25kdlk6cIuyPczJ3hzA",
+  apiKey: "AIzaSyCjdRQdgfwgFk0n7is8isGBqnD4j2pNQIY",
   authDomain: "gymtracker-128ca.firebaseapp.com",
   projectId: "gymtracker-128ca",
   storageBucket: "gymtracker-128ca.firebasestorage.app",
