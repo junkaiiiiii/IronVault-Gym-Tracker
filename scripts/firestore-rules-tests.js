@@ -139,6 +139,34 @@ test("username claims are owner-only and validated", async () => {
   );
 });
 
+test("username reads allow exact checks but prevent directory enumeration", async () => {
+  await testEnv.withSecurityRulesDisabled(async (context) => {
+    const db = context.firestore();
+    await usernameDoc(db, "alice_1").set({
+      uid: "alice",
+      username: "alice_1",
+      usernameLower: "alice_1",
+      updatedAt: 1782220000000,
+    });
+    await usernameDoc(db, "bob_1").set({
+      uid: "bob",
+      username: "bob_1",
+      usernameLower: "bob_1",
+      updatedAt: 1782220000001,
+    });
+  });
+
+  const aliceDb = authedDb("alice");
+  await assertSucceeds(usernameDoc(aliceDb, "bob_1").get());
+  await assertSucceeds(
+    aliceDb.collection("usernames").where("uid", "==", "alice").get(),
+  );
+  await assertFails(
+    aliceDb.collection("usernames").where("uid", "==", "bob").get(),
+  );
+  await assertFails(aliceDb.collection("usernames").get());
+});
+
 test("workouts respect ownership, id matching, and exercise cap", async () => {
   const aliceDb = authedDb("alice");
   const bobDb = authedDb("bob");

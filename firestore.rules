@@ -258,7 +258,12 @@ service cloud.firestore {
     }
 
     match /usernames/{username} {
-      allow read: if isAuthenticated();
+      // Anyone signed in may check one exact username for availability. Queries
+      // must be scoped to the caller's uid so the reservation index cannot be
+      // downloaded as a directory of usernames and Firebase user ids.
+      allow get: if isAuthenticated();
+      allow list: if isAuthenticated()
+        && resource.data.uid == request.auth.uid;
 
       allow create: if isAuthenticated()
         && isValidUsername(username)

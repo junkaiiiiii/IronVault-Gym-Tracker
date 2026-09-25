@@ -3,7 +3,7 @@
     "name": "IronVault",
     "slug": "ironvault",
     "scheme": "com.on333.ironvault",
-    "version": "1.0.2",
+    "version": "1.0.3",
     "orientation": "portrait",
     "icon": "./assets/icon.png",
     "userInterfaceStyle": "dark",
@@ -16,7 +16,7 @@
     "ios": {
       "supportsTablet": false,
       "bundleIdentifier": "com.on333.ironvault",
-      "buildNumber": "47",
+      "buildNumber": "48",
       "usesAppleSignIn": true,
       "infoPlist": {
         "CFBundleURLTypes": [
@@ -53,6 +53,7 @@
     },
     "android": {
       "package": "com.on333.ironvault",
+      "allowBackup": false,
       "intentFilters": [
         {
           "action": "VIEW",
@@ -69,12 +70,12 @@
             {
               "scheme": "file",
               "mimeType": "*/*",
-              "pathSuffix": ".ironvault-template"
+              "pathPattern": "/.*\\.ironvault-template"
             },
             {
               "scheme": "content",
               "mimeType": "*/*",
-              "pathSuffix": ".ironvault-template"
+              "pathPattern": "/.*\\.ironvault-template"
             }
           ]
         }

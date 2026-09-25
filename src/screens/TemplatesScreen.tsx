@@ -2927,7 +2927,8 @@ export default function TemplatesScreen({ navigation, route }: any) {
           <View style={localStyles.importModalContent}>
             <Text style={styles.actionMenuTitle}>Import Template</Text>
             <Text style={localStyles.importModalSubtitle}>
-              This IronVault template passed safety checks before previewing.
+              The file format and contents were validated. Only import templates
+              from people you trust.
             </Text>
 
             <View style={localStyles.importSummaryCard}>
