@@ -737,10 +737,14 @@ export const prepareSections = (data: any[], filter: string) => {
 };
 
 export const fetchGitHubExercises = async () => {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 10000);
+
   try {
     const response = await fetch(
       `https://raw.githubusercontent.com/junkaiiiiii/ironvault-exercises/main/my-exercises.json?ts=${Date.now()}`,
       {
+        signal: controller.signal,
         headers: {
           "Cache-Control": "no-cache",
           Pragma: "no-cache",
@@ -749,11 +753,19 @@ export const fetchGitHubExercises = async () => {
     );
     if (!response.ok) return [];
 
-    const data = await response.json();
+    const contentLength = Number(response.headers.get("content-length") || 0);
+    if (contentLength > 2 * 1024 * 1024) return [];
+
+    const raw = await response.text();
+    if (raw.length > 2 * 1024 * 1024) return [];
+
+    const data = JSON.parse(raw);
     return sanitizeRemoteExercises(data);
   } catch (error) {
     console.error("Error fetching from GitHub:", error);
     return [];
+  } finally {
+    clearTimeout(timeout);
   }
 };
 
@@ -834,9 +846,9 @@ const RemoteExerciseSchema = z
     brand: z.string().max(80).optional(),
     machineBrand: z.string().max(80).optional(),
   })
-  .passthrough();
+  .strip();
 
-const sanitizeRemoteExercises = (value: any) => {
+export const sanitizeRemoteExercises = (value: any) => {
   if (!Array.isArray(value)) return [];
 
   return value

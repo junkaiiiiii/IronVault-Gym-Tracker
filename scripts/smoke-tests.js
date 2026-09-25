@@ -106,6 +106,29 @@ test("limits sanitize and clamp user input", () => {
   assert.equal(cleanLimitedText("  hello  ", 20), "hello");
 });
 
+test("remote exercise data strips undeclared fields", () => {
+  const { sanitizeRemoteExercises } = require(fromRoot("src/utils/helpers.ts"));
+  const [exercise] = sanitizeRemoteExercises([
+    {
+      id: "remote-1",
+      name: "Cable Curl",
+      muscle: "Arms",
+      equipment: "Cable",
+      is_unilateral: false,
+      is_custom: true,
+      createdByUser: true,
+      sets: [{ weight: 999, reps: 999 }],
+      gymReplacements: { attacker: "Injected Exercise" },
+    },
+  ]);
+
+  assert.equal(exercise.name, "Cable Curl");
+  assert.equal(exercise.is_custom, undefined);
+  assert.equal(exercise.createdByUser, undefined);
+  assert.equal(exercise.sets, undefined);
+  assert.equal(exercise.gymReplacements, undefined);
+});
+
 test("RPE input accepts half steps and preserves historical tracking", () => {
   const {
     chooseHeaviestRpeSet,
