@@ -122,6 +122,11 @@ import {
   isValidCompletedSet,
   toSetInputValue,
 } from "../utils/setCompletion";
+import {
+  getTemplateVariantForStorage,
+  getTemplateVariantLabel,
+  normalizeTemplateVariantForComparison,
+} from "../utils/templateChanges";
 
 Notifications.setNotificationHandler({
   handleNotification: async () =>
@@ -525,7 +530,7 @@ export default function WorkoutScreen({ navigation, route }: any) {
     const variant = String(
       exercise?.exerciseVariant || (variationOptions.length > 0 ? "Normal" : ""),
     ).trim();
-    return variant || "";
+    return normalizeTemplateVariantForComparison(variant);
   };
 
   const getExerciseSelectionCompare = (exercise: any) => ({
@@ -535,8 +540,13 @@ export default function WorkoutScreen({ navigation, route }: any) {
 
   const getExerciseSelectionLabel = (exercise: any) => {
     const selection = getExerciseSelectionCompare(exercise);
+    const variationOptions = getExerciseVariationOptions(exercise);
+    const displayVariant = getTemplateVariantLabel(
+      exercise?.exerciseVariant,
+      variationOptions.length > 0,
+    );
     const parts = [];
-    if (selection.variant) parts.push(selection.variant);
+    if (displayVariant) parts.push(displayVariant);
     if (selection.attachment) parts.push(selection.attachment);
     if (!selection.attachment && hasExplicitNoAttachment(exercise)) {
       parts.push(NO_ATTACHMENT_OPTION_LABEL);
@@ -609,6 +619,10 @@ export default function WorkoutScreen({ navigation, route }: any) {
           ...base,
           attachment: normalizedExercise.attachment || base.attachment,
         });
+        const variationOptions = getExerciseVariationOptions({
+          ...normalizedExercise,
+          ...base,
+        });
         const baseId = ex.templateBaseExercise
           ? base.id || base.originalExerciseId || ex.originalExerciseId || null
           : ex.originalExerciseId || ex.exerciseId || base.id || null;
@@ -626,9 +640,12 @@ export default function WorkoutScreen({ navigation, route }: any) {
             base.machineBrandApplicable ?? ex.machineBrandApplicable,
           brandApplicable: base.brandApplicable ?? ex.brandApplicable,
           image: base.image || ex.image,
-          exerciseVariant:
-            base.exerciseVariant || ex.exerciseVariant || "Normal",
-          variationOptions: base.variationOptions || ex.variationOptions,
+          exerciseVariant: getTemplateVariantForStorage(
+            base.exerciseVariant || ex.exerciseVariant,
+            variationOptions.length > 0,
+          ),
+          variationOptions:
+            variationOptions.length > 0 ? variationOptions : undefined,
           supportsVariants: getExerciseSupportsVariantsForStorage({
             ...normalizedExercise,
             ...base,
@@ -1204,8 +1221,10 @@ export default function WorkoutScreen({ navigation, route }: any) {
       machineBrandApplicable: entry.machineBrandApplicable,
       brandApplicable: entry.brandApplicable,
       image: entry.image,
-      exerciseVariant:
-        entry.exerciseVariant || (variationOptions.length > 0 ? "Normal" : undefined),
+      exerciseVariant: getTemplateVariantForStorage(
+        entry.exerciseVariant,
+        variationOptions.length > 0,
+      ),
       variationOptions:
         entry.variationOptions || (variationOptions.length > 0 ? variationOptions : undefined),
       supportsVariants: getExerciseSupportsVariantsForStorage(entry),
@@ -2561,6 +2580,8 @@ export default function WorkoutScreen({ navigation, route }: any) {
                 normalizeExerciseForAttachmentStorage(sourceExercise);
               const attachmentOptions =
                 getExerciseAttachmentOptions(attachmentExercise);
+              const variationOptions =
+                getExerciseVariationOptions(attachmentExercise);
               const exName = attachmentExercise.name;
               const isUnilateral = !!attachmentExercise.is_unilateral;
               const brand = attachmentExercise.brand;
@@ -2609,8 +2630,14 @@ export default function WorkoutScreen({ navigation, route }: any) {
                 image: attachmentExercise.image,
                 reminder: attachmentExercise.reminder || "",
                 remark: "",
-                exerciseVariant: attachmentExercise.exerciseVariant || "Normal",
-                variationOptions: attachmentExercise.variationOptions,
+                exerciseVariant: getTemplateVariantForStorage(
+                  attachmentExercise.exerciseVariant,
+                  variationOptions.length > 0,
+                ),
+                variationOptions:
+                  variationOptions.length > 0 ? variationOptions : undefined,
+                supportsVariants:
+                  getExerciseSupportsVariantsForStorage(attachmentExercise),
                 attachment: getExerciseAttachmentForSave(attachmentExercise),
                 attachmentOptions:
                   attachmentOptions.length > 0 ? attachmentOptions : undefined,
