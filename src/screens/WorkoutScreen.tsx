@@ -126,6 +126,7 @@ import {
   getTemplateVariantForStorage,
   getTemplateVariantLabel,
   normalizeTemplateVariantForComparison,
+  resolveWorkoutTemplateVariantForStorage,
 } from "../utils/templateChanges";
 
 Notifications.setNotificationHandler({
@@ -640,8 +641,9 @@ export default function WorkoutScreen({ navigation, route }: any) {
             base.machineBrandApplicable ?? ex.machineBrandApplicable,
           brandApplicable: base.brandApplicable ?? ex.brandApplicable,
           image: base.image || ex.image,
-          exerciseVariant: getTemplateVariantForStorage(
-            base.exerciseVariant || ex.exerciseVariant,
+          exerciseVariant: resolveWorkoutTemplateVariantForStorage(
+            ex.exerciseVariant,
+            base.exerciseVariant,
             variationOptions.length > 0,
           ),
           variationOptions:
@@ -4265,7 +4267,7 @@ export default function WorkoutScreen({ navigation, route }: any) {
                         fontWeight: "900",
                       }}
                     >
-                      Create New Template
+                      Save as New Template
                     </Text>
                     <Text
                       style={{

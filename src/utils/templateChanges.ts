@@ -11,6 +11,16 @@ export const getTemplateVariantForStorage = (
   return String(value || "").trim() || "Normal";
 };
 
+export const resolveWorkoutTemplateVariantForStorage = (
+  workoutValue: any,
+  originalTemplateValue: any,
+  hasVariantOptions: boolean,
+): string | undefined =>
+  getTemplateVariantForStorage(
+    String(workoutValue || "").trim() || originalTemplateValue,
+    hasVariantOptions,
+  );
+
 export const getTemplateVariantLabel = (
   value: any,
   hasVariantOptions: boolean,
