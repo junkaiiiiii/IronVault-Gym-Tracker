@@ -106,6 +106,57 @@ test("limits sanitize and clamp user input", () => {
   assert.equal(cleanLimitedText("  hello  ", 20), "hello");
 });
 
+test("set completion never requires RPE", () => {
+  const { hasValidSetInputs, isValidCompletedSet } = require(
+    fromRoot("src/utils/setCompletion.ts"),
+  );
+
+  const bilateral = { is_unilateral: false };
+  const unilateral = { is_unilateral: true };
+
+  assert.equal(
+    hasValidSetInputs(bilateral, { weight: "100", reps: "5", rpe: "" }),
+    true,
+  );
+  assert.equal(
+    isValidCompletedSet(bilateral, {
+      weight: "100",
+      reps: "5",
+      rpe: "",
+      completed: true,
+    }),
+    true,
+  );
+  assert.equal(
+    isValidCompletedSet(bilateral, {
+      weight: "60",
+      reps: "5",
+      rpe: "",
+      isWarmup: true,
+      completed: true,
+    }),
+    true,
+  );
+  assert.equal(
+    hasValidSetInputs(unilateral, {
+      weight: "25",
+      repsL: "8",
+      repsR: "8",
+      rpe: "",
+    }),
+    true,
+  );
+  assert.equal(
+    isValidCompletedSet(bilateral, {
+      weight: "100",
+      reps: "5",
+      rpe: "",
+      completed: false,
+    }),
+    false,
+  );
+});
+
 test("remote exercise data strips undeclared fields", () => {
   const { sanitizeRemoteExercises } = require(fromRoot("src/utils/helpers.ts"));
   const [exercise] = sanitizeRemoteExercises([

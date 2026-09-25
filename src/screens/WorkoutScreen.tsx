@@ -117,6 +117,11 @@ import {
   restoreHistoricalWeightPrefillState,
   type HistoricalWeightPrefillState,
 } from "../utils/setHistoryHints";
+import {
+  hasValidSetInputs,
+  isValidCompletedSet,
+  toSetInputValue,
+} from "../utils/setCompletion";
 
 Notifications.setNotificationHandler({
   handleNotification: async () =>
@@ -167,35 +172,6 @@ const WARMUP_REST_TIMER_PRESETS = [
   { label: "60s", value: 60 },
   { label: "90s", value: 90 },
 ];
-
-const toSetInputValue = (value: any) =>
-  value === undefined || value === null ? "" : String(value);
-
-const trimmedSetValue = (value: any) => toSetInputValue(value).trim();
-
-const isPositiveSetNumber = (value: any) => {
-  const parsed = Number(trimmedSetValue(value));
-  return Number.isFinite(parsed) && parsed > 0;
-};
-
-const hasValidSetInputs = (exercise: any, set: any) => {
-  if (!isPositiveSetNumber(set?.weight)) return false;
-  if (exercise?.is_unilateral) {
-    return (
-      isPositiveSetNumber(set?.repsL) && isPositiveSetNumber(set?.repsR)
-    );
-  }
-  return isPositiveSetNumber(set?.reps);
-};
-
-const isValidCompletedSet = (
-  exercise: any,
-  set: any,
-  options: { includeWarmup?: boolean } = {},
-) =>
-  !!set?.completed &&
-  (options.includeWarmup !== false || !set?.isWarmup) &&
-  hasValidSetInputs(exercise, set);
 
 const getWeightPrefillIdentityKey = (items: any[] = []) =>
   items.map(getHistoricalSetHintIdentityKey).join("||");
@@ -8336,11 +8312,7 @@ export default function WorkoutScreen({ navigation, route }: any) {
                               });
                               setHasUnsavedChanges(true);
                             }}
-                            onBlur={() => {
-                              if (!rpeTrackingEnabled) {
-                                handleSetBlur(exIdx, s.id);
-                              }
-                            }}
+                            onBlur={() => handleSetBlur(exIdx, s.id)}
                           />
 
                           {/* L / R (unilateral) or REPS (bilateral) — flat siblings, no wrapper */}
@@ -8395,11 +8367,7 @@ export default function WorkoutScreen({ navigation, route }: any) {
                                   });
                                   setHasUnsavedChanges(true);
                                 }}
-                                onBlur={() => {
-                                  if (!rpeTrackingEnabled) {
-                                    handleSetBlur(exIdx, s.id);
-                                  }
-                                }}
+                                onBlur={() => handleSetBlur(exIdx, s.id)}
                               />
                               <TextInput
                                 style={[
@@ -8450,11 +8418,7 @@ export default function WorkoutScreen({ navigation, route }: any) {
                                   });
                                   setHasUnsavedChanges(true);
                                 }}
-                                onBlur={() => {
-                                  if (!rpeTrackingEnabled) {
-                                    handleSetBlur(exIdx, s.id);
-                                  }
-                                }}
+                                onBlur={() => handleSetBlur(exIdx, s.id)}
                               />
                             </>
                           ) : (
@@ -8502,11 +8466,7 @@ export default function WorkoutScreen({ navigation, route }: any) {
                                 });
                                 setHasUnsavedChanges(true);
                               }}
-                              onBlur={() => {
-                                if (!rpeTrackingEnabled) {
-                                  handleSetBlur(exIdx, s.id);
-                                }
-                              }}
+                              onBlur={() => handleSetBlur(exIdx, s.id)}
                             />
                           )}
 
